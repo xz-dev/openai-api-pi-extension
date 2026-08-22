@@ -1,0 +1,30 @@
+{
+  "name": "openai-api-pi-extension",
+  "version": "0.1.0",
+  "description": "Minimal modern Pi provider extension for any OpenAI-compatible gateway using the Responses API.",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "openai",
+    "responses-api"
+  ],
+  "type": "module",
+  "scripts": {
+    "check": "node --check index.ts && node --test tests/*.test.ts",
+    "test": "node --test tests/*.test.ts"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "^0.83.0",
+    "@earendil-works/pi-coding-agent": "^0.83.0"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "^0.83.0",
+    "@earendil-works/pi-coding-agent": "^0.83.0"
+  }
+}
