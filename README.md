@@ -1,4 +1,4 @@
-# openai-api-pi-extension
+# openai-api-extension
 
 Minimal modern [Pi](https://pi.dev) provider extension for any
 OpenAI-compatible gateway — [Sub2API](https://github.com/Wei-Shaw/sub2api),
@@ -7,7 +7,7 @@ CLIProxyAPI, LiteLLM, or the official OpenAI API — using the
 
 ## What it does
 
-- Registers an `openai-api` provider in Pi.
+- Registers an `openai-api-extension` provider in Pi.
 - Discovers the model list from `GET {baseUrl}/models` before startup finishes
   (the documented async-factory pattern for remote catalogs).
 - Every model is registered with `api: "openai-responses"` and reasoning
@@ -21,7 +21,7 @@ CLIProxyAPI, LiteLLM, or the official OpenAI API — using the
 ### Option 1: `/login` (recommended)
 
 ```
-/login openai-api
+/login openai-api-extension
 ```
 
 Prompts for the gateway base URL and API key, validates the pair against
@@ -35,11 +35,11 @@ The extension stays inert until one of these is configured. Env values take
 precedence over a stored `/login` credential.
 
 ```bash
-export OPENAI_API_PI_EXTENSION_BASE_URL="https://your-gateway.example.com/v1"
-export OPENAI_API_PI_EXTENSION_API_KEY="sk-..."
+export OPENAI_API_EXTENSION_BASE_URL="https://your-gateway.example.com/v1"
+export OPENAI_API_EXTENSION_API_KEY="sk-..."
 ```
 
-> The dedicated `OPENAI_API_PI_EXTENSION_*` prefix avoids colliding with the
+> The dedicated `OPENAI_API_EXTENSION_*` prefix avoids colliding with the
 > official OpenAI provider's environment variables.
 
 If the gateway is unreachable at startup, the extension logs a warning and
@@ -49,13 +49,13 @@ restart re-validates.
 ## Install
 
 ```
-pi install git:github.com/xz-dev/openai-api-pi-extension
+pi install git:github.com/xz-dev/openai-api-extension
 ```
 
 Or try it once without installing:
 
 ```
-pi -e git:github.com/xz-dev/openai-api-pi-extension --provider openai-api --model <model-id>
+pi -e git:github.com/xz-dev/openai-api-extension --provider openai-api-extension --model <model-id>
 ```
 
 ## Per-model overrides
@@ -66,7 +66,7 @@ tune any model without touching this extension:
 ```json
 {
   "providers": {
-    "openai-api": {
+    "openai-api-extension": {
       "models": [
         {
           "id": "gpt-5.6",

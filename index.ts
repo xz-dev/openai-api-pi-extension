@@ -3,19 +3,19 @@
  * OpenAI Responses API.
  *
  * Configuration (either way; env wins when both are set):
- * 1. `/login openai-api` — prompts for gateway base URL and API key,
+ * 1. `/login openai-api-extension` — prompts for gateway base URL and API key,
  *    validates via GET {baseUrl}/models, and stores both in auth.json.
- * 2. Env vars: OPENAI_API_PI_EXTENSION_BASE_URL / OPENAI_API_PI_EXTENSION_API_KEY
+ * 2. Env vars: OPENAI_API_EXTENSION_BASE_URL / OPENAI_API_EXTENSION_API_KEY
  */
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai";
 
-const PROVIDER = "openai-api";
-const PROVIDER_NAME = "OpenAI API";
-const ENV_BASE_URL = "OPENAI_API_PI_EXTENSION_BASE_URL";
-const ENV_API_KEY = "OPENAI_API_PI_EXTENSION_API_KEY";
+const PROVIDER = "openai-api-extension";
+const PROVIDER_NAME = "OpenAI API Extension";
+const ENV_BASE_URL = "OPENAI_API_EXTENSION_BASE_URL";
+const ENV_API_KEY = "OPENAI_API_EXTENSION_API_KEY";
 const DEFAULT_BASE_URL = "https://api.openai.com/v1";
 const DEFAULT_CONTEXT_WINDOW = 128000;
 const DEFAULT_MAX_TOKENS = 16384;
@@ -129,7 +129,7 @@ function loadStoredConnection(agentDir: string): { baseUrl?: string; apiKey?: st
 // --- provider registration ---
 
 function register(pi: ExtensionAPI, agentDir: string, options: { baseUrl: string; apiKey?: string; models: GatewayModel[] }): void {
-  // OAuth-only when a /login credential exists so `/login openai-api` skips
+  // OAuth-only when a /login credential exists so `/login openai-api-extension` skips
   // the api-key-vs-account selector; apiKey is passed only for env setups.
   pi.unregisterProvider(PROVIDER);
   pi.registerProvider(PROVIDER, {
@@ -195,7 +195,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   if (!baseUrl || !apiKey) {
     register(pi, agentDir, { baseUrl: baseUrl ?? DEFAULT_BASE_URL, models: [] }); // visible in /login immediately.
     console.info(
-      `[openai-api] not configured. Use /login ${PROVIDER}, or set ${ENV_BASE_URL} and ${ENV_API_KEY}.`,
+      `[openai-api-extension] not configured. Use /login ${PROVIDER}, or set ${ENV_BASE_URL} and ${ENV_API_KEY}.`,
     );
     return;
   }
@@ -205,7 +205,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     register(pi, agentDir, { baseUrl, apiKey: stored.apiKey ? undefined : envKey, models });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    console.warn(`[openai-api] model discovery failed (${message}); starting without models.`);
+    console.warn(`[openai-api-extension] model discovery failed (${message}); starting without models.`);
     register(pi, agentDir, { baseUrl, apiKey: stored.apiKey ? undefined : envKey, models: [] });
   }
 }

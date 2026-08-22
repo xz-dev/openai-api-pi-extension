@@ -1,5 +1,5 @@
 {
-  "name": "openai-api-pi-extension",
+  "name": "openai-api-extension",
   "version": "0.1.0",
   "description": "Minimal modern Pi provider extension for any OpenAI-compatible gateway using the Responses API.",
   "license": "MIT",
