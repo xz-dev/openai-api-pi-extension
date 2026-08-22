@@ -8,35 +8,43 @@ CLIProxyAPI, LiteLLM, or the official OpenAI API — using the
 ## What it does
 
 - Registers an `openai-api` provider in Pi.
-- Fetches the model list from `GET {baseUrl}/models` before startup finishes
-  (the documented async-factory pattern for remote catalogs). A failed fetch
-  fails extension loading with a clear error instead of a silently empty catalog.
+- Discovers the model list from `GET {baseUrl}/models` before startup finishes
+  (the documented async-factory pattern for remote catalogs).
 - Every model is registered with `api: "openai-responses"` and reasoning
   enabled — the gateway is trusted to accept and normalize reasoning
-  parameters (e.g. Sub2API group-level effort mappings / body passthrough).
+  parameters; per-model tuning belongs in `~/.pi/agent/models.json`.
 - No catalog enrichment, no effort-tier inference, no retry logic: request
-  bodies are sent through Pi's standard OpenAI Responses adapter unchanged.
+  bodies go through Pi's standard OpenAI Responses adapter unchanged.
 
 ## Setup
 
-Set the gateway base URL (extension stays inert without it):
-
-```bash
-export OPENAI_API_BASE_URL="http://10.1.1.22:8086/v1"
-```
-
-Provide the API key either via environment:
-
-```bash
-export OPENAI_API_KEY="sk-..."
-```
-
-or through Pi's login flow, which stores the credential in
-`~/.pi/agent/auth.json`:
+### Option 1: `/login` (recommended)
 
 ```
 /login openai-api
 ```
+
+Prompts for the gateway base URL and API key, validates the pair against
+`GET {baseUrl}/models`, and stores both in `~/.pi/agent/auth.json`. On the
+next start the stored connection is used automatically — no environment
+variables needed.
+
+### Option 2: Environment variables
+
+The extension stays inert until one of these is configured. Env values take
+precedence over a stored `/login` credential.
+
+```bash
+export OPENAI_API_PI_EXTENSION_BASE_URL="https://your-gateway.example.com/v1"
+export OPENAI_API_PI_EXTENSION_API_KEY="sk-..."
+```
+
+> The dedicated `OPENAI_API_PI_EXTENSION_*` prefix avoids colliding with the
+> official OpenAI provider's environment variables.
+
+If the gateway is unreachable at startup, the extension logs a warning and
+registers without models instead of failing the session; `/login` or a
+restart re-validates.
 
 ## Install
 
@@ -82,7 +90,7 @@ When fields are present they are honored: `context_window` /
 
 ```
 npm install
-npm test        # node:test unit tests for URL + model mapping
+npm test        # node:test unit tests for URL, model mapping, and credential meta
 ```
 
 ## License
