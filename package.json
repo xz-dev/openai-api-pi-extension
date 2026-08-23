@@ -1,8 +1,20 @@
 {
   "name": "openai-api-extension",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Minimal modern Pi provider extension for any OpenAI-compatible gateway using the Responses API.",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xz-dev/openai-api-extension.git"
+  },
+  "files": [
+    "index.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
   "keywords": [
     "pi-package",
     "pi-extension",

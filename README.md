@@ -7,9 +7,11 @@ CLIProxyAPI, LiteLLM, or the official OpenAI API — using the
 
 ## What it does
 
-- Registers an `openai-api-extension` provider in Pi.
-- Discovers the model list from `GET {baseUrl}/models` before startup finishes
-  (the documented async-factory pattern for remote catalogs).
+- Registers a complete Pi-native `openai-api-extension` provider. Pi owns
+  credentials, model refresh, persistence, offline restore, cancellation, and
+  request-time endpoint selection.
+- Discovers models from `GET {baseUrl}/models` during async startup or Pi's
+  provider refresh.
 - Every model is registered with `api: "openai-responses"` and reasoning
   enabled — the gateway is trusted to accept and normalize reasoning
   parameters; per-model tuning belongs in `~/.pi/agent/models.json`.
@@ -25,14 +27,15 @@ CLIProxyAPI, LiteLLM, or the official OpenAI API — using the
 ```
 
 Prompts for the gateway base URL and API key, validates the pair against
-`GET {baseUrl}/models`, and stores both in `~/.pi/agent/auth.json`. On the
-next start the stored connection is used automatically — no environment
-variables needed.
+`GET {baseUrl}/models`, and stores one API-key credential in
+`~/.pi/agent/auth.json`. The API key uses Pi's secret prompt; the base URL is
+stored as provider-scoped credential metadata. `/logout openai-api-extension`
+removes both.
 
 ### Option 2: Environment variables
 
-The extension stays inert until one of these is configured. Env values take
-precedence over a stored `/login` credential.
+The provider remains visible for `/login` when unconfigured, but exposes no
+models. Environment values override stored `/login` fields independently.
 
 ```bash
 export OPENAI_API_EXTENSION_BASE_URL="https://your-gateway.example.com/v1"
@@ -42,9 +45,24 @@ export OPENAI_API_EXTENSION_API_KEY="sk-..."
 > The dedicated `OPENAI_API_EXTENSION_*` prefix avoids colliding with the
 > official OpenAI provider's environment variables.
 
-If the gateway is unreachable at startup, the extension logs a warning and
-registers without models instead of failing the session; `/login` or a
-restart re-validates.
+Environment-based setup discovers models during the async extension factory,
+so they are available at startup and to `--list-models`. Stored `/login`
+credentials refresh through Pi's provider lifecycle. If discovery fails, Pi
+retains the last persisted catalog; offline startup restores it without network
+access.
+
+## Upgrade from 0.1.0
+
+Version 0.1.0 stored API keys as OAuth credentials. After upgrading, replace
+that legacy entry once:
+
+```
+/logout openai-api-extension
+/login openai-api-extension
+```
+
+The new credential stores the key once as an API key and removes the entire
+connection on future logout.
 
 ## Install
 
@@ -90,7 +108,7 @@ When fields are present they are honored: `context_window` /
 
 ```
 npm install
-npm test        # node:test unit tests for URL, model mapping, and credential meta
+npm test        # node:test provider lifecycle, loader, and transport tests
 ```
 
 ## License
