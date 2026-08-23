@@ -1,4 +1,4 @@
-# openai-api-extension
+# openai-api-pi-extension
 
 Minimal modern [Pi](https://pi.dev) provider extension for any
 OpenAI-compatible gateway — [Sub2API](https://github.com/Wei-Shaw/sub2api),
@@ -67,13 +67,13 @@ connection on future logout.
 ## Install
 
 ```
-pi install git:github.com/xz-dev/openai-api-extension
+pi install git:github.com/xz-dev/openai-api-pi-extension
 ```
 
 Or try it once without installing:
 
 ```
-pi -e git:github.com/xz-dev/openai-api-extension --provider openai-api-extension --model <model-id>
+pi -e git:github.com/xz-dev/openai-api-pi-extension --provider openai-api-extension --model <model-id>
 ```
 
 ## Per-model overrides
