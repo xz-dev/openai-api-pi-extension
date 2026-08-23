@@ -68,7 +68,11 @@ export function mapModel(entry: unknown, baseUrl = DEFAULT_BASE_URL): GatewayMod
   if (!id) return undefined;
   const contextWindow = num(row.context_window) ?? num(row.context_length);
   const maxTokens = num(row.max_output_tokens) ?? num(row.max_completion_tokens) ?? num(row.max_tokens);
-  if (!contextWindow || !maxTokens) throw new Error(`Model ${id} is missing capability limits`);
+  if (!contextWindow) throw new Error(`Model ${id} is missing capability limits`);
+  // Gateways commonly omit output-token limits; the model's own context
+  // window is the gateway-declared upper bound, so use it rather than
+  // rejecting the whole catalog.
+  const resolvedMaxTokens = maxTokens ?? contextWindow;
   const name =
     [row.name, row.display_name].find((value): value is string => typeof value === "string" && value.trim() !== "")
       ?.trim() ?? id;
@@ -82,7 +86,7 @@ export function mapModel(entry: unknown, baseUrl = DEFAULT_BASE_URL): GatewayMod
     input: ["text"],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow,
-    maxTokens,
+    maxTokens: resolvedMaxTokens,
   };
 }
 

@@ -18,6 +18,17 @@ test("mapModel rejects missing capability limits", () => {
   assert.throws(() => mapModel({ slug: "vendor/model-5" }), /vendor\/model-5.*capability limits/);
 });
 
+test("mapModel falls back to contextWindow when max tokens missing", () => {
+  const model = mapModel({ slug: "glm-5.3", context_window: 1048576 });
+  assert.equal(model?.contextWindow, 1048576);
+  assert.equal(model?.maxTokens, 1048576);
+});
+
+test("mapModel keeps explicit max tokens over fallback", () => {
+  const model = mapModel({ slug: "gpt-x", context_window: 272000, max_tokens: 128000 });
+  assert.equal(model?.maxTokens, 128000);
+});
+
 test("mapCatalog is atomic: one bad entry rejects the whole catalog", () => {
   const good = { id: "good-model", context_window: 64000, max_tokens: 8192 };
   assert.throws(
