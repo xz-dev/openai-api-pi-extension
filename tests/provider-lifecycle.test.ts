@@ -216,6 +216,34 @@ test("invalid environment connection fails closed without mixing stored fields",
   assert.equal(await models.getAuth(PROVIDER), undefined);
 });
 
+test("login saves the API key even when the catalog is unusable; refresh keeps failing on the catalog", async () => {
+  const gatewayServer = await gateway("axis/codex-auto-review", "test-key", false);
+  const credentials = new InMemoryCredentialStore();
+  const modelsStore = new InMemoryModelsStore();
+  const models = createModels({ credentials, modelsStore, authContext: authContext() });
+  models.setProvider(createOpenAIApiProvider());
+  const notifications: string[] = [];
+  let promptCount = 0;
+
+  const credential = await models.login(PROVIDER, "api_key", {
+    prompt: async () => (promptCount++ === 0 ? gatewayServer.baseUrl : "test-key"),
+    notify: (event) => {
+      if (event.type === "info") notifications.push(event.message);
+    },
+  });
+
+  assert.equal(credential.key, "test-key");
+  assert.deepEqual(await credentials.read(PROVIDER), credential);
+  assert.match(
+    notifications.find((message) => /catalog is not usable/.test(message)) ?? "",
+    /axis\/codex-auto-review.*capability limits.*API key saved/,
+  );
+
+  const result = await models.refresh();
+  assert.match(result.errors.get(PROVIDER)?.message ?? "", /axis\/codex-auto-review.*capability limits/);
+  assert.equal(models.getModels(PROVIDER).length, 0, "no partial catalog may be published");
+});
+
 test("incomplete catalog fails refresh without replacing the last verified models", async () => {
   const gatewayServer = await gateway("untrusted-model", "test-key", false);
   const credentials = new InMemoryCredentialStore();

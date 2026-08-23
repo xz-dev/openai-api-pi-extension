@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { fetchModels, mapModel, normalizeBaseUrl } from "../index.ts";
+import { fetchModels, mapCatalog, mapModel, normalizeBaseUrl } from "../index.ts";
 
 test("normalizeBaseUrl trims, strips slashes, rejects non-http", () => {
   assert.equal(normalizeBaseUrl("  https://gw.example.com/v1/  "), "https://gw.example.com/v1");
@@ -16,6 +16,16 @@ test("normalizeBaseUrl trims, strips slashes, rejects non-http", () => {
 
 test("mapModel rejects missing capability limits", () => {
   assert.throws(() => mapModel({ slug: "vendor/model-5" }), /vendor\/model-5.*capability limits/);
+});
+
+test("mapCatalog is atomic: one bad entry rejects the whole catalog", () => {
+  const good = { id: "good-model", context_window: 64000, max_tokens: 8192 };
+  assert.throws(
+    () => mapCatalog([good, { slug: "axis/codex-auto-review" }]),
+    /axis\/codex-auto-review.*capability limits/,
+  );
+  assert.equal(mapCatalog([good]).length, 1);
+  assert.throws(() => mapCatalog([]), /no usable models/);
 });
 
 test("mapModel prefers display_name and honors upstream limits", () => {

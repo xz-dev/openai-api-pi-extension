@@ -99,9 +99,13 @@ tune any model without touching this extension:
 ## Model metadata
 
 The extension requests the Codex-compatible `/v1/models?client_version=...`
-catalog. Every model must provide identity, context-window, and output-token
-limits; an incomplete catalog fails refresh atomically, so Pi keeps the last
-verified catalog instead of publishing invented limits.
+catalog. Catalog refresh is atomic: every model must provide identity,
+context-window, and output-token limits, or the whole list is rejected — Pi
+keeps the last verified catalog instead of publishing invented limits or a
+partial list. `/login` is not blocked by catalog quality: only connection
+failures (unreachable gateway, invalid API key, non-Codex payload) fail login.
+If the gateway connects but the catalog is unusable, the key is saved and the
+problem is reported where it belongs — model-list refresh.
 
 ## Development
 

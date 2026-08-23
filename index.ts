@@ -86,8 +86,8 @@ export function mapModel(entry: unknown, baseUrl = DEFAULT_BASE_URL): GatewayMod
   };
 }
 
-/** Fetches and maps the gateway catalog; throws on HTTP or invalid/empty catalogs. */
-export async function fetchModels(baseUrl: string, apiKey: string, signal?: AbortSignal): Promise<GatewayModel[]> {
+/** Fetches the raw gateway catalog; throws only on transport/shape failures (HTTP, auth, non-Codex payload). */
+export async function fetchCatalog(baseUrl: string, apiKey: string, signal?: AbortSignal): Promise<unknown[]> {
   const url = new URL(`${baseUrl}/models`);
   url.searchParams.set("client_version", VERSION);
   const response = await fetch(url, {
@@ -99,7 +99,12 @@ export async function fetchModels(baseUrl: string, apiKey: string, signal?: Abor
   if (typeof payload !== "object" || payload === null || !Array.isArray((payload as { models?: unknown }).models)) {
     throw new Error("Model discovery did not return a Codex model catalog");
   }
-  const models = (payload as { models: unknown[] }).models
+  return (payload as { models: unknown[] }).models;
+}
+
+/** Maps a raw catalog atomically: any unusable entry rejects the whole list, never a partial one. */
+export function mapCatalog(entries: readonly unknown[], baseUrl = DEFAULT_BASE_URL): GatewayModel[] {
+  const models = entries
     .map((entry) => {
       const model = mapModel(entry, baseUrl);
       if (!model) throw new Error("Model discovery returned an invalid catalog entry");
@@ -108,6 +113,11 @@ export async function fetchModels(baseUrl: string, apiKey: string, signal?: Abor
     .sort((left, right) => left.id.localeCompare(right.id));
   if (models.length === 0) throw new Error("Model discovery returned no usable models");
   return models;
+}
+
+/** Fetches and maps the gateway catalog atomically; throws on transport, shape, or entry-level failures. */
+export async function fetchModels(baseUrl: string, apiKey: string, signal?: AbortSignal): Promise<GatewayModel[]> {
+  return mapCatalog(await fetchCatalog(baseUrl, apiKey, signal), baseUrl);
 }
 
 function credentialBaseUrl(credential: ApiKeyCredential | undefined): string | undefined {
@@ -158,9 +168,18 @@ function apiKeyAuth(
       if (!apiKey) throw new Error("Gateway API key cannot be empty");
 
       interaction.notify({ type: "progress", message: "Validating connection..." });
-      const models = await fetchModels(baseUrl, apiKey, interaction.signal);
-      onValidated(baseUrl, apiKey, models);
-      interaction.notify({ type: "info", message: `Found ${models.length} models.` });
+      const entries = await fetchCatalog(baseUrl, apiKey, interaction.signal);
+      try {
+        const models = mapCatalog(entries, baseUrl);
+        onValidated(baseUrl, apiKey, models);
+        interaction.notify({ type: "info", message: `Found ${models.length} models.` });
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        interaction.notify({
+          type: "info",
+          message: `Connected, but the model catalog is not usable: ${reason} API key saved; models were not updated.`,
+        });
+      }
       return { type: "api_key", key: apiKey, env: { [ENV_BASE_URL]: baseUrl } };
     },
     check: async ({ ctx, credential, signal }) => {
