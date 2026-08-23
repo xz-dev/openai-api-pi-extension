@@ -15,7 +15,7 @@ const BASE_URL_ENV = "OPENAI_API_EXTENSION_BASE_URL";
 const API_KEY_ENV = "OPENAI_API_EXTENSION_API_KEY";
 const servers: Server[] = [];
 
-async function gateway(modelId: string, expectedKey = "test-key") {
+async function gateway(modelId: string, expectedKey = "test-key", includeLimits = true) {
   const requests: string[] = [];
   const server = createServer((request, response) => {
     requests.push(`${request.method} ${request.url} ${request.headers.authorization ?? ""}`);
@@ -24,7 +24,9 @@ async function gateway(modelId: string, expectedKey = "test-key") {
       return;
     }
     response.writeHead(200, { "content-type": "application/json" });
-    response.end(JSON.stringify({ data: [{ id: modelId, context_window: 64000, max_output_tokens: 8192 }] }));
+    response.end(JSON.stringify({
+      models: [{ slug: modelId, ...(includeLimits ? { context_window: 64000, max_tokens: 8192 } : {}) }],
+    }));
   });
   servers.push(server);
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -113,8 +115,8 @@ test("host convergence persists factory-prefetched models without another networ
     reasoning: true,
     input: ["text"] as Array<"text" | "image">,
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: 128000,
-    maxTokens: 16384,
+    contextWindow: 64000,
+    maxTokens: 8192,
   };
   const models = createModels({ modelsStore, authContext: authContext() });
   models.setProvider(createOpenAIApiProvider([prefetched]));
@@ -170,8 +172,8 @@ test("environment fields override stored connection during refresh and request a
         reasoning: true,
         input: ["text"],
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        contextWindow: 128000,
-        maxTokens: 16384,
+        contextWindow: 64000,
+        maxTokens: 8192,
       },
     ],
   });
@@ -212,6 +214,39 @@ test("invalid environment connection fails closed without mixing stored fields",
   assert.equal(result.errors.size, 0);
   assert.equal(storedGateway.requests.length, 0);
   assert.equal(await models.getAuth(PROVIDER), undefined);
+});
+
+test("incomplete catalog fails refresh without replacing the last verified models", async () => {
+  const gatewayServer = await gateway("untrusted-model", "test-key", false);
+  const credentials = new InMemoryCredentialStore();
+  const modelsStore = new InMemoryModelsStore();
+  await credentials.modify(PROVIDER, async () => ({
+    type: "api_key",
+    key: "test-key",
+    env: { [BASE_URL_ENV]: gatewayServer.baseUrl },
+  }));
+  await modelsStore.write(PROVIDER, {
+    models: [{
+      id: "verified-model",
+      name: "verified-model",
+      provider: PROVIDER,
+      api: "openai-responses",
+      baseUrl: gatewayServer.baseUrl,
+      reasoning: true,
+      input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 64000,
+      maxTokens: 8192,
+    }],
+  });
+  const models = createModels({ credentials, modelsStore, authContext: authContext() });
+  models.setProvider(createOpenAIApiProvider());
+
+  const result = await models.refresh();
+  assert.match(result.errors.get(PROVIDER)?.message ?? "", /untrusted-model.*capability limits/);
+  assert.equal(models.getModel(PROVIDER, "verified-model")?.contextWindow, 64000);
+  assert.equal(models.getModel(PROVIDER, "untrusted-model"), undefined);
+  assert.equal((await modelsStore.read(PROVIDER))?.models[0]?.id, "verified-model");
 });
 
 test("refresh abort reaches the catalog request without publishing partial state", async () => {

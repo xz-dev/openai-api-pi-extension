@@ -5,7 +5,7 @@
  * - /login openai-api-extension
  * - OPENAI_API_EXTENSION_BASE_URL / OPENAI_API_EXTENSION_API_KEY
  */
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { type ExtensionAPI, VERSION } from "@earendil-works/pi-coding-agent";
 import {
   type ApiKeyAuth,
   type ApiKeyCredential,
@@ -22,8 +22,6 @@ const PROVIDER_NAME = "OpenAI API Extension";
 const ENV_BASE_URL = "OPENAI_API_EXTENSION_BASE_URL";
 const ENV_API_KEY = "OPENAI_API_EXTENSION_API_KEY";
 const DEFAULT_BASE_URL = "https://api.openai.com/v1";
-const DEFAULT_CONTEXT_WINDOW = 128000;
-const DEFAULT_MAX_TOKENS = 16384;
 
 /** Normalizes a user-supplied base URL: trims, strips trailing slashes, http(s) only. */
 export function normalizeBaseUrl(raw: string | undefined): string | undefined {
@@ -46,6 +44,7 @@ export function normalizeBaseUrl(raw: string | undefined): string | undefined {
 
 type UpstreamModel = {
   id?: unknown;
+  slug?: unknown;
   name?: unknown;
   display_name?: unknown;
   context_window?: unknown;
@@ -65,8 +64,11 @@ export type GatewayModel = Model<"openai-responses">;
 export function mapModel(entry: unknown, baseUrl = DEFAULT_BASE_URL): GatewayModel | undefined {
   if (typeof entry !== "object" || entry === null || Array.isArray(entry)) return undefined;
   const row = entry as UpstreamModel;
-  const id = typeof row.id === "string" ? row.id.trim() : "";
+  const id = [row.id, row.slug].find((value): value is string => typeof value === "string" && value.trim() !== "")?.trim();
   if (!id) return undefined;
+  const contextWindow = num(row.context_window) ?? num(row.context_length);
+  const maxTokens = num(row.max_output_tokens) ?? num(row.max_completion_tokens) ?? num(row.max_tokens);
+  if (!contextWindow || !maxTokens) throw new Error(`Model ${id} is missing capability limits`);
   const name =
     [row.name, row.display_name].find((value): value is string => typeof value === "string" && value.trim() !== "")
       ?.trim() ?? id;
@@ -79,28 +81,29 @@ export function mapModel(entry: unknown, baseUrl = DEFAULT_BASE_URL): GatewayMod
     reasoning: true,
     input: ["text"],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: num(row.context_window) ?? num(row.context_length) ?? DEFAULT_CONTEXT_WINDOW,
-    maxTokens:
-      num(row.max_output_tokens) ?? num(row.max_completion_tokens) ?? num(row.max_tokens) ?? DEFAULT_MAX_TOKENS,
+    contextWindow,
+    maxTokens,
   };
 }
 
 /** Fetches and maps the gateway catalog; throws on HTTP or invalid/empty catalogs. */
 export async function fetchModels(baseUrl: string, apiKey: string, signal?: AbortSignal): Promise<GatewayModel[]> {
-  const response = await fetch(`${baseUrl}/models`, {
+  const url = new URL(`${baseUrl}/models`);
+  url.searchParams.set("client_version", VERSION);
+  const response = await fetch(url, {
     headers: { Authorization: `Bearer ${apiKey}` },
     signal,
   });
   if (!response.ok) throw new Error(`Model discovery failed: HTTP ${response.status}`);
   const payload: unknown = await response.json();
-  const rows =
-    typeof payload === "object" && payload !== null && Array.isArray((payload as { data?: unknown }).data)
-      ? (payload as { data: unknown[] }).data
-      : [];
-  const models = rows
-    .flatMap((entry) => {
+  if (typeof payload !== "object" || payload === null || !Array.isArray((payload as { models?: unknown }).models)) {
+    throw new Error("Model discovery did not return a Codex model catalog");
+  }
+  const models = (payload as { models: unknown[] }).models
+    .map((entry) => {
       const model = mapModel(entry, baseUrl);
-      return model ? [model] : [];
+      if (!model) throw new Error("Model discovery returned an invalid catalog entry");
+      return model;
     })
     .sort((left, right) => left.id.localeCompare(right.id));
   if (models.length === 0) throw new Error("Model discovery returned no usable models");

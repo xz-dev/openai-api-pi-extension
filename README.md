@@ -98,11 +98,10 @@ tune any model without touching this extension:
 
 ## Model metadata
 
-The standard `/v1/models` response carries little metadata on most gateways.
-When fields are present they are honored: `context_window` /
-`context_length`, `max_output_tokens` / `max_completion_tokens` /
-`max_tokens`, and `name` / `display_name`. Otherwise sensible defaults
-(128k context / 16k output) are used.
+The extension requests the Codex-compatible `/v1/models?client_version=...`
+catalog. Every model must provide identity, context-window, and output-token
+limits; an incomplete catalog fails refresh atomically, so Pi keeps the last
+verified catalog instead of publishing invented limits.
 
 ## Development
 

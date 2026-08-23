@@ -49,10 +49,10 @@ test("async factory publishes environment catalog before startup", async () => {
   savedEnv = Object.fromEntries(ENV_KEYS.map((key) => [key, process.env[key]]));
   delete process.env.PI_OFFLINE;
   const server = createServer((request, response) => {
-    assert.equal(request.url, "/v1/models");
+    assert.equal(request.url, "/v1/models?client_version=0.84.2");
     assert.equal(request.headers.authorization, "Bearer loader-key");
     response.writeHead(200, { "content-type": "application/json" });
-    response.end(JSON.stringify({ data: [{ id: "loader-model" }] }));
+    response.end(JSON.stringify({ models: [{ slug: "loader-model", context_window: 64000, max_tokens: 8192 }] }));
   });
   servers.push(server);
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));

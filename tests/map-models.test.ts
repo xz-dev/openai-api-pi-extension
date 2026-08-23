@@ -14,26 +14,18 @@ test("normalizeBaseUrl trims, strips slashes, rejects non-http", () => {
   assert.equal(normalizeBaseUrl("   "), undefined);
 });
 
-test("mapModel keeps identity id, falls back to defaults", () => {
-  const model = mapModel({ id: "vendor/model-5" });
-  assert.equal(model?.id, "vendor/model-5");
-  assert.equal(model?.name, "vendor/model-5");
-  assert.equal(model?.reasoning, true);
-  assert.equal(model?.provider, "openai-api-extension");
-  assert.equal(model?.api, "openai-responses");
-  assert.equal(model?.baseUrl, "https://api.openai.com/v1");
-  assert.equal(model?.contextWindow, 128000);
-  assert.equal(model?.maxTokens, 16384);
-  assert.deepEqual(model?.input, ["text"]);
+test("mapModel rejects missing capability limits", () => {
+  assert.throws(() => mapModel({ slug: "vendor/model-5" }), /vendor\/model-5.*capability limits/);
 });
 
 test("mapModel prefers display_name and honors upstream limits", () => {
   const model = mapModel({
-    id: "gpt-x",
+    slug: "gpt-x",
     display_name: "GPT X",
     context_window: 400000,
-    max_output_tokens: 128000,
+    max_tokens: 128000,
   });
+  assert.equal(model?.id, "gpt-x");
   assert.equal(model?.name, "GPT X");
   assert.equal(model?.contextWindow, 400000);
   assert.equal(model?.maxTokens, 128000);
@@ -51,6 +43,21 @@ test("mapModel rejects entries without usable id", () => {
   assert.equal(mapModel({ id: 42 }), undefined);
   assert.equal(mapModel(null), undefined);
   assert.equal(mapModel([]), undefined);
+});
+
+test("fetchModels requests Codex catalog and rejects plain OpenAI shape", async () => {
+  const originalFetch = globalThis.fetch;
+  let requestedUrl = "";
+  globalThis.fetch = async (input) => {
+    requestedUrl = String(input);
+    return Response.json({ data: [{ id: "gpt-x" }] });
+  };
+  try {
+    await assert.rejects(fetchModels("https://gateway.example/v1", "secret-key"), /Codex model catalog/);
+    assert.equal(requestedUrl, "https://gateway.example/v1/models?client_version=0.84.2");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("catalog HTTP errors do not expose endpoint or API key", async () => {
