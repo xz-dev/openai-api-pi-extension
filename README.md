@@ -12,11 +12,11 @@ CLIProxyAPI, LiteLLM, or the official OpenAI API — using the
   request-time endpoint selection.
 - Discovers models from `GET {baseUrl}/models` during async startup or Pi's
   provider refresh.
-- Every model is registered with `api: "openai-responses"` and reasoning
-  enabled — the gateway is trusted to accept and normalize reasoning
-  parameters; per-model tuning belongs in `~/.pi/agent/models.json`.
-- No catalog enrichment, no effort-tier inference, no retry logic: request
-  bodies go through Pi's standard OpenAI Responses adapter unchanged.
+- Every model is registered with `api: "openai-responses"`. Reasoning and
+  `thinkingLevelMap` come from the Codex catalog (`supported_reasoning_levels`
+  or `capabilities.effort_tiers`), using the same map shape as OmniRoute:
+  `off` is hidden, `minimal` aliases `low`, unknown/`ultra`/`none-only` fail
+  closed. Request bodies still go through Pi's standard OpenAI Responses adapter.
 
 ## Setup
 
@@ -78,23 +78,8 @@ pi -e git:github.com/xz-dev/openai-api-pi-extension --provider openai-api-extens
 
 ## Per-model overrides
 
-Pi composes `~/.pi/agent/models.json` above registered providers. Use it to
-tune any model without touching this extension:
-
-```json
-{
-  "providers": {
-    "openai-api-extension": {
-      "models": [
-        {
-          "id": "gpt-5.6",
-          "thinkingLevelMap": { "off": null, "low": "low", "medium": "medium", "high": "high", "max": "max" }
-        }
-      ]
-    }
-  }
-}
-```
+Pi composes `~/.pi/agent/models.json` above registered providers. Use it only
+to override a catalog-derived map, not to invent the default tiers.
 
 ## Model metadata
 
@@ -105,7 +90,9 @@ keeps the last verified catalog instead of publishing invented limits or a
 partial list. `/login` is not blocked by catalog quality: only connection
 failures (unreachable gateway, invalid API key, non-Codex payload) fail login.
 If the gateway connects but the catalog is unusable, the key is saved and the
-problem is reported where it belongs — model-list refresh.
+problem is reported where it belongs — model-list refresh. Pi's `/model` overlay
+only names the provider; this extension also appends a TUI-only chat entry with
+the real discovery error (HTTP status and a short body, no URL or API key).
 
 ## Development
 

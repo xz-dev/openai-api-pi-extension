@@ -277,6 +277,41 @@ test("incomplete catalog fails refresh without replacing the last verified model
   assert.equal((await modelsStore.read(PROVIDER))?.models[0]?.id, "verified-model");
 });
 
+test("refresh reports catalog errors then still keeps cached models", async () => {
+  const gatewayServer = await gateway("untrusted-model", "test-key", false);
+  const credentials = new InMemoryCredentialStore();
+  const modelsStore = new InMemoryModelsStore();
+  await credentials.modify(PROVIDER, async () => ({
+    type: "api_key",
+    key: "test-key",
+    env: { [BASE_URL_ENV]: gatewayServer.baseUrl },
+  }));
+  await modelsStore.write(PROVIDER, {
+    models: [{
+      id: "verified-model",
+      name: "verified-model",
+      provider: PROVIDER,
+      api: "openai-responses",
+      baseUrl: gatewayServer.baseUrl,
+      reasoning: true,
+      input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 64000,
+      maxTokens: 8192,
+    }],
+  });
+  const reported: string[] = [];
+  const models = createModels({ credentials, modelsStore, authContext: authContext() });
+  models.setProvider(createOpenAIApiProvider([], (message) => {
+    reported.push(message);
+  }));
+
+  const result = await models.refresh();
+  assert.match(result.errors.get(PROVIDER)?.message ?? "", /untrusted-model.*capability limits/);
+  assert.deepEqual(reported, [result.errors.get(PROVIDER)?.message]);
+  assert.equal(models.getModel(PROVIDER, "verified-model")?.contextWindow, 64000);
+});
+
 test("refresh abort reaches the catalog request without publishing partial state", async () => {
   const server = createServer(() => undefined);
   servers.push(server);

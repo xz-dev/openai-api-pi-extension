@@ -22,6 +22,15 @@ const PROVIDER_NAME = "OpenAI API Extension";
 const ENV_BASE_URL = "OPENAI_API_EXTENSION_BASE_URL";
 const ENV_API_KEY = "OPENAI_API_EXTENSION_API_KEY";
 const DEFAULT_BASE_URL = "https://api.openai.com/v1";
+const ERROR_ENTRY = "openai-api-extension.error";
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function isAbortError(error: unknown, signal?: AbortSignal): boolean {
+  return Boolean(signal?.aborted) || (error instanceof Error && error.name === "AbortError");
+}
 
 /** Normalizes a user-supplied base URL: trims, strips trailing slashes, http(s) only. */
 export function normalizeBaseUrl(raw: string | undefined): string | undefined {
@@ -42,6 +51,10 @@ export function normalizeBaseUrl(raw: string | undefined): string | undefined {
   }
 }
 
+const REASONING_EFFORTS = new Set(["none", "low", "medium", "high", "xhigh", "max"]);
+
+type ReasoningEffort = "none" | "low" | "medium" | "high" | "xhigh" | "max";
+
 type UpstreamModel = {
   id?: unknown;
   slug?: unknown;
@@ -52,10 +65,40 @@ type UpstreamModel = {
   max_tokens?: unknown;
   max_output_tokens?: unknown;
   max_completion_tokens?: unknown;
+  input_modalities?: unknown;
+  supported_reasoning_levels?: unknown;
+  capabilities?: unknown;
 };
 
 function num(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function parseEfforts(value: unknown): ReasoningEffort[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => {
+    const effort = typeof item === "string" ? item : isRecord(item) ? item.effort : undefined;
+    const normalized = typeof effort === "string" ? effort.trim().toLowerCase() : undefined;
+    return normalized && REASONING_EFFORTS.has(normalized) ? [normalized as ReasoningEffort] : [];
+  });
+}
+
+function thinkingLevelMap(efforts: ReasoningEffort[]) {
+  const available = new Set(efforts);
+  if (![...available].some((effort) => effort !== "none")) return undefined;
+  return {
+    off: null,
+    minimal: available.has("low") ? "low" : null,
+    low: available.has("low") ? "low" : null,
+    medium: available.has("medium") ? "medium" : null,
+    high: available.has("high") ? "high" : null,
+    xhigh: available.has("xhigh") ? "xhigh" : null,
+    max: available.has("max") ? "max" : null,
+  };
 }
 
 export type GatewayModel = Model<"openai-responses">;
@@ -76,14 +119,20 @@ export function mapModel(entry: unknown, baseUrl = DEFAULT_BASE_URL): GatewayMod
   const name =
     [row.name, row.display_name].find((value): value is string => typeof value === "string" && value.trim() !== "")
       ?.trim() ?? id;
+  const map = thinkingLevelMap(
+    parseEfforts(
+      row.supported_reasoning_levels ?? (isRecord(row.capabilities) ? row.capabilities.effort_tiers : undefined),
+    ),
+  );
   return {
     id,
     name,
     provider: PROVIDER,
     api: "openai-responses",
     baseUrl,
-    reasoning: true,
-    input: ["text"],
+    reasoning: map !== undefined,
+    ...(map ? { thinkingLevelMap: map } : {}),
+    input: Array.isArray(row.input_modalities) && row.input_modalities.includes("image") ? ["text", "image"] : ["text"],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow,
     maxTokens: resolvedMaxTokens,
@@ -98,7 +147,10 @@ export async function fetchCatalog(baseUrl: string, apiKey: string, signal?: Abo
     headers: { Authorization: `Bearer ${apiKey}` },
     signal,
   });
-  if (!response.ok) throw new Error(`Model discovery failed: HTTP ${response.status}`);
+  if (!response.ok) {
+    const body = (await response.text().catch(() => "")).replace(/\s+/g, " ").trim().slice(0, 160);
+    throw new Error(`Model discovery failed: HTTP ${response.status}${body ? `: ${body}` : ""}`);
+  }
   const payload: unknown = await response.json();
   if (typeof payload !== "object" || payload === null || !Array.isArray((payload as { models?: unknown }).models)) {
     throw new Error("Model discovery did not return a Codex model catalog");
@@ -202,7 +254,10 @@ function apiKeyAuth(
   };
 }
 
-export function createOpenAIApiProvider(initialModels: readonly GatewayModel[] = []): Provider<"openai-responses"> {
+export function createOpenAIApiProvider(
+  initialModels: readonly GatewayModel[] = [],
+  onCatalogError?: (message: string) => void,
+): Provider<"openai-responses"> {
   let models = initialModels;
   let initialModelsPublished = false;
   let validatedLogin:
@@ -252,12 +307,23 @@ export function createOpenAIApiProvider(initialModels: readonly GatewayModel[] =
       const baseUrl = credentialBaseUrl(context.credential);
       const apiKey = context.credential.key;
       if (!baseUrl || !apiKey) return;
-      const refreshed = await fetchModels(baseUrl, apiKey, context.signal);
-      if (context.signal.aborted) return;
-      await context.publish({
-        persist: { models: refreshed, checkedAt: Date.now() },
-        update: () => { models = refreshed; },
-      });
+      try {
+        const refreshed = await fetchModels(baseUrl, apiKey, context.signal);
+        if (context.signal.aborted) return;
+        await context.publish({
+          persist: { models: refreshed, checkedAt: Date.now() },
+          update: () => { models = refreshed; },
+        });
+      } catch (error) {
+        if (!isAbortError(error, context.signal)) {
+          try {
+            onCatalogError?.(errorMessage(error));
+          } catch {
+            /* reporter must not mask the catalog error */
+          }
+        }
+        throw error;
+      }
     },
     stream: (model, context, options) => api.stream(model, context, options),
     streamSimple: (model, context, options) => api.streamSimple(model, context, options),
@@ -266,6 +332,29 @@ export function createOpenAIApiProvider(initialModels: readonly GatewayModel[] =
 }
 
 export default async function (pi: ExtensionAPI): Promise<void> {
+  pi.registerEntryRenderer(ERROR_ENTRY, (entry, _options, theme) => {
+    const message =
+      typeof (entry.data as { message?: unknown } | undefined)?.message === "string"
+        ? (entry.data as { message: string }).message
+        : "catalog refresh failed";
+    return {
+      render(width: number) {
+        const text = `[openai-api-extension] ${message}`;
+        const size = Math.max(width, 1);
+        const lines: string[] = [];
+        for (let i = 0; i < text.length; i += size) lines.push(theme.fg("error", text.slice(i, i + size)));
+        return lines;
+      },
+      invalidate() {},
+    };
+  });
+  const reportCatalogError = (message: string) => {
+    try {
+      pi.appendEntry(ERROR_ENTRY, { message });
+    } catch {
+      console.warn(`[openai-api-extension] ${message}`);
+    }
+  };
   const baseUrl = normalizeBaseUrl(process.env[ENV_BASE_URL]);
   const apiKey = process.env[ENV_API_KEY]?.trim();
   let models: readonly GatewayModel[] = [];
@@ -273,10 +362,8 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     try {
       models = await fetchModels(baseUrl, apiKey, AbortSignal.timeout(15_000));
     } catch (error) {
-      console.warn(
-        `[openai-api-extension] model discovery failed: ${error instanceof Error ? error.message : String(error)}`,
-      );
+      console.warn(`[openai-api-extension] model discovery failed: ${errorMessage(error)}`);
     }
   }
-  pi.registerProvider(createOpenAIApiProvider(models));
+  pi.registerProvider(createOpenAIApiProvider(models, reportCatalogError));
 }

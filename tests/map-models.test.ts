@@ -50,6 +50,63 @@ test("mapModel prefers display_name and honors upstream limits", () => {
   assert.equal(model?.name, "GPT X");
   assert.equal(model?.contextWindow, 400000);
   assert.equal(model?.maxTokens, 128000);
+  assert.equal(model?.reasoning, false);
+  assert.equal(model?.thinkingLevelMap, undefined);
+  assert.deepEqual(model?.input, ["text"]);
+});
+
+test("mapModel copies Codex reasoning levels and image input", () => {
+  const model = mapModel({
+    slug: "gpt-5.6-sol",
+    display_name: "GPT 5.6 Sol",
+    context_window: 272000,
+    max_tokens: 128000,
+    input_modalities: ["text", "image"],
+    supported_reasoning_levels: [
+      { effort: "low" },
+      { effort: "medium" },
+      { effort: "high" },
+      { effort: "xhigh" },
+      { effort: "max" },
+      { effort: "ultra" },
+    ],
+  });
+  assert.equal(model?.reasoning, true);
+  assert.deepEqual(model?.thinkingLevelMap, {
+    off: null,
+    minimal: "low",
+    low: "low",
+    medium: "medium",
+    high: "high",
+    xhigh: "xhigh",
+    max: "max",
+  });
+  assert.equal((model?.thinkingLevelMap as Record<string, unknown> | undefined)?.ultra, undefined);
+  assert.deepEqual(model?.input, ["text", "image"]);
+});
+
+test("mapModel accepts OmniRoute effort_tiers and fails closed for none-only", () => {
+  const glm = mapModel({
+    slug: "glm-5.3",
+    context_window: 1048576,
+    capabilities: { effort_tiers: ["low", "medium", "high"] },
+  });
+  assert.deepEqual(glm?.thinkingLevelMap, {
+    off: null,
+    minimal: "low",
+    low: "low",
+    medium: "medium",
+    high: "high",
+    xhigh: null,
+    max: null,
+  });
+  const none = mapModel({
+    slug: "no-think",
+    context_window: 64000,
+    supported_reasoning_levels: ["none", "ultra"],
+  });
+  assert.equal(none?.reasoning, false);
+  assert.equal(none?.thinkingLevelMap, undefined);
 });
 
 test("mapModel accepts context_length and max_tokens aliases", () => {
@@ -90,6 +147,22 @@ test("catalog HTTP errors do not expose endpoint or API key", async () => {
       (error: Error) => {
         assert.equal(error.message, "Model discovery failed: HTTP 401");
         assert.doesNotMatch(error.message, /gateway|account-42|secret-key/);
+        return true;
+      },
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("catalog HTTP errors include a short response body", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response("Bad Gateway", { status: 502 });
+  try {
+    await assert.rejects(
+      fetchModels("https://gateway.example/v1", "secret-key"),
+      (error: Error) => {
+        assert.equal(error.message, "Model discovery failed: HTTP 502: Bad Gateway");
         return true;
       },
     );
