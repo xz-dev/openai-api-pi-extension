@@ -7,9 +7,17 @@ import { createOpenAIApiProvider } from "../index.ts";
 const PROVIDER = "openai-api-extension";
 let server: Server;
 let baseUrl: string;
+let savedEnv: Record<string, string | undefined>;
+let savedOffline: string | undefined;
 let captured: { url?: string; authorization?: string; body?: Record<string, unknown> } = {};
 
+const ENV_KEYS = ["OPENAI_API_EXTENSION_BASE_URL", "OPENAI_API_EXTENSION_API_KEY"] as const;
+
 before(async () => {
+  savedEnv = Object.fromEntries(ENV_KEYS.map((key) => [key, process.env[key]]));
+  savedOffline = process.env.PI_OFFLINE;
+  for (const key of ENV_KEYS) delete process.env[key];
+  delete process.env.PI_OFFLINE;
   server = createServer(async (request, response) => {
     captured.url = request.url;
     captured.authorization = request.headers.authorization;
@@ -51,6 +59,13 @@ before(async () => {
 });
 
 after(async () => {
+  for (const key of ENV_KEYS) {
+    const value = savedEnv[key];
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+  if (savedOffline === undefined) delete process.env.PI_OFFLINE;
+  else process.env.PI_OFFLINE = savedOffline;
   await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
 });
 

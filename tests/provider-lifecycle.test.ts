@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createServer, type Server } from "node:http";
-import { afterEach, test } from "node:test";
+import { afterEach, beforeEach, test } from "node:test";
 import {
   createModels,
   InMemoryCredentialStore,
@@ -14,6 +14,13 @@ const PROVIDER = "openai-api-extension";
 const BASE_URL_ENV = "OPENAI_API_EXTENSION_BASE_URL";
 const API_KEY_ENV = "OPENAI_API_EXTENSION_API_KEY";
 const servers: Server[] = [];
+let savedEnv: Record<string, string | undefined>;
+
+beforeEach(() => {
+  savedEnv = { [BASE_URL_ENV]: process.env[BASE_URL_ENV], [API_KEY_ENV]: process.env[API_KEY_ENV] };
+  delete process.env[BASE_URL_ENV];
+  delete process.env[API_KEY_ENV];
+});
 
 async function gateway(modelId: string, expectedKey = "test-key", includeLimits = true) {
   const requests: string[] = [];
@@ -43,6 +50,11 @@ function authContext(env: Record<string, string | undefined> = {}): AuthContext 
 }
 
 afterEach(async () => {
+  for (const key of [BASE_URL_ENV, API_KEY_ENV]) {
+    const value = savedEnv[key];
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
   await Promise.all(
     servers.splice(0).map((server) => new Promise<void>((resolve) => server.close(() => resolve()))),
   );
@@ -193,6 +205,37 @@ test("environment fields override stored connection during refresh and request a
   assert.deepEqual((await models.getAuth(PROVIDER))?.auth, {
     apiKey: "env-key",
     baseUrl: currentGateway.baseUrl,
+  });
+});
+
+test("auth context fields override stored connection independently", async () => {
+  const apiKeyAuth = createOpenAIApiProvider().auth.apiKey;
+  assert.ok(apiKeyAuth);
+  const credential = {
+    type: "api_key" as const,
+    key: "old-key",
+    env: { [BASE_URL_ENV]: "https://stored.example/v1" },
+  };
+  const signal = new AbortController().signal;
+
+  const overriddenBaseUrl = await apiKeyAuth.resolve({
+    ctx: authContext({ [BASE_URL_ENV]: "https://environment.example/v1" }),
+    credential,
+    signal,
+  });
+  assert.deepEqual(overriddenBaseUrl?.auth, {
+    apiKey: "old-key",
+    baseUrl: "https://environment.example/v1",
+  });
+
+  const overriddenApiKey = await apiKeyAuth.resolve({
+    ctx: authContext({ [API_KEY_ENV]: "env-key" }),
+    credential,
+    signal,
+  });
+  assert.deepEqual(overriddenApiKey?.auth, {
+    apiKey: "env-key",
+    baseUrl: "https://stored.example/v1",
   });
 });
 

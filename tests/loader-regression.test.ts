@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
 import { createServer, type Server } from "node:http";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, test } from "node:test";
-import { discoverAndLoadExtensions } from "@earendil-works/pi-coding-agent";
+import {
+  createAgentSessionServices,
+  discoverAndLoadExtensions,
+} from "@earendil-works/pi-coding-agent";
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const extensionPath = join(projectRoot, "index.ts");
@@ -43,6 +46,64 @@ test("real Pi loader queues exactly one complete native provider", async () => {
   assert.equal(typeof provider?.refreshModels, "function");
   assert.equal(typeof provider?.stream, "function");
   assert.equal(typeof provider?.streamSimple, "function");
+});
+
+test("real Pi runtime lets process environment override stored fields independently", async () => {
+  savedEnv = Object.fromEntries(ENV_KEYS.map((key) => [key, process.env[key]]));
+  delete process.env.PI_OFFLINE;
+  const cases = [
+    { field: "base URL", envBaseUrl: true },
+    { field: "API key", envBaseUrl: false },
+  ] as const;
+
+  for (const { field, envBaseUrl } of cases) {
+    let expectedBaseUrl = "";
+    const server = createServer((request, response) => {
+      assert.equal(request.url, "/v1/models?client_version=0.84.2");
+      assert.equal(request.headers.authorization, "Bearer current-key");
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({
+        models: [{ slug: `${envBaseUrl ? "base" : "key"}-override-model`, context_window: 64000, max_tokens: 8192 }],
+      }));
+    });
+    servers.push(server);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    assert.ok(address && typeof address === "object");
+    expectedBaseUrl = `http://127.0.0.1:${address.port}/v1`;
+
+    const agentDir = await mkdtemp(join(tmpdir(), "openai-api-extension-runtime-"));
+    tempDirs.push(agentDir);
+    const storedCredential = envBaseUrl
+      ? { type: "api_key", key: "current-key", env: { OPENAI_API_EXTENSION_BASE_URL: "http://127.0.0.1:1/v1" } }
+      : { type: "api_key", key: "stored-key", env: { OPENAI_API_EXTENSION_BASE_URL: expectedBaseUrl } };
+    await writeFile(join(agentDir, "auth.json"), JSON.stringify({ "openai-api-extension": storedCredential }));
+    if (envBaseUrl) {
+      process.env.OPENAI_API_EXTENSION_BASE_URL = expectedBaseUrl;
+      delete process.env.OPENAI_API_EXTENSION_API_KEY;
+    } else {
+      delete process.env.OPENAI_API_EXTENSION_BASE_URL;
+      process.env.OPENAI_API_EXTENSION_API_KEY = "current-key";
+    }
+
+    const services = await createAgentSessionServices({
+      cwd: projectRoot,
+      agentDir,
+      resourceLoaderOptions: {
+        additionalExtensionPaths: [extensionPath],
+        noContextFiles: true,
+        noPromptTemplates: true,
+        noSkills: true,
+        noThemes: true,
+      },
+    });
+    assert.deepEqual(services.diagnostics, [], field);
+    await services.modelRuntime.refresh({ providers: ["openai-api-extension"] });
+    const modelId = `${envBaseUrl ? "base" : "key"}-override-model`;
+    assert.equal(services.modelRuntime.getModel("openai-api-extension", modelId)?.baseUrl, expectedBaseUrl, field);
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    servers.splice(servers.indexOf(server), 1);
+  }
 });
 
 test("async factory publishes environment catalog before startup", async () => {

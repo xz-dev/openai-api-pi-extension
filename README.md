@@ -51,19 +51,6 @@ credentials refresh through Pi's provider lifecycle. If discovery fails, Pi
 retains the last persisted catalog; offline startup restores it without network
 access.
 
-## Upgrade from 0.1.0
-
-Version 0.1.0 stored API keys as OAuth credentials. After upgrading, replace
-that legacy entry once:
-
-```
-/logout openai-api-extension
-/login openai-api-extension
-```
-
-The new credential stores the key once as an API key and removes the entire
-connection on future logout.
-
 ## Install
 
 ```
