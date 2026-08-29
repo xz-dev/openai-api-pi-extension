@@ -3,7 +3,8 @@
 Minimal modern [Pi](https://pi.dev) provider extension for any
 OpenAI-compatible gateway — [Sub2API](https://github.com/Wei-Shaw/sub2api),
 CLIProxyAPI, LiteLLM, or the official OpenAI API — using the
-**Responses API** (`POST /v1/responses`) as the transport.
+**Responses API** over Pi's configured transport (`sse`, `websocket`, or
+`websocket-cached`).
 
 ## What it does
 
@@ -16,7 +17,9 @@ CLIProxyAPI, LiteLLM, or the official OpenAI API — using the
   `thinkingLevelMap` come from the Codex catalog (`supported_reasoning_levels`
   or `capabilities.effort_tiers`), using the same map shape as OmniRoute:
   `off` is hidden, `minimal` aliases `low`, unknown/`ultra`/`none-only` fail
-  closed. Request bodies still go through Pi's standard OpenAI Responses adapter.
+  closed. Request bodies and response streams still go through Pi's standard
+  OpenAI Responses adapter; the WebSocket bridge only carries those bytes via
+  the official OpenAI SDK.
 
 ## Setup
 
@@ -62,6 +65,35 @@ Or try it once without installing:
 ```
 pi -e git:github.com/xz-dev/openai-api-pi-extension --provider openai-api-extension --model <model-id>
 ```
+
+## Transports
+
+Pi's `transport` setting selects behavior:
+
+- `sse`: normal HTTP `POST /v1/responses` stream.
+- `websocket`: one Responses WebSocket per request.
+- `websocket-cached`: reuses a session WebSocket and sends
+  `previous_response_id` plus only new input when the conversation prefix still
+  matches; otherwise sends full context safely.
+- `auto`: tries cached WebSocket first, then falls back to SSE only if the
+  WebSocket fails before any response event.
+
+The bridge uses Pi's existing request builder and response parser through its
+public `fetch` injection point; it does not copy Pi's Responses protocol code.
+
+## Connection status
+
+Run:
+
+```text
+/provider-info
+```
+
+The command probes the configured gateway with the effective API key and shows
+the last transport this plugin actually used, Pi's configured transport, server
+URL, connection/key validity, and live usable model count. Before the first
+model request, actual transport is reported as `not connected yet`. It never
+prints the API key.
 
 ## Per-model overrides
 

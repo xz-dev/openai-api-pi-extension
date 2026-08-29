@@ -155,6 +155,23 @@ test("catalog HTTP errors do not expose endpoint or API key", async () => {
   }
 });
 
+test("catalog HTTP errors redact an echoed API key", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response("upstream rejected secret-key", { status: 401 });
+  try {
+    await assert.rejects(
+      fetchModels("https://gateway.example/v1", "secret-key"),
+      (error: Error) => {
+        assert.equal(error.message, "Model discovery failed: HTTP 401: upstream rejected [REDACTED]");
+        assert.doesNotMatch(error.message, /secret-key/);
+        return true;
+      },
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("catalog HTTP errors include a short response body", async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async () => new Response("Bad Gateway", { status: 502 });

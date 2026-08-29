@@ -5,7 +5,7 @@
  * - /login openai-api-extension
  * - OPENAI_API_EXTENSION_BASE_URL / OPENAI_API_EXTENSION_API_KEY
  */
-import { type ExtensionAPI, VERSION } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, type ExtensionAPI, SettingsManager, VERSION } from "@earendil-works/pi-coding-agent";
 import {
   type ApiKeyAuth,
   type ApiKeyCredential,
@@ -16,6 +16,13 @@ import {
   type RefreshModelsContext,
 } from "@earendil-works/pi-ai";
 import { openAIResponsesApi } from "@earendil-works/pi-ai/compat";
+import {
+  createResponsesWebSocketBridge,
+  getActualResponsesTransport,
+  recordActualResponsesTransport,
+  redactAssistantStream,
+  wrapResponsesWebSocketStream,
+} from "./responses-websocket-fetch.ts";
 
 const PROVIDER = "openai-api-extension";
 const PROVIDER_NAME = "OpenAI API Extension";
@@ -23,6 +30,7 @@ const ENV_BASE_URL = "OPENAI_API_EXTENSION_BASE_URL";
 const ENV_API_KEY = "OPENAI_API_EXTENSION_API_KEY";
 const DEFAULT_BASE_URL = "https://api.openai.com/v1";
 const ERROR_ENTRY = "openai-api-extension.error";
+const CONNECTION_TIMEOUT_MS = 15_000;
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -149,7 +157,8 @@ export async function fetchCatalog(baseUrl: string, apiKey: string, signal?: Abo
   });
   if (!response.ok) {
     const body = (await response.text().catch(() => "")).replace(/\s+/g, " ").trim().slice(0, 160);
-    throw new Error(`Model discovery failed: HTTP ${response.status}${body ? `: ${body}` : ""}`);
+    const safeBody = apiKey ? body.split(apiKey).join("[REDACTED]") : body;
+    throw new Error(`Model discovery failed: HTTP ${response.status}${safeBody ? `: ${safeBody}` : ""}`);
   }
   const payload: unknown = await response.json();
   if (typeof payload !== "object" || payload === null || !Array.isArray((payload as { models?: unknown }).models)) {
@@ -325,8 +334,28 @@ export function createOpenAIApiProvider(
         throw error;
       }
     },
-    stream: (model, context, options) => api.stream(model, context, options),
-    streamSimple: (model, context, options) => api.streamSimple(model, context, options),
+    stream: (model, context, options) => {
+      if (!options?.transport || options.transport === "sse") {
+        recordActualResponsesTransport(model.baseUrl, "sse", options?.sessionId);
+        return redactAssistantStream(api.stream(model, context, options), options?.apiKey);
+      }
+      const bridge = createResponsesWebSocketBridge(model, options);
+      return redactAssistantStream(
+        wrapResponsesWebSocketStream(api.stream(model, context, { ...options, fetch: bridge.fetch }), bridge),
+        options.apiKey,
+      );
+    },
+    streamSimple: (model, context, options) => {
+      if (!options?.transport || options.transport === "sse") {
+        recordActualResponsesTransport(model.baseUrl, "sse", options?.sessionId);
+        return redactAssistantStream(api.streamSimple(model, context, options), options?.apiKey);
+      }
+      const bridge = createResponsesWebSocketBridge(model, options);
+      return redactAssistantStream(
+        wrapResponsesWebSocketStream(api.streamSimple(model, context, { ...options, fetch: bridge.fetch }), bridge),
+        options.apiKey,
+      );
+    },
   };
   return provider;
 }
@@ -355,12 +384,66 @@ export default async function (pi: ExtensionAPI): Promise<void> {
       console.warn(`[openai-api-extension] ${message}`);
     }
   };
+  const getTransport = (ctx: { cwd: string; isProjectTrusted(): boolean }) => {
+    try {
+      return SettingsManager.create(ctx.cwd, getAgentDir(), {
+        projectTrusted: ctx.isProjectTrusted(),
+      }).getTransport();
+    } catch {
+      return "auto";
+    }
+  };
+
+  pi.registerCommand("provider-info", {
+    description: "Show OpenAI API Extension connection status",
+    handler: async (_args, ctx) => {
+      const transport = getTransport(ctx);
+      const auth = await ctx.modelRegistry.getProviderAuth(PROVIDER);
+      const baseUrl = normalizeBaseUrl(auth?.auth.baseUrl);
+      const apiKey = auth?.auth.apiKey?.trim();
+      const sessionId = ctx.sessionManager.getSessionId();
+      const actualTransport = baseUrl
+        ? getActualResponsesTransport(baseUrl, sessionId) ?? "not connected yet"
+        : "not connected yet";
+      const lines = [
+        "OpenAI API Extension:",
+        `Transport: ${actualTransport}`,
+        `Configured transport: ${transport}`,
+        `Server: ${baseUrl ?? "not configured"}`,
+      ];
+      if (!baseUrl || !apiKey) {
+        ctx.ui.notify([
+          ...lines,
+          "Connection: ✗ not configured",
+          "Models: 0",
+        ].join("\n"), "warning");
+        return;
+      }
+
+      try {
+        const models = await fetchModels(baseUrl, apiKey, AbortSignal.timeout(CONNECTION_TIMEOUT_MS));
+        ctx.ui.notify([
+          ...lines,
+          "Connection: ✓ connected; API key valid",
+          `Models: ${models.length}`,
+        ].join("\n"), "info");
+      } catch (error) {
+        const reason = errorMessage(error).split(apiKey).join("[REDACTED]");
+        ctx.ui.notify([
+          ...lines,
+          "Connection: ✗ failed",
+          `Reason: ${reason}`,
+          "Models: 0",
+        ].join("\n"), "error");
+      }
+    },
+  });
   const baseUrl = normalizeBaseUrl(process.env[ENV_BASE_URL]);
   const apiKey = process.env[ENV_API_KEY]?.trim();
   let models: readonly GatewayModel[] = [];
   if (!process.env.PI_OFFLINE && baseUrl && apiKey) {
     try {
-      models = await fetchModels(baseUrl, apiKey, AbortSignal.timeout(15_000));
+      models = await fetchModels(baseUrl, apiKey, AbortSignal.timeout(CONNECTION_TIMEOUT_MS));
     } catch (error) {
       console.warn(`[openai-api-extension] model discovery failed: ${errorMessage(error)}`);
     }
