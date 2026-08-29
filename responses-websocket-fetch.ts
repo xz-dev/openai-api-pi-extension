@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import OpenAI from "openai";
 import { ResponsesWS } from "openai/resources/responses/ws";
+import type { ResponsesStreamMessage } from "openai/resources/responses/internal-base";
 import type { ResponseInput, ResponseStreamEvent, ResponsesClientEvent } from "openai/resources/responses/responses";
 import {
   type AssistantMessage,
@@ -33,7 +34,7 @@ type Pending = {
   key?: string;
   keep: boolean;
   request: RequestBody;
-  iterator: AsyncIterator<ReturnType<ResponsesWS[typeof Symbol.asyncIterator]> extends AsyncIterator<infer T> ? T : never>;
+  iterator: AsyncIterator<ResponsesStreamMessage>;
 };
 
 type BridgeOptions = Pick<
@@ -183,13 +184,13 @@ function streamResponse(pending: Pending, first: ResponseStreamEvent, signal: Ab
           controller.error(error);
         } finally {
           signal.removeEventListener("abort", abort);
-          await pending.iterator.return?.();
+          await pending.iterator.return();
         }
       })();
     },
     async cancel() {
       closeConnection(pending.key, pending.connection, "cancelled");
-      await pending.iterator.return?.();
+      await pending.iterator.return();
     },
   });
   return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
@@ -221,7 +222,7 @@ export function createResponsesWebSocketBridge(
       }
 
       const acquired = acquire(model, options, request.headers);
-      const iterator = acquired.connection.ws[Symbol.asyncIterator]();
+      const iterator = acquired.connection.ws.stream();
       pending = {
         ...acquired,
         idleTimeoutMs: options.timeoutMs,
