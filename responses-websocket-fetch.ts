@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import OpenAI from "openai";
 import { ResponsesWS } from "openai/resources/responses/ws";
 import type { ResponsesStreamMessage } from "openai/resources/responses/internal-base";
-import type { ResponseInput, ResponseStreamEvent, ResponsesClientEvent } from "openai/resources/responses/responses";
+import type { ResponseInputItem, ResponseStreamEvent, ResponsesClientEvent } from "openai/resources/responses/responses";
 import {
   type AssistantMessage,
   type AssistantMessageEventStream,
@@ -12,15 +12,13 @@ import {
   type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
 
-const OPENAI_TOOL_CALL_PROVIDERS = new Set(["openai", "openai-codex", "opencode", "openai-api-extension"]);
 const SOCKET_TTL_MS = 5 * 60 * 1000;
 const encoder = new TextEncoder();
 
-type RequestBody = Omit<ResponsesClientEvent, "type"> & { stream?: boolean };
+type RequestBody = Omit<ResponsesClientEvent, "type"> & { input?: ResponseInputItem[]; stream?: boolean };
 type Continuation = {
   request: RequestBody;
   responseId: string;
-  responseItems: ResponseInput;
 };
 type Connection = {
   ws: ResponsesWS;
@@ -77,13 +75,17 @@ function release(pending: Pending): void {
   }
 }
 
+function websocketHeaders(headers: Headers): Record<string, string> {
+  return Object.fromEntries([...headers].filter(([name]) => name !== "authorization"));
+}
+
 function createConnection(model: Model<"openai-responses">, options: BridgeOptions, headers: Headers): Connection {
   const apiKey = options.apiKey ?? headers.get("authorization")?.replace(/^Bearer\s+/i, "");
   const client = new OpenAI({ apiKey, baseURL: model.baseUrl, maxRetries: 0 });
   return {
     ws: new ResponsesWS(client, {
       handshakeTimeout: options.websocketConnectTimeoutMs,
-      headers: Object.fromEntries(headers),
+      headers: websocketHeaders(headers),
     }),
     busy: true,
   };
@@ -113,13 +115,26 @@ function withoutInput(body: RequestBody): Omit<RequestBody, "input" | "previous_
   return rest;
 }
 
+function isAssistantResponseItem(item: ResponseInputItem): boolean {
+  return (
+    (item.type === "message" && item.role === "assistant") ||
+    item.type === "reasoning" ||
+    item.type === "function_call" ||
+    item.type === "custom_tool_call"
+  );
+}
+
 function cachedBody(connection: Connection, body: RequestBody): RequestBody {
   const previous = connection.continuation;
   if (!previous || JSON.stringify(withoutInput(body)) !== JSON.stringify(withoutInput(previous.request))) return body;
   const input = body.input ?? [];
-  const baseline = [...(previous.request.input ?? []), ...previous.responseItems];
-  if (input.length < baseline.length || JSON.stringify(input.slice(0, baseline.length)) !== JSON.stringify(baseline)) return body;
-  return { ...body, previous_response_id: previous.responseId, input: input.slice(baseline.length) };
+  const previousInput = previous.request.input ?? [];
+  if (input.length <= previousInput.length || JSON.stringify(input.slice(0, previousInput.length)) !== JSON.stringify(previousInput)) return body;
+  let deltaStart = previousInput.length;
+  if (!isAssistantResponseItem(input[deltaStart]!)) return body;
+  while (deltaStart < input.length && isAssistantResponseItem(input[deltaStart]!)) deltaStart++;
+  if (deltaStart >= input.length) return body;
+  return { ...body, previous_response_id: previous.responseId, input: input.slice(deltaStart) } as RequestBody;
 }
 
 async function nextItem(pending: Pending) {
@@ -184,13 +199,13 @@ function streamResponse(pending: Pending, first: ResponseStreamEvent, signal: Ab
           controller.error(error);
         } finally {
           signal.removeEventListener("abort", abort);
-          await pending.iterator.return();
+          await pending.iterator.return?.();
         }
       })();
     },
     async cancel() {
       closeConnection(pending.key, pending.connection, "cancelled");
-      await pending.iterator.return();
+      await pending.iterator.return?.();
     },
   });
   return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
@@ -247,10 +262,7 @@ export function createResponsesWebSocketBridge(
     async finish(output) {
       if (!pending) return;
       if (output.stopReason !== "error" && output.stopReason !== "aborted" && output.responseId && cacheEnabled(options)) {
-        const { convertResponsesMessages } = await import("@earendil-works/pi-ai/api/openai-responses-shared");
-        const responseItems = convertResponsesMessages(model, { messages: [output] }, OPENAI_TOOL_CALL_PROVIDERS)
-          .filter((item) => item.type !== "function_call_output" && item.type !== "custom_tool_call_output");
-        pending.connection.continuation = { request: pending.request, responseId: output.responseId, responseItems };
+        pending.connection.continuation = { request: pending.request, responseId: output.responseId };
       }
       if (output.stopReason === "error" || output.stopReason === "aborted") closeConnection(pending.key, pending.connection, "request failed");
       else release(pending);

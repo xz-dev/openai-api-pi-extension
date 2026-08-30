@@ -97,6 +97,7 @@ test("websocket transport reuses Pi request building, parser, auth, and headers"
     request = body;
     completed(socket, "resp_ws", "websocket ok");
   }, (upgrade) => {
+    assert.deepEqual(upgrade.rawHeaders.filter((value) => value.toLowerCase() === "authorization"), ["Authorization"]);
     assert.equal(upgrade.headers.authorization, "Bearer bridge-key");
     assert.equal(upgrade.headers["x-bridge-test"], "present");
   });
@@ -150,6 +151,39 @@ test("websocket-cached reuses connection and sends previous_response_id with del
   assert.equal(requests[0]?.body.previous_response_id, undefined);
   assert.equal(requests[1]?.body.previous_response_id, "resp_1");
   assert.deepEqual(requests[1]?.body.input, [{ role: "user", content: [{ type: "input_text", text: "two" }] }]);
+});
+
+test("websocket-cached omits every prior assistant response item from delta input", async () => {
+  const requests: Array<Record<string, unknown>> = [];
+  const upstream = await server((body, _connection, socket) => {
+    requests.push(body);
+    completed(socket, `resp_${requests.length}`, `answer ${requests.length}`);
+  });
+  const provider = createOpenAIApiProvider();
+  const first = await provider.streamSimple(
+    model(upstream.baseUrl),
+    { messages: [{ role: "user", content: "one", timestamp: 1 }] },
+    { apiKey: "bridge-key", transport: "websocket-cached", sessionId: "multi-item-cache" },
+  ).result();
+  first.content.unshift({
+    type: "thinking",
+    thinking: "reasoning",
+    thinkingSignature: JSON.stringify({ type: "reasoning", id: "rs_1", summary: [] }),
+  });
+  await provider.streamSimple(
+    model(upstream.baseUrl),
+    {
+      messages: [
+        { role: "user", content: "one", timestamp: 1 },
+        first,
+        { role: "user", content: "two", timestamp: 2 },
+      ],
+    },
+    { apiKey: "bridge-key", transport: "websocket-cached", sessionId: "multi-item-cache" },
+  ).result();
+
+  assert.equal(requests[1]?.previous_response_id, "resp_1");
+  assert.deepEqual(requests[1]?.input, [{ role: "user", content: [{ type: "input_text", text: "two" }] }]);
 });
 
 test("SSE requests record the actual session-scoped transport", async () => {
