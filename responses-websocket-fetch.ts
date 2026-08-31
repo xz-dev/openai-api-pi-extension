@@ -13,6 +13,7 @@ import {
 } from "@earendil-works/pi-ai";
 
 const SOCKET_TTL_MS = 5 * 60 * 1000;
+const AUTO_SSE_COOLDOWN_MS = 60 * 1000;
 const encoder = new TextEncoder();
 
 type RequestBody = Omit<ResponsesClientEvent, "type"> & { input?: ResponseInputItem[]; stream?: boolean };
@@ -41,7 +42,8 @@ type BridgeOptions = Pick<
 >;
 
 const connections = new Map<string, Connection>();
-const autoSseFallbacks = new Set<string>();
+const autoSseFallbackUntil = new Map<string, number>();
+const autoSseRecoveryInFlight = new Set<string>();
 const actualTransports = new Map<string, "sse" | "websocket" | "websocket-cached">();
 
 function transportKey(baseUrl: string, sessionId?: string): string {
@@ -231,9 +233,18 @@ export function createResponsesWebSocketBridge(
       if (request.method !== "POST" || !new URL(request.url).pathname.replace(/\/+$/, "").endsWith("/responses")) {
         return fallbackFetch(fallbackRequest);
       }
-      if (options.transport === "auto" && options.sessionId && autoSseFallbacks.has(statusKey)) {
-        actualTransports.set(statusKey, "sse");
-        return fallbackFetch(fallbackRequest);
+      let recoveryProbe = false;
+      if (options.transport === "auto" && options.sessionId) {
+        const fallbackUntil = autoSseFallbackUntil.get(statusKey);
+        if (autoSseRecoveryInFlight.has(statusKey) || (fallbackUntil !== undefined && Date.now() < fallbackUntil)) {
+          actualTransports.set(statusKey, "sse");
+          return fallbackFetch(fallbackRequest);
+        }
+        if (fallbackUntil !== undefined) {
+          autoSseFallbackUntil.delete(statusKey);
+          autoSseRecoveryInFlight.add(statusKey);
+          recoveryProbe = true;
+        }
       }
 
       const acquired = acquire(model, options, request.headers);
@@ -248,13 +259,16 @@ export function createResponsesWebSocketBridge(
       pending.connection.ws.send({ type: "response.create", ...body } as ResponsesClientEvent);
       try {
         const first = await firstMessage(pending, request.signal);
+        if (recoveryProbe) autoSseRecoveryInFlight.delete(statusKey);
+        autoSseFallbackUntil.delete(statusKey);
         actualTransports.set(statusKey, cacheEnabled(options) ? "websocket-cached" : "websocket");
         return streamResponse(pending, first, request.signal);
       } catch (error) {
         closeConnection(pending.key, pending.connection, "request failed");
         pending = undefined;
+        if (recoveryProbe) autoSseRecoveryInFlight.delete(statusKey);
         if (options.transport !== "auto" || request.signal.aborted) throw error;
-        if (options.sessionId) autoSseFallbacks.add(statusKey);
+        if (options.sessionId) autoSseFallbackUntil.set(statusKey, Date.now() + AUTO_SSE_COOLDOWN_MS);
         actualTransports.set(statusKey, "sse");
         return fallbackFetch(fallbackRequest);
       }
@@ -346,10 +360,12 @@ export function closeResponsesWebSockets(sessionId?: string): void {
     if (!sessionId || key.includes(`\0${sessionId}\0`)) closeConnection(key, connection, "session shutdown");
   }
   if (sessionId) {
-    for (const key of autoSseFallbacks) if (key.endsWith(`\0${sessionId}`)) autoSseFallbacks.delete(key);
+    for (const key of autoSseFallbackUntil.keys()) if (key.endsWith(`\0${sessionId}`)) autoSseFallbackUntil.delete(key);
+    for (const key of autoSseRecoveryInFlight) if (key.endsWith(`\0${sessionId}`)) autoSseRecoveryInFlight.delete(key);
     for (const key of actualTransports.keys()) if (key.endsWith(`\0${sessionId}`)) actualTransports.delete(key);
   } else {
-    autoSseFallbacks.clear();
+    autoSseFallbackUntil.clear();
+    autoSseRecoveryInFlight.clear();
     actualTransports.clear();
   }
 }

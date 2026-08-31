@@ -75,8 +75,12 @@ Pi's `transport` setting selects behavior:
 - `websocket-cached`: reuses a session WebSocket and sends
   `previous_response_id` plus only new input when the conversation prefix still
   matches; otherwise sends full context safely.
-- `auto`: tries cached WebSocket first, then falls back to SSE only if the
-  WebSocket fails before any response event.
+- `auto`: tries cached WebSocket first. If it fails before any response event,
+  the request falls back to SSE and that session stays on SSE for one minute.
+  The next real request after the cooldown retries cached WebSocket while
+  concurrent requests stay on SSE. Another pre-start failure starts a new
+  one-minute cooldown, while success resumes the normal cached WebSocket
+  connection.
 
 The bridge uses Pi's existing request builder and response parser through its
 public `fetch` injection point; it does not copy Pi's Responses protocol code.
