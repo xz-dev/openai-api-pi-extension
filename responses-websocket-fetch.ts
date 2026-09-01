@@ -13,7 +13,7 @@ import {
 } from "@earendil-works/pi-ai";
 
 const SOCKET_TTL_MS = 5 * 60 * 1000;
-const AUTO_SSE_COOLDOWN_MS = 60 * 1000;
+const AUTO_SSE_COOLDOWN_MS = 15 * 1000;
 const encoder = new TextEncoder();
 
 type RequestBody = Omit<ResponsesClientEvent, "type"> & { input?: ResponseInputItem[]; stream?: boolean };
@@ -33,6 +33,7 @@ type Pending = {
   key?: string;
   keep: boolean;
   request: RequestBody;
+  reused: boolean;
   iterator: AsyncIterator<ResponsesStreamMessage>;
 };
 
@@ -40,6 +41,13 @@ type BridgeOptions = Pick<
   SimpleStreamOptions,
   "apiKey" | "cacheRetention" | "fetch" | "sessionId" | "timeoutMs" | "transport" | "websocketConnectTimeoutMs"
 >;
+
+class ResponsesWebSocketResponseError extends Error {
+  constructor(error: Error) {
+    super(error.message);
+    this.name = "ResponsesWebSocketResponseError";
+  }
+}
 
 const connections = new Map<string, Connection>();
 const autoSseFallbackUntil = new Map<string, number>();
@@ -97,19 +105,20 @@ function acquire(
   model: Model<"openai-responses">,
   options: BridgeOptions,
   headers: Headers,
-): Pick<Pending, "connection" | "key" | "keep"> {
+  forceFresh = false,
+): Pick<Pending, "connection" | "key" | "keep" | "reused"> {
   const key = connectionKey(model, options, headers);
-  const existing = key ? connections.get(key) : undefined;
+  const existing = !forceFresh && key ? connections.get(key) : undefined;
   if (existing && !existing.busy && existing.ws.socket.readyState === 1) {
     if (existing.timer) clearTimeout(existing.timer);
     existing.busy = true;
-    return { connection: existing, key, keep: true };
+    return { connection: existing, key, keep: true, reused: true };
   }
 
   const connection = createConnection(model, options, headers);
   const keep = Boolean(key);
   if (key) connections.set(key, connection);
-  return { connection, key, keep };
+  return { connection, key, keep, reused: false };
 }
 
 function withoutInput(body: RequestBody): Omit<RequestBody, "input" | "previous_response_id"> {
@@ -164,7 +173,10 @@ async function firstMessage(pending: Pending, signal: AbortSignal): Promise<Resp
     while (true) {
       const item = await nextItem(pending);
       if (item.done) throw new Error("Responses WebSocket closed before response started");
-      if (item.value.type === "error") throw item.value.error;
+      if (item.value.type === "error") {
+        if (item.value.error.error) throw new ResponsesWebSocketResponseError(item.value.error);
+        throw item.value.error;
+      }
       if (item.value.type === "close") throw new Error(`Responses WebSocket closed (${item.value.code}): ${item.value.reason}`);
       if (item.value.type === "message") return item.value.message;
     }
@@ -247,24 +259,49 @@ export function createResponsesWebSocketBridge(
         }
       }
 
-      const acquired = acquire(model, options, request.headers);
-      const iterator = acquired.connection.ws.stream();
-      pending = {
-        ...acquired,
-        idleTimeoutMs: options.timeoutMs,
-        request: JSON.parse(await request.text()) as RequestBody,
-        iterator,
+      const requestBody = JSON.parse(await request.text()) as RequestBody;
+      const attempt = async (
+        acquired: Pick<Pending, "connection" | "key" | "keep" | "reused">,
+        body: RequestBody,
+      ): Promise<ResponseStreamEvent> => {
+        const iterator = acquired.connection.ws.stream();
+        pending = {
+          ...acquired,
+          idleTimeoutMs: options.timeoutMs,
+          request: requestBody,
+          iterator,
+        };
+        pending.connection.ws.send({ type: "response.create", ...body } as ResponsesClientEvent);
+        return firstMessage(pending, request.signal);
       };
-      const body = cacheEnabled(options) ? cachedBody(pending.connection, pending.request) : pending.request;
-      pending.connection.ws.send({ type: "response.create", ...body } as ResponsesClientEvent);
+
       try {
-        const first = await firstMessage(pending, request.signal);
+        const acquired = acquire(model, options, request.headers);
+        let first: ResponseStreamEvent;
+        try {
+          const body = cacheEnabled(options) ? cachedBody(acquired.connection, requestBody) : requestBody;
+          first = await attempt(acquired, body);
+        } catch (error) {
+          const failed = pending;
+          if (
+            options.transport !== "auto" ||
+            request.signal.aborted ||
+            !failed?.reused ||
+            error instanceof ResponsesWebSocketResponseError
+          ) throw error;
+          // An OPEN cached socket can still be half-closed. Retry only that
+          // cache-specific transport failure, once, with the full request.
+          closeConnection(failed.key, failed.connection, "cached request failed");
+          pending = undefined;
+          const { previous_response_id: _previousResponseId, ...freshBody } = requestBody;
+          first = await attempt(acquire(model, options, request.headers, true), freshBody);
+        }
         if (recoveryProbe) autoSseRecoveryInFlight.delete(statusKey);
         autoSseFallbackUntil.delete(statusKey);
         actualTransports.set(statusKey, cacheEnabled(options) ? "websocket-cached" : "websocket");
-        return streamResponse(pending, first, request.signal);
+        return streamResponse(pending!, first, request.signal);
       } catch (error) {
-        closeConnection(pending.key, pending.connection, "request failed");
+        if (pending) closeConnection(pending.key, pending.connection, "request failed");
         pending = undefined;
         if (recoveryProbe) autoSseRecoveryInFlight.delete(statusKey);
         if (options.transport !== "auto" || request.signal.aborted) throw error;
