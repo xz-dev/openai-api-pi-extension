@@ -31,6 +31,8 @@ const ENV_API_KEY = "OPENAI_API_EXTENSION_API_KEY";
 const DEFAULT_BASE_URL = "https://api.openai.com/v1";
 const ERROR_ENTRY = "openai-api-extension.error";
 const CONNECTION_TIMEOUT_MS = 15_000;
+/** Ported omniroute fallback: gateways may omit limits; never reject the catalog for it. */
+const DEFAULT_CONTEXT_WINDOW = 128_000;
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -68,12 +70,14 @@ type UpstreamModel = {
   slug?: unknown;
   name?: unknown;
   display_name?: unknown;
+  type?: unknown;
   context_window?: unknown;
   context_length?: unknown;
   max_tokens?: unknown;
   max_output_tokens?: unknown;
   max_completion_tokens?: unknown;
   input_modalities?: unknown;
+  output_modalities?: unknown;
   supported_reasoning_levels?: unknown;
   capabilities?: unknown;
 };
@@ -84,6 +88,45 @@ function num(value: unknown): number | undefined {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** Model kinds Pi's chat catalog cannot use (ported from omniroute-pi-extension). */
+const NON_CHAT_TYPES = new Set(["embedding", "image", "video", "audio"]);
+
+function identifierSegments(value: string): string[] {
+  return value
+    .trim()
+    .toLowerCase()
+    .split(/[\/:\-_]/)
+    .map((segment) => segment.trim())
+    .filter(Boolean);
+}
+
+/** Entry identity used for both filtering and mapping: id (id/slug) plus display name. */
+function entryIdentity(row: UpstreamModel): { id: string; name: string } | undefined {
+  const id = [row.id, row.slug].find((value): value is string => typeof value === "string" && value.trim() !== "")?.trim();
+  if (!id) return undefined;
+  const name =
+    [row.name, row.display_name].find((value): value is string => typeof value === "string" && value.trim() !== "")
+      ?.trim() ?? id;
+  return { id, name };
+}
+
+/** Keeps only conversational text models (Pi chat usage); drops unambiguous non-chat kinds. */
+export function isConversationalTextModel(row: UpstreamModel): boolean {
+  const identity = entryIdentity(row);
+  if (!identity) return false;
+  const type = typeof row.type === "string" ? row.type.trim().toLowerCase() : "";
+  if (type && NON_CHAT_TYPES.has(type)) return false;
+  if (Array.isArray(row.output_modalities) && row.output_modalities.length > 0) {
+    const outputs = row.output_modalities.filter((value): value is string => typeof value === "string");
+    if (outputs.length > 0 && !outputs.some((modality) => modality.trim().toLowerCase() === "text")) return false;
+  }
+  for (const value of [identity.id, identity.name]) {
+    const segments = identifierSegments(value);
+    if (segments.some((segment) => NON_CHAT_TYPES.has(segment))) return false;
+  }
+  return true;
 }
 
 function parseEfforts(value: unknown): ReasoningEffort[] {
@@ -115,26 +158,21 @@ export type GatewayModel = Model<"openai-responses">;
 export function mapModel(entry: unknown, baseUrl = DEFAULT_BASE_URL): GatewayModel | undefined {
   if (typeof entry !== "object" || entry === null || Array.isArray(entry)) return undefined;
   const row = entry as UpstreamModel;
-  const id = [row.id, row.slug].find((value): value is string => typeof value === "string" && value.trim() !== "")?.trim();
-  if (!id) return undefined;
-  const contextWindow = num(row.context_window) ?? num(row.context_length);
+  const identity = entryIdentity(row);
+  if (!identity) return undefined;
+  const contextWindow = num(row.context_window) ?? num(row.context_length) ?? DEFAULT_CONTEXT_WINDOW;
   const maxTokens = num(row.max_output_tokens) ?? num(row.max_completion_tokens) ?? num(row.max_tokens);
-  if (!contextWindow) throw new Error(`Model ${id} is missing capability limits`);
-  // Gateways commonly omit output-token limits; the model's own context
-  // window is the gateway-declared upper bound, so use it rather than
-  // rejecting the whole catalog.
+  // Ported omniroute semantics: a gateway entry without declared limits uses the
+  // default context window instead of rejecting the whole catalog.
   const resolvedMaxTokens = maxTokens ?? contextWindow;
-  const name =
-    [row.name, row.display_name].find((value): value is string => typeof value === "string" && value.trim() !== "")
-      ?.trim() ?? id;
   const map = thinkingLevelMap(
     parseEfforts(
       row.supported_reasoning_levels ?? (isRecord(row.capabilities) ? row.capabilities.effort_tiers : undefined),
     ),
   );
   return {
-    id,
-    name,
+    id: identity.id,
+    name: identity.name,
     provider: PROVIDER,
     api: "openai-responses",
     baseUrl,
@@ -167,13 +205,24 @@ export async function fetchCatalog(baseUrl: string, apiKey: string, signal?: Abo
   return (payload as { models: unknown[] }).models;
 }
 
-/** Maps a raw catalog atomically: any unusable entry rejects the whole list, never a partial one. */
+/**
+ * Maps a raw catalog atomically for Pi chat usage: non-conversational entries
+ * (embedding/image/video/audio) are filtered before mapping, so their missing
+ * capability limits never reject the catalog; any remaining unusable entry
+ * still rejects the whole list, never a partial one.
+ */
 export function mapCatalog(entries: readonly unknown[], baseUrl = DEFAULT_BASE_URL): GatewayModel[] {
   const models = entries
-    .map((entry) => {
+    .flatMap((entry) => {
+      if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+        throw new Error("Model discovery returned an invalid catalog entry");
+      }
+      const row = entry as UpstreamModel;
+      if (!entryIdentity(row)) throw new Error("Model discovery returned an invalid catalog entry");
+      if (!isConversationalTextModel(row)) return [];
       const model = mapModel(entry, baseUrl);
       if (!model) throw new Error("Model discovery returned an invalid catalog entry");
-      return model;
+      return [model];
     })
     .sort((left, right) => left.id.localeCompare(right.id));
   if (models.length === 0) throw new Error("Model discovery returned no usable models");

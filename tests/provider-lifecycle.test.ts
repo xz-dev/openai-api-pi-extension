@@ -259,7 +259,7 @@ test("invalid environment connection fails closed without mixing stored fields",
   assert.equal(await models.getAuth(PROVIDER), undefined);
 });
 
-test("login saves the API key even when the catalog is unusable; refresh keeps failing on the catalog", async () => {
+test("login saves the API key; catalog without limits maps via defaults and refresh succeeds", async () => {
   const gatewayServer = await gateway("axis/codex-auto-review", "test-key", false);
   const credentials = new InMemoryCredentialStore();
   const modelsStore = new InMemoryModelsStore();
@@ -277,17 +277,19 @@ test("login saves the API key even when the catalog is unusable; refresh keeps f
 
   assert.equal(credential.key, "test-key");
   assert.deepEqual(await credentials.read(PROVIDER), credential);
-  assert.match(
-    notifications.find((message) => /catalog is not usable/.test(message)) ?? "",
-    /axis\/codex-auto-review.*capability limits.*API key saved/,
+  assert.equal(
+    notifications.find((message) => /Found \d+ models/.test(message)) !== undefined,
+    true,
+    "missing limits must map via defaults, not make the catalog unusable",
   );
 
   const result = await models.refresh();
-  assert.match(result.errors.get(PROVIDER)?.message ?? "", /axis\/codex-auto-review.*capability limits/);
-  assert.equal(models.getModels(PROVIDER).length, 0, "no partial catalog may be published");
+  assert.equal(result.errors.size, 0);
+  assert.equal(models.getModels(PROVIDER).length, 1);
+  assert.equal(models.getModel(PROVIDER, "axis/codex-auto-review")?.contextWindow, 128_000);
 });
 
-test("incomplete catalog fails refresh without replacing the last verified models", async () => {
+test("entries without limits use defaults and publish alongside verified models", async () => {
   const gatewayServer = await gateway("untrusted-model", "test-key", false);
   const credentials = new InMemoryCredentialStore();
   const modelsStore = new InMemoryModelsStore();
@@ -314,13 +316,11 @@ test("incomplete catalog fails refresh without replacing the last verified model
   models.setProvider(createOpenAIApiProvider());
 
   const result = await models.refresh();
-  assert.match(result.errors.get(PROVIDER)?.message ?? "", /untrusted-model.*capability limits/);
-  assert.equal(models.getModel(PROVIDER, "verified-model")?.contextWindow, 64000);
-  assert.equal(models.getModel(PROVIDER, "untrusted-model"), undefined);
-  assert.equal((await modelsStore.read(PROVIDER))?.models[0]?.id, "verified-model");
+  assert.equal(result.errors.size, 0, "missing limits must not fail refresh");
+  assert.equal(models.getModel(PROVIDER, "untrusted-model")?.contextWindow, 128_000);
 });
 
-test("refresh reports catalog errors then still keeps cached models", async () => {
+test("refresh without catalog errors reports nothing and publishes models", async () => {
   const gatewayServer = await gateway("untrusted-model", "test-key", false);
   const credentials = new InMemoryCredentialStore();
   const modelsStore = new InMemoryModelsStore();
@@ -350,9 +350,9 @@ test("refresh reports catalog errors then still keeps cached models", async () =
   }));
 
   const result = await models.refresh();
-  assert.match(result.errors.get(PROVIDER)?.message ?? "", /untrusted-model.*capability limits/);
-  assert.deepEqual(reported, [result.errors.get(PROVIDER)?.message]);
-  assert.equal(models.getModel(PROVIDER, "verified-model")?.contextWindow, 64000);
+  assert.equal(result.errors.size, 0);
+  assert.deepEqual(reported, []);
+  assert.equal(models.getModel(PROVIDER, "untrusted-model")?.contextWindow, 128_000);
 });
 
 test("refresh abort reaches the catalog request without publishing partial state", async () => {

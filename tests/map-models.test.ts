@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { fetchModels, mapCatalog, mapModel, normalizeBaseUrl } from "../index.ts";
+import { fetchModels, isConversationalTextModel, mapCatalog, mapModel, normalizeBaseUrl } from "../index.ts";
 
 test("normalizeBaseUrl trims, strips slashes, rejects non-http", () => {
   assert.equal(normalizeBaseUrl("  https://gw.example.com/v1/  "), "https://gw.example.com/v1");
@@ -14,8 +14,10 @@ test("normalizeBaseUrl trims, strips slashes, rejects non-http", () => {
   assert.equal(normalizeBaseUrl("   "), undefined);
 });
 
-test("mapModel rejects missing capability limits", () => {
-  assert.throws(() => mapModel({ slug: "vendor/model-5" }), /vendor\/model-5.*capability limits/);
+test("mapModel falls back to default context window when limits missing (omniroute semantics)", () => {
+  const model = mapModel({ slug: "vendor/model-5" });
+  assert.equal(model?.contextWindow, 128_000);
+  assert.equal(model?.maxTokens, 128_000);
 });
 
 test("mapModel falls back to contextWindow when max tokens missing", () => {
@@ -29,12 +31,10 @@ test("mapModel keeps explicit max tokens over fallback", () => {
   assert.equal(model?.maxTokens, 128000);
 });
 
-test("mapCatalog is atomic: one bad entry rejects the whole catalog", () => {
+test("mapCatalog is atomic for invalid entries; missing limits never reject", () => {
   const good = { id: "good-model", context_window: 64000, max_tokens: 8192 };
-  assert.throws(
-    () => mapCatalog([good, { slug: "axis/codex-auto-review" }]),
-    /axis\/codex-auto-review.*capability limits/,
-  );
+  const noLimits = { slug: "axis/codex-auto-review" };
+  assert.equal(mapCatalog([good, noLimits]).length, 2);
   assert.equal(mapCatalog([good]).length, 1);
   assert.throws(() => mapCatalog([]), /no usable models/);
 });
@@ -186,4 +186,29 @@ test("catalog HTTP errors include a short response body", async () => {
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test("mapCatalog filters non-chat models before mapping (omniroute semantics)", () => {
+  const chat = { id: "chat-model", context_window: 64000, max_tokens: 8192 };
+  // image/video model without capability limits must be filtered, not fatal
+  const imageNoLimits = { slug: "supergrok/grok-imagine-image-2.0" };
+  const byType = { id: "embedding/model", type: "embedding", context_window: 8192 };
+  const bySegment = { id: "video/clip-4", context_window: 8192 };
+  const byOutput = { id: "image-out", context_window: 8192, output_modalities: ["image"] };
+  const models = mapCatalog([chat, imageNoLimits, byType, bySegment, byOutput]);
+  assert.equal(models.length, 1);
+  assert.equal(models[0].id, "chat-model");
+});
+
+test("isConversationalTextModel keeps image INPUT but rejects image OUTPUT", () => {
+  assert.equal(
+    isConversationalTextModel({ id: "vision-chat", context_window: 8192, input_modalities: ["text", "image"] }),
+    true,
+  );
+  assert.equal(
+    isConversationalTextModel({ id: "gen-image", context_window: 8192, output_modalities: ["image"] }),
+    false,
+  );
+  assert.equal(isConversationalTextModel({ slug: "grok-imagine-video-1.5", context_window: 8192 }), false);
+  assert.equal(isConversationalTextModel({ slug: "plain-text-model", context_window: 8192 }), true);
 });

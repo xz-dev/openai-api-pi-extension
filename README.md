@@ -12,7 +12,13 @@ CLIProxyAPI, LiteLLM, or the official OpenAI API — using the
   credentials, model refresh, persistence, offline restore, cancellation, and
   request-time endpoint selection.
 - Discovers models from `GET {baseUrl}/models` during async startup or Pi's
-  provider refresh.
+  provider refresh. The gateway may expose its complete inventory; this
+  extension registers only conversational text models for Pi agent use,
+  filtering explicit embedding/image/video/audio kinds and non-text outputs
+  while retaining image-input vision models.
+- Valid chat entries without declared capability limits use a conservative
+  128K context/output fallback instead of rejecting the entire catalog;
+  explicit gateway limits always win.
 - Every model is registered with `api: "openai-responses"`. Reasoning and
   `thinkingLevelMap` come from the Codex catalog (`supported_reasoning_levels`
   or `capabilities.effort_tiers`), using the same map shape as OmniRoute:
