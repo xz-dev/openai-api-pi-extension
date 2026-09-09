@@ -474,7 +474,7 @@ test("model request errors redact an echoed API key", async () => {
   }
 });
 
-test("auto retries cached WebSocket after each fixed 15-second SSE cooldown", async (context) => {
+test("auto retries cached WebSocket after each fixed 5-minute SSE cooldown", async (context) => {
   context.mock.timers.enable({ apis: ["Date"], now: 0 });
   const fallback = await sseServer("fallback ok");
   const wss = new WebSocketServer({ noServer: true });
@@ -517,7 +517,7 @@ test("auto retries cached WebSocket after each fixed 15-second SSE cooldown", as
   assert.equal(fallback.requests, 2);
   assert.equal(upgradeAttempts, 1);
 
-  context.mock.timers.tick(15_000);
+  context.mock.timers.tick(300_000);
   await request("failed retry");
   assert.equal(fallback.requests, 3);
   assert.equal(upgradeAttempts, 2);
@@ -528,7 +528,7 @@ test("auto retries cached WebSocket after each fixed 15-second SSE cooldown", as
   assert.equal(upgradeAttempts, 2);
   assert.equal(connections, 0);
 
-  context.mock.timers.tick(15_000);
+  context.mock.timers.tick(300_000);
   const recovered = await request("recover");
   assert.equal(recovered.stopReason, "stop", recovered.errorMessage ?? "WebSocket recovery failed");
   assert.equal(recovered.content[0]?.type, "text");
@@ -554,7 +554,7 @@ test("auto retries cached WebSocket after each fixed 15-second SSE cooldown", as
   assert.equal(fallback.requests, 6);
   assert.equal(upgradeAttempts, 4);
 
-  context.mock.timers.tick(15_000);
+  context.mock.timers.tick(300_000);
   const recoveredAgain = await request("recover again");
   assert.equal(recoveredAgain.stopReason, "stop", recoveredAgain.errorMessage ?? "Second WebSocket recovery failed");
   assert.equal(upgradeAttempts, 5);
@@ -604,7 +604,7 @@ test("auto runs one recovery probe while concurrent requests stay on SSE", async
 
   await request("start cooldown");
   websocketAvailable = true;
-  context.mock.timers.tick(15_000);
+  context.mock.timers.tick(300_000);
 
   const recovery = request("recover");
   await probeStarted;

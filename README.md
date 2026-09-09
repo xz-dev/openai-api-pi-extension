@@ -85,10 +85,10 @@ Pi's `transport` setting selects behavior:
   transport failure before any response event, it is discarded and the same
   request is tried once on a fresh WebSocket with full context. If the first
   attempt was already fresh, or that fresh retry also fails before the first
-  event, the request falls back to SSE and that session stays on SSE for 15
+  event, the request falls back to SSE and that session stays on SSE for 5 minutes
   seconds. The next real request after the cooldown retries cached WebSocket
   while concurrent requests stay on SSE. Another pre-start failure starts a
-  new 15-second cooldown, while success resumes the normal cached WebSocket
+  new 5-minute cooldown, while success resumes the normal cached WebSocket
   connection. API error events do not trigger the extra fresh-WebSocket retry.
 
 The bridge uses Pi's existing request builder and response parser through its

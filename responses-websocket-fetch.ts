@@ -13,7 +13,7 @@ import {
 } from "@earendil-works/pi-ai";
 
 const SOCKET_TTL_MS = 5 * 60 * 1000;
-const AUTO_SSE_COOLDOWN_MS = 15 * 1000;
+const AUTO_SSE_COOLDOWN_MS = 5 * 60 * 1000;
 const encoder = new TextEncoder();
 
 type RequestBody = Omit<ResponsesClientEvent, "type"> & { input?: ResponseInputItem[]; stream?: boolean };
