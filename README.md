@@ -93,6 +93,10 @@ Pi's `transport` setting selects behavior:
 
 The bridge uses Pi's existing request builder and response parser through its
 public `fetch` injection point; it does not copy Pi's Responses protocol code.
+Because message conversion runs inside Pi's shared `transformMessages` step,
+the extension itself drops empty-content user/assistant messages (for example
+watchdog inquiry fold markers) before delegating, so requests stay clean on any
+host pi version.
 
 ## Connection status
 

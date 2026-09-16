@@ -11,6 +11,7 @@ import {
   type ApiKeyCredential,
   type AuthContext,
   type AuthResult,
+  type Message,
   type Model,
   type Provider,
   type RefreshModelsContext,
@@ -25,6 +26,36 @@ import {
 } from "./responses-websocket-fetch.ts";
 
 const PROVIDER = "openai-api-extension";
+
+/**
+ * Drop messages whose content is empty or whitespace-only before delegating to
+ * Pi's Responses adapter. Extension-injected custom messages (for example
+ * watchdog inquiry fold markers) surface here as empty user messages, which
+ * some gateways reject (Gemini-style `contents.parts must not be empty`).
+ * Kept regardless of emptiness:
+ * - toolResult messages: they answer tool calls and must not be dropped
+ * - assistant messages with tool calls: dropping them would orphan tool results
+ * - blocks carrying signatures (textSignature/thinkingSignature, including
+ *   redacted thinking): providers require them echoed back
+ * Unknown block types are kept for the downstream adapter to decide.
+ */
+function isEmptyContent(message: Message): boolean {
+  if (message.role === "toolResult") return false;
+  if (message.role === "user") {
+    if (typeof message.content === "string") return message.content.trim().length === 0;
+    return message.content.every((block) => block.type === "text" && block.text.trim().length === 0);
+  }
+  return message.content.every((block) => {
+    if (block.type === "toolCall") return false;
+    if (block.type === "text") return !block.textSignature && block.text.trim().length === 0;
+    if (block.type === "thinking") return !block.thinkingSignature && block.thinking.trim().length === 0;
+    return false;
+  });
+}
+
+export function dropEmptyMessages(messages: Message[]): Message[] {
+  return messages.filter((message) => !isEmptyContent(message));
+}
 const PROVIDER_NAME = "OpenAI API Extension";
 const ENV_BASE_URL = "OPENAI_API_EXTENSION_BASE_URL";
 const ENV_API_KEY = "OPENAI_API_EXTENSION_API_KEY";
@@ -384,24 +415,26 @@ export function createOpenAIApiProvider(
       }
     },
     stream: (model, context, options) => {
+      const filteredContext = { ...context, messages: dropEmptyMessages(context.messages) };
       if (!options?.transport || options.transport === "sse") {
         recordActualResponsesTransport(model.baseUrl, "sse", options?.sessionId);
-        return redactAssistantStream(api.stream(model, context, options), options?.apiKey);
+        return redactAssistantStream(api.stream(model, filteredContext, options), options?.apiKey);
       }
       const bridge = createResponsesWebSocketBridge(model, options);
       return redactAssistantStream(
-        wrapResponsesWebSocketStream(api.stream(model, context, { ...options, fetch: bridge.fetch }), bridge),
+        wrapResponsesWebSocketStream(api.stream(model, filteredContext, { ...options, fetch: bridge.fetch }), bridge),
         options.apiKey,
       );
     },
     streamSimple: (model, context, options) => {
+      const filteredContext = { ...context, messages: dropEmptyMessages(context.messages) };
       if (!options?.transport || options.transport === "sse") {
         recordActualResponsesTransport(model.baseUrl, "sse", options?.sessionId);
-        return redactAssistantStream(api.streamSimple(model, context, options), options?.apiKey);
+        return redactAssistantStream(api.streamSimple(model, filteredContext, options), options?.apiKey);
       }
       const bridge = createResponsesWebSocketBridge(model, options);
       return redactAssistantStream(
-        wrapResponsesWebSocketStream(api.streamSimple(model, context, { ...options, fetch: bridge.fetch }), bridge),
+        wrapResponsesWebSocketStream(api.streamSimple(model, filteredContext, { ...options, fetch: bridge.fetch }), bridge),
         options.apiKey,
       );
     },
