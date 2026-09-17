@@ -39,6 +39,24 @@ test("drops user messages with empty or whitespace-only content", () => {
   assert.equal(result[0].content, "hello");
 });
 
+for (const content of ["Be concise.", "", " \n\t "]) {
+  test(`keeps system messages with content ${JSON.stringify(content)} and control metadata`, () => {
+    // Newer Pi hosts supply system messages; the oldest supported peer types do not define them yet.
+    const messages = [{
+      role: "system",
+      content,
+      sections: { tools: "<tools>\n(none)\n" },
+      tools: [],
+      timestamp: 1,
+    }] as unknown as Message[];
+
+    const result = dropEmptyMessages(messages);
+
+    assert.deepEqual(result, messages);
+    assert.equal(result[0], messages[0]);
+  });
+}
+
 test("keeps user messages that contain an image even with empty text", () => {
   const messages: Message[] = [
     {

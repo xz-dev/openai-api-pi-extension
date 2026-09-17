@@ -33,6 +33,7 @@ const PROVIDER = "openai-api-extension";
  * watchdog inquiry fold markers) surface here as empty user messages, which
  * some gateways reject (Gemini-style `contents.parts must not be empty`).
  * Kept regardless of emptiness:
+ * - system messages: their content and control metadata must reach Pi unchanged
  * - toolResult messages: they answer tool calls and must not be dropped
  * - assistant messages with tool calls: dropping them would orphan tool results
  * - blocks carrying signatures (textSignature/thinkingSignature, including
@@ -40,7 +41,7 @@ const PROVIDER = "openai-api-extension";
  * Unknown block types are kept for the downstream adapter to decide.
  */
 function isEmptyContent(message: Message): boolean {
-  if (message.role === "toolResult") return false;
+  if (message.role !== "user" && message.role !== "assistant") return false;
   if (message.role === "user") {
     if (typeof message.content === "string") return message.content.trim().length === 0;
     return message.content.every((block) => block.type === "text" && block.text.trim().length === 0);
