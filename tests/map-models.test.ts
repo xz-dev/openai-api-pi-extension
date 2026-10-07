@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { VERSION } from "@earendil-works/pi-coding-agent";
 import { fetchModels, isConversationalTextModel, mapCatalog, mapModel, normalizeBaseUrl } from "../index.ts";
 
 test("normalizeBaseUrl trims, strips slashes, rejects non-http", () => {
@@ -132,7 +133,7 @@ test("fetchModels requests Codex catalog and rejects plain OpenAI shape", async 
   };
   try {
     await assert.rejects(fetchModels("https://gateway.example/v1", "secret-key"), /Codex model catalog/);
-    assert.equal(requestedUrl, "https://gateway.example/v1/models?client_version=0.84.2");
+    assert.equal(requestedUrl, `https://gateway.example/v1/models?client_version=${VERSION}`);
   } finally {
     globalThis.fetch = originalFetch;
   }

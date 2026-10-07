@@ -33,7 +33,6 @@ type Pending = {
   key?: string;
   keep: boolean;
   request: RequestBody;
-  reused: boolean;
   iterator: AsyncIterator<ResponsesStreamMessage>;
 };
 
@@ -42,14 +41,8 @@ type BridgeOptions = Pick<
   "apiKey" | "cacheRetention" | "fetch" | "sessionId" | "timeoutMs" | "transport" | "websocketConnectTimeoutMs"
 >;
 
-class ResponsesWebSocketResponseError extends Error {
-  constructor(error: Error) {
-    super(error.message);
-    this.name = "ResponsesWebSocketResponseError";
-  }
-}
-
 const connections = new Map<string, Connection>();
+// Presence records a WS failure: 0 retries next request; a deadline enforces cooldown.
 const autoSseFallbackUntil = new Map<string, number>();
 const autoSseRecoveryInFlight = new Set<string>();
 const actualTransports = new Map<string, "sse" | "websocket" | "websocket-cached">();
@@ -106,19 +99,19 @@ function acquire(
   options: BridgeOptions,
   headers: Headers,
   forceFresh = false,
-): Pick<Pending, "connection" | "key" | "keep" | "reused"> {
+): Pick<Pending, "connection" | "key" | "keep"> {
   const key = connectionKey(model, options, headers);
   const existing = !forceFresh && key ? connections.get(key) : undefined;
   if (existing && !existing.busy && existing.ws.socket.readyState === 1) {
     if (existing.timer) clearTimeout(existing.timer);
     existing.busy = true;
-    return { connection: existing, key, keep: true, reused: true };
+    return { connection: existing, key, keep: true };
   }
 
   const connection = createConnection(model, options, headers);
   const keep = Boolean(key);
   if (key) connections.set(key, connection);
-  return { connection, key, keep, reused: false };
+  return { connection, key, keep };
 }
 
 function withoutInput(body: RequestBody): Omit<RequestBody, "input" | "previous_response_id"> {
@@ -173,10 +166,7 @@ async function firstMessage(pending: Pending, signal: AbortSignal): Promise<Resp
     while (true) {
       const item = await nextItem(pending);
       if (item.done) throw new Error("Responses WebSocket closed before response started");
-      if (item.value.type === "error") {
-        if (item.value.error.error) throw new ResponsesWebSocketResponseError(item.value.error);
-        throw item.value.error;
-      }
+      if (item.value.type === "error") throw item.value.error;
       if (item.value.type === "close") throw new Error(`Responses WebSocket closed (${item.value.code}): ${item.value.reason}`);
       if (item.value.type === "message") return item.value.message;
     }
@@ -237,6 +227,14 @@ export function createResponsesWebSocketBridge(
   let pending: Pending | undefined;
   const fallbackFetch = options.fetch ?? globalThis.fetch;
   const statusKey = transportKey(model.baseUrl, options.sessionId);
+  let recoveryProbe = false;
+  // Pi may retry fetch within one model request; SSE stays selected until it ends.
+  let useSse = false;
+  const recordFailure = () => {
+    if (options.transport === "auto" && options.sessionId) {
+      autoSseFallbackUntil.set(statusKey, autoSseFallbackUntil.has(statusKey) ? Date.now() + AUTO_SSE_COOLDOWN_MS : 0);
+    }
+  };
 
   return {
     fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -245,25 +243,22 @@ export function createResponsesWebSocketBridge(
       if (request.method !== "POST" || !new URL(request.url).pathname.replace(/\/+$/, "").endsWith("/responses")) {
         return fallbackFetch(fallbackRequest);
       }
-      let recoveryProbe = false;
-      if (options.transport === "auto" && options.sessionId) {
+      if (options.transport === "auto") {
         const fallbackUntil = autoSseFallbackUntil.get(statusKey);
-        if (autoSseRecoveryInFlight.has(statusKey) || (fallbackUntil !== undefined && Date.now() < fallbackUntil)) {
+        if (useSse || autoSseRecoveryInFlight.has(statusKey) || (fallbackUntil !== undefined && Date.now() < fallbackUntil)) {
+          useSse = true;
           actualTransports.set(statusKey, "sse");
           return fallbackFetch(fallbackRequest);
         }
         if (fallbackUntil !== undefined) {
-          autoSseFallbackUntil.delete(statusKey);
           autoSseRecoveryInFlight.add(statusKey);
           recoveryProbe = true;
         }
       }
 
-      const requestBody = JSON.parse(await request.text()) as RequestBody;
-      const attempt = async (
-        acquired: Pick<Pending, "connection" | "key" | "keep" | "reused">,
-        body: RequestBody,
-      ): Promise<ResponseStreamEvent> => {
+      try {
+        const requestBody = JSON.parse(await request.text()) as RequestBody;
+        const acquired = acquire(model, options, request.headers, recoveryProbe);
         const iterator = acquired.connection.ws.stream();
         pending = {
           ...acquired,
@@ -271,41 +266,20 @@ export function createResponsesWebSocketBridge(
           request: requestBody,
           iterator,
         };
+        // Recovery must not reference state from the discarded connection.
+        const { previous_response_id: _previousResponseId, ...fullBody } = requestBody;
+        const body = recoveryProbe ? fullBody : cacheEnabled(options) ? cachedBody(acquired.connection, requestBody) : requestBody;
         pending.connection.ws.send({ type: "response.create", ...body } as ResponsesClientEvent);
-        return firstMessage(pending, request.signal);
-      };
-
-      try {
-        const acquired = acquire(model, options, request.headers);
-        let first: ResponseStreamEvent;
-        try {
-          const body = cacheEnabled(options) ? cachedBody(acquired.connection, requestBody) : requestBody;
-          first = await attempt(acquired, body);
-        } catch (error) {
-          const failed = pending;
-          if (
-            options.transport !== "auto" ||
-            request.signal.aborted ||
-            !failed?.reused ||
-            error instanceof ResponsesWebSocketResponseError
-          ) throw error;
-          // An OPEN cached socket can still be half-closed. Retry only that
-          // cache-specific transport failure, once, with the full request.
-          closeConnection(failed.key, failed.connection, "cached request failed");
-          pending = undefined;
-          const { previous_response_id: _previousResponseId, ...freshBody } = requestBody;
-          first = await attempt(acquire(model, options, request.headers, true), freshBody);
-        }
-        if (recoveryProbe) autoSseRecoveryInFlight.delete(statusKey);
-        autoSseFallbackUntil.delete(statusKey);
+        const first = await firstMessage(pending, request.signal);
         actualTransports.set(statusKey, cacheEnabled(options) ? "websocket-cached" : "websocket");
-        return streamResponse(pending!, first, request.signal);
+        return streamResponse(pending, first, request.signal);
       } catch (error) {
         if (pending) closeConnection(pending.key, pending.connection, "request failed");
         pending = undefined;
         if (recoveryProbe) autoSseRecoveryInFlight.delete(statusKey);
         if (options.transport !== "auto" || request.signal.aborted) throw error;
-        if (options.sessionId) autoSseFallbackUntil.set(statusKey, Date.now() + AUTO_SSE_COOLDOWN_MS);
+        recordFailure();
+        useSse = true;
         actualTransports.set(statusKey, "sse");
         return fallbackFetch(fallbackRequest);
       }
@@ -315,8 +289,14 @@ export function createResponsesWebSocketBridge(
       if (output.stopReason !== "error" && output.stopReason !== "aborted" && output.responseId && cacheEnabled(options)) {
         pending.connection.continuation = { request: pending.request, responseId: output.responseId };
       }
-      if (output.stopReason === "error" || output.stopReason === "aborted") closeConnection(pending.key, pending.connection, "request failed");
-      else release(pending);
+      if (output.stopReason === "error" || output.stopReason === "aborted") {
+        closeConnection(pending.key, pending.connection, "request failed");
+        if (output.stopReason === "error") recordFailure();
+      } else {
+        if (options.transport === "auto") autoSseFallbackUntil.delete(statusKey);
+        release(pending);
+      }
+      if (recoveryProbe) autoSseRecoveryInFlight.delete(statusKey);
       pending = undefined;
     },
   };

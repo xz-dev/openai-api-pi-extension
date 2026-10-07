@@ -157,7 +157,7 @@ test("websocket-cached reuses connection and sends previous_response_id with del
   assert.deepEqual(requests[1]?.body.input, [{ role: "user", content: [{ type: "input_text", text: "two" }] }]);
 });
 
-test("auto retries a failed reused cached connection once with a fresh full-context WebSocket", async () => {
+test("auto falls back on cached failure and recovers with full context on the next request", async () => {
   const requests: Array<{ body: Record<string, unknown>; connection: number }> = [];
   let sseFallbacks = 0;
   const upstream = await server((body, connection, socket) => {
@@ -177,7 +177,10 @@ test("auto retries a failed reused cached connection once with a fresh full-cont
     apiKey: "bridge-key",
     fetch: async () => {
       sseFallbacks++;
-      throw new Error("SSE fallback invoked");
+      return new Response(
+        responseEvents("resp_sse", "fallback ok").map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""),
+        { headers: { "content-type": "text/event-stream" } },
+      );
     },
     samplingParams: { previous_response_id: "caller-provided" },
     transport: "auto" as const,
@@ -189,22 +192,27 @@ test("auto retries a failed reused cached connection once with a fresh full-cont
     { messages: [{ role: "user", content: "one", timestamp: 1 }] },
     options,
   ).result();
+  const messages = [
+    { role: "user" as const, content: "one", timestamp: 1 },
+    first,
+    { role: "user" as const, content: "two", timestamp: 2 },
+  ];
+  const fallback = await provider.streamSimple(model(upstream.baseUrl), { messages }, options).result();
+  assert.equal(fallback.stopReason, "stop", fallback.errorMessage);
+  assert.equal(fallback.content[0]?.text, "fallback ok");
+  assert.equal(sseFallbacks, 1);
+  assert.equal(upstream.connections, 1);
+  assert.equal(requests.length, 2);
+
   const recovered = await provider.streamSimple(
     model(upstream.baseUrl),
-    {
-      messages: [
-        { role: "user", content: "one", timestamp: 1 },
-        first,
-        { role: "user", content: "two", timestamp: 2 },
-      ],
-    },
+    { messages: [...messages, fallback, { role: "user", content: "three", timestamp: 3 }] },
     options,
   ).result();
 
   assert.equal(recovered.stopReason, "stop", recovered.errorMessage ?? "Fresh WebSocket recovery failed");
-  assert.equal(recovered.content[0]?.type, "text");
   assert.equal(recovered.content[0]?.text, "fresh recovery");
-  assert.equal(sseFallbacks, 0);
+  assert.equal(sseFallbacks, 1);
   assert.equal(upstream.connections, 2);
   assert.equal(requests.length, 3);
   assert.equal(requests[1]?.connection, 1);
@@ -216,10 +224,10 @@ test("auto retries a failed reused cached connection once with a fresh full-cont
   assert.ok(Array.isArray(freshInput));
   assert.ok(freshInput.length > 1);
   assert.equal((freshInput[0] as { role?: unknown }).role, "user");
-  assert.equal((freshInput[freshInput.length - 1] as { role?: unknown }).role, "user");
+  assert.deepEqual(freshInput.at(-1), { role: "user", content: [{ type: "input_text", text: "three" }] });
 });
 
-test("auto falls back to SSE after both a reused cached connection and its fresh WebSocket retry fail", async (context) => {
+test("auto cools down only after the next-request fresh WebSocket also fails", async (context) => {
   context.mock.timers.enable({ apis: ["Date"], now: 0 });
   const fallback = await sseServer("fallback ok");
   const wss = new WebSocketServer({ noServer: true });
@@ -267,19 +275,78 @@ test("auto falls back to SSE after both a reused cached connection and its fresh
   assert.equal(fallbackOutput.stopReason, "stop", fallbackOutput.errorMessage ?? "SSE fallback failed");
   assert.equal(fallbackOutput.content[0]?.type, "text");
   assert.equal(fallbackOutput.content[0]?.text, "fallback ok");
-  assert.equal(upgradeAttempts, 2);
-  assert.equal(connections, 2);
-  assert.equal(websocketRequests, 3);
+  assert.equal(upgradeAttempts, 1);
+  assert.equal(connections, 1);
+  assert.equal(websocketRequests, 2);
   assert.equal(fallback.requests, 1);
   assert.equal(getActualResponsesTransport(fallback.baseUrl, options.sessionId), "sse");
 
   await provider.streamSimple(
     model(fallback.baseUrl),
-    { messages: [{ role: "user", content: "during cooldown", timestamp: 3 }] },
+    { messages: [{ role: "user", content: "fresh retry", timestamp: 3 }] },
     options,
   ).result();
   assert.equal(upgradeAttempts, 2);
+  assert.equal(connections, 2);
+  assert.equal(websocketRequests, 3);
   assert.equal(fallback.requests, 2);
+
+  await provider.streamSimple(
+    model(fallback.baseUrl),
+    { messages: [{ role: "user", content: "during cooldown", timestamp: 4 }] },
+    options,
+  ).result();
+  assert.equal(upgradeAttempts, 2);
+  assert.equal(fallback.requests, 3);
+});
+
+test("auto keeps provider retries on SSE and reserves fresh WebSocket recovery for the next request", async () => {
+  const fallback = await sseServer("fallback ok");
+  const wss = new WebSocketServer({ noServer: true });
+  servers.push(wss);
+  let websocketAvailable = false;
+  let upgradeAttempts = 0;
+  let fetchAttempts = 0;
+  fallback.server.on("upgrade", (request, socket, head) => {
+    upgradeAttempts++;
+    if (!websocketAvailable) socket.destroy();
+    else wss.handleUpgrade(request, socket, head, (client) => wss.emit("connection", client, request));
+  });
+  wss.on("connection", (socket) => {
+    socket.on("message", () => completed(socket, "resp_recovered", "websocket recovered"));
+  });
+  const provider = createOpenAIApiProvider();
+  const options = {
+    apiKey: "bridge-key",
+    transport: "auto" as const,
+    sessionId: "provider-retry-recovery",
+    maxRetries: 1,
+    websocketConnectTimeoutMs: 1_000,
+    fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
+      fetchAttempts++;
+      if (fetchAttempts === 1) return new Response("retry SSE", { status: 503, headers: { "retry-after-ms": "1" } });
+      return fetch(input, init);
+    },
+  };
+  const request = () => provider.streamSimple(
+    model(fallback.baseUrl),
+    { messages: [{ role: "user", content: "ping", timestamp: 1 }] },
+    options,
+  ).result();
+
+  const first = await request();
+  assert.equal(first.stopReason, "stop", first.errorMessage);
+  assert.equal(first.content[0]?.text, "fallback ok");
+  assert.equal(fetchAttempts, 2, "Pi still retries a retryable SSE response");
+  assert.equal(upgradeAttempts, 1, "provider retry must remain SSE within the same logical request");
+  assert.equal(fallback.requests, 1);
+
+  websocketAvailable = true;
+  const recovered = await request();
+  assert.equal(recovered.stopReason, "stop", recovered.errorMessage);
+  assert.equal(recovered.content[0]?.text, "websocket recovered");
+  assert.equal(upgradeAttempts, 2, "only the next real request may probe a fresh WebSocket");
+  assert.equal(fetchAttempts, 2);
 });
 
 test("auto does not retry a reused cached WebSocket after an API error event", async () => {
@@ -474,7 +541,7 @@ test("model request errors redact an echoed API key", async () => {
   }
 });
 
-test("auto retries cached WebSocket after each fixed 5-minute SSE cooldown", async (context) => {
+test("auto retries after each 5-minute cooldown and resets failures after WebSocket success", async (context) => {
   context.mock.timers.enable({ apis: ["Date"], now: 0 });
   const fallback = await sseServer("fallback ok");
   const wss = new WebSocketServer({ noServer: true });
@@ -492,7 +559,10 @@ test("auto retries cached WebSocket after each fixed 5-minute SSE cooldown", asy
   });
   wss.on("connection", (socket) => {
     connections++;
-    socket.on("message", () => completed(socket, `resp_recovered_${connections}`, "websocket recovered"));
+    socket.on("message", () => {
+      if (!websocketAvailable) socket.terminate();
+      else completed(socket, `resp_recovered_${connections}`, "websocket recovered");
+    });
   });
 
   const provider = createOpenAIApiProvider();
@@ -513,112 +583,168 @@ test("auto retries cached WebSocket after each fixed 5-minute SSE cooldown", asy
   assert.equal(fallback.requests, 1);
   assert.equal(upgradeAttempts, 1);
 
-  await request("during cooldown");
+  await request("immediate fresh retry");
   assert.equal(fallback.requests, 2);
-  assert.equal(upgradeAttempts, 1);
+  assert.equal(upgradeAttempts, 2);
 
-  context.mock.timers.tick(300_000);
-  await request("failed retry");
+  context.mock.timers.tick(299_999);
+  await request("during cooldown");
   assert.equal(fallback.requests, 3);
   assert.equal(upgradeAttempts, 2);
 
+  context.mock.timers.tick(1);
+  await request("failed retry");
+  assert.equal(fallback.requests, 4);
+  assert.equal(upgradeAttempts, 3);
+
   websocketAvailable = true;
   await request("new cooldown");
-  assert.equal(fallback.requests, 4);
-  assert.equal(upgradeAttempts, 2);
+  assert.equal(fallback.requests, 5);
+  assert.equal(upgradeAttempts, 3);
   assert.equal(connections, 0);
 
   context.mock.timers.tick(300_000);
   const recovered = await request("recover");
   assert.equal(recovered.stopReason, "stop", recovered.errorMessage ?? "WebSocket recovery failed");
-  assert.equal(recovered.content[0]?.type, "text");
   assert.equal(recovered.content[0]?.text, "websocket recovered");
-  assert.equal(upgradeAttempts, 3);
+  assert.equal(upgradeAttempts, 4);
   assert.equal(connections, 1);
   assert.equal(getActualResponsesTransport(fallback.baseUrl, options.sessionId), "websocket-cached");
 
   const continued = await request("continue");
   assert.equal(continued.stopReason, "stop", continued.errorMessage ?? "Cached WebSocket continuation failed");
-  assert.equal(upgradeAttempts, 3);
+  assert.equal(upgradeAttempts, 4);
   assert.equal(connections, 1);
 
-  closeResponsesWebSockets(options.sessionId);
   websocketAvailable = false;
-  await request("fallback again");
-  assert.equal(fallback.requests, 5);
+  await request("cached connection fails again");
+  assert.equal(fallback.requests, 6);
   assert.equal(upgradeAttempts, 4);
   assert.equal(getActualResponsesTransport(fallback.baseUrl, options.sessionId), "sse");
 
   websocketAvailable = true;
-  await request("second cooldown");
-  assert.equal(fallback.requests, 6);
-  assert.equal(upgradeAttempts, 4);
-
-  context.mock.timers.tick(300_000);
-  const recoveredAgain = await request("recover again");
+  const recoveredAgain = await request("recover immediately after reset");
   assert.equal(recoveredAgain.stopReason, "stop", recoveredAgain.errorMessage ?? "Second WebSocket recovery failed");
+  assert.equal(fallback.requests, 6);
   assert.equal(upgradeAttempts, 5);
   assert.equal(connections, 2);
   assert.equal(getActualResponsesTransport(fallback.baseUrl, options.sessionId), "websocket-cached");
 });
 
-test("auto runs one recovery probe while concurrent requests stay on SSE", async (context) => {
-  context.mock.timers.enable({ apis: ["Date"], now: 0 });
-  const fallback = await sseServer("fallback ok");
-  const wss = new WebSocketServer({ noServer: true });
-  servers.push(wss);
-  let websocketAvailable = false;
-  let upgradeAttempts = 0;
-  let markProbeStarted = () => {};
-  let releaseProbe = () => {};
-  const probeStarted = new Promise<void>((resolve) => { markProbeStarted = resolve; });
-  const probeReleased = new Promise<void>((resolve) => { releaseProbe = resolve; });
-  fallback.server.on("upgrade", (request, socket, head) => {
-    upgradeAttempts++;
-    if (!websocketAvailable) {
-      socket.destroy();
-      return;
-    }
-    wss.handleUpgrade(request, socket, head, (client) => wss.emit("connection", client, request));
-  });
-  wss.on("connection", (socket) => {
-    socket.on("message", async () => {
-      markProbeStarted();
-      await probeReleased;
-      completed(socket, "resp_recovered", "websocket recovered");
+for (const failures of [1, 2]) {
+  test(`auto runs one recovery probe after ${failures} failure(s) while concurrent requests stay on SSE`, async (context) => {
+    context.mock.timers.enable({ apis: ["Date"], now: 0 });
+    const fallback = await sseServer("fallback ok");
+    const wss = new WebSocketServer({ noServer: true });
+    servers.push(wss);
+    let websocketAvailable = false;
+    let upgradeAttempts = 0;
+    let markProbeStarted = () => {};
+    let releaseProbe = () => {};
+    const probeStarted = new Promise<void>((resolve) => { markProbeStarted = resolve; });
+    const probeReleased = new Promise<void>((resolve) => { releaseProbe = resolve; });
+    fallback.server.on("upgrade", (request, socket, head) => {
+      upgradeAttempts++;
+      if (!websocketAvailable) {
+        socket.destroy();
+        return;
+      }
+      wss.handleUpgrade(request, socket, head, (client) => wss.emit("connection", client, request));
     });
+    wss.on("connection", (socket) => {
+      socket.on("message", async () => {
+        socket.send(JSON.stringify({ type: "response.created", response: { id: "resp_recovered" } }));
+        await probeReleased;
+        for (const event of responseEvents("resp_recovered", "websocket recovered").slice(1)) socket.send(JSON.stringify(event));
+      });
+    });
+
+    const provider = createOpenAIApiProvider();
+    const options = {
+      apiKey: "bridge-key",
+      transport: "auto" as const,
+      sessionId: "auto-concurrent-recovery",
+      websocketConnectTimeoutMs: 1_000,
+      onResponse: () => { if (websocketAvailable) markProbeStarted(); },
+    };
+    const request = (text: string) => provider.streamSimple(
+      model(fallback.baseUrl),
+      { messages: [{ role: "user" as const, content: text, timestamp: 1 }] },
+      options,
+    ).result();
+
+    for (let i = 0; i < failures; i++) await request("failure");
+    if (failures === 2) context.mock.timers.tick(300_000);
+    websocketAvailable = true;
+
+    const recovery = request("recover");
+    await probeStarted;
+    const concurrent = await request("concurrent");
+    assert.equal(concurrent.stopReason, "stop", concurrent.errorMessage ?? "Concurrent SSE fallback failed");
+    assert.equal(fallback.requests, failures + 1);
+    assert.equal(upgradeAttempts, failures + 1);
+    assert.equal(getActualResponsesTransport(fallback.baseUrl, options.sessionId), "sse");
+
+    releaseProbe();
+    const recovered = await recovery;
+    assert.equal(recovered.stopReason, "stop", recovered.errorMessage ?? "WebSocket recovery failed");
+    assert.equal(recovered.content[0]?.type, "text");
+    assert.equal(recovered.content[0]?.text, "websocket recovered");
+    assert.equal(upgradeAttempts, failures + 1);
+    // The concurrent SSE request was the last transport started.
+    assert.equal(getActualResponsesTransport(fallback.baseUrl, options.sessionId), "sse");
   });
+}
 
-  const provider = createOpenAIApiProvider();
-  const options = {
-    apiKey: "bridge-key",
-    transport: "auto" as const,
-    sessionId: "auto-concurrent-recovery",
-    websocketConnectTimeoutMs: 1_000,
-  };
-  const request = (text: string) => provider.streamSimple(
-    model(fallback.baseUrl),
-    { messages: [{ role: "user" as const, content: text, timestamp: 1 }] },
-    options,
-  ).result();
-
-  await request("start cooldown");
-  websocketAvailable = true;
-  context.mock.timers.tick(300_000);
-
-  const recovery = request("recover");
-  await probeStarted;
-  const concurrent = await request("concurrent");
-  assert.equal(concurrent.stopReason, "stop", concurrent.errorMessage ?? "Concurrent SSE fallback failed");
-  assert.equal(fallback.requests, 2);
-  assert.equal(upgradeAttempts, 2);
-  assert.equal(getActualResponsesTransport(fallback.baseUrl, options.sessionId), "sse");
-
-  releaseProbe();
-  const recovered = await recovery;
-  assert.equal(recovered.stopReason, "stop", recovered.errorMessage ?? "WebSocket recovery failed");
-  assert.equal(recovered.content[0]?.type, "text");
-  assert.equal(recovered.content[0]?.text, "websocket recovered");
-  assert.equal(upgradeAttempts, 2);
-  assert.equal(getActualResponsesTransport(fallback.baseUrl, options.sessionId), "websocket-cached");
-});
+for (const outcome of ["error", "aborted"] as const) {
+  test(`auto recovery ${outcome} after streaming starts preserves failure history without replay`, async (context) => {
+    context.mock.timers.enable({ apis: ["Date"], now: 0 });
+    const fallback = await sseServer("fallback ok");
+    const wss = new WebSocketServer({ noServer: true });
+    servers.push(wss);
+    let upgradeAttempts = 0;
+    let interrupt: (() => void) | undefined;
+    fallback.server.on("upgrade", (request, socket, head) => {
+      upgradeAttempts++;
+      if (upgradeAttempts === 1) socket.destroy();
+      else wss.handleUpgrade(request, socket, head, (client) => wss.emit("connection", client, request));
+    });
+    const controller = new AbortController();
+    wss.on("connection", (socket) => {
+      socket.on("message", () => {
+        if (upgradeAttempts === 2) {
+          interrupt = () => outcome === "aborted" ? controller.abort() : socket.terminate();
+          socket.send(JSON.stringify({ type: "response.created", response: { id: "resp_partial" } }));
+        } else completed(socket, "resp_recovered", "websocket recovered");
+      });
+    });
+    const provider = createOpenAIApiProvider();
+    const options = {
+      apiKey: "bridge-key",
+      transport: "auto" as const,
+      sessionId: `recovery-${outcome}`,
+      websocketConnectTimeoutMs: 1_000,
+    };
+    // Exercise the full stream entry point too, not only streamSimple.
+    const request = (recover = false) => provider.stream(
+      model(fallback.baseUrl),
+      { messages: [{ role: "user", content: "ping", timestamp: 1 }] },
+      { ...options, ...(recover ? { signal: controller.signal, onResponse: () => interrupt?.() } : {}) },
+    ).result();
+    await request();
+    const interrupted = await request(true);
+    assert.equal(interrupted.stopReason, outcome, interrupted.errorMessage);
+    assert.equal(upgradeAttempts, 2);
+    assert.equal(fallback.requests, 1, "never replay after the first event");
+    if (outcome === "error") {
+      await request();
+      assert.equal(upgradeAttempts, 2, "partial response must not reset the failure sequence");
+      assert.equal(fallback.requests, 2);
+      context.mock.timers.tick(300_000);
+    }
+    const recovered = await request();
+    assert.equal(recovered.stopReason, "stop", recovered.errorMessage);
+    assert.equal(recovered.content[0]?.text, "websocket recovered");
+    assert.equal(upgradeAttempts, 3, "aborted probe must release its slot without adding a cooldown");
+  });
+}

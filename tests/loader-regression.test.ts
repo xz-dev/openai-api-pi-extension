@@ -12,6 +12,7 @@ import {
   ModelRegistry,
   ModelRuntime,
   SessionManager,
+  VERSION,
 } from "@earendil-works/pi-coding-agent";
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -72,7 +73,7 @@ test("provider-info reports actual transport and live connection without exposin
   savedEnv = Object.fromEntries(ENV_KEYS.map((key) => [key, process.env[key]]));
   delete process.env.PI_OFFLINE;
   const server = createServer((request, response) => {
-    assert.equal(request.url, "/v1/models?client_version=0.84.2");
+    assert.equal(request.url, `/v1/models?client_version=${VERSION}`);
     assert.equal(request.headers.authorization, "Bearer provider-info-key");
     response.writeHead(200, { "content-type": "application/json" });
     response.end(JSON.stringify({
@@ -186,7 +187,7 @@ test("real Pi runtime lets process environment override stored fields independen
   for (const { field, envBaseUrl } of cases) {
     let expectedBaseUrl = "";
     const server = createServer((request, response) => {
-      assert.equal(request.url, "/v1/models?client_version=0.84.2");
+      assert.equal(request.url, `/v1/models?client_version=${VERSION}`);
       assert.equal(request.headers.authorization, "Bearer current-key");
       response.writeHead(200, { "content-type": "application/json" });
       response.end(JSON.stringify({
@@ -237,7 +238,7 @@ test("async factory publishes environment catalog before startup", async () => {
   savedEnv = Object.fromEntries(ENV_KEYS.map((key) => [key, process.env[key]]));
   delete process.env.PI_OFFLINE;
   const server = createServer((request, response) => {
-    assert.equal(request.url, "/v1/models?client_version=0.84.2");
+    assert.equal(request.url, `/v1/models?client_version=${VERSION}`);
     assert.equal(request.headers.authorization, "Bearer loader-key");
     response.writeHead(200, { "content-type": "application/json" });
     response.end(JSON.stringify({ models: [{ slug: "loader-model", context_window: 64000, max_tokens: 8192 }] }));
