@@ -81,15 +81,23 @@ Pi's `transport` setting selects behavior:
 - `websocket-cached`: reuses a session WebSocket and sends
   `previous_response_id` plus only new input when the conversation prefix still
   matches; otherwise sends full context safely.
-- `auto`: tries cached WebSocket first. If a reused cached connection has a
-  transport failure before any response event, it is discarded and the same
-  request is tried once on a fresh WebSocket with full context. If the first
-  attempt was already fresh, or that fresh retry also fails before the first
-  event, the request falls back to SSE and that session stays on SSE for 5 minutes
-  seconds. The next real request after the cooldown retries cached WebSocket
-  while concurrent requests stay on SSE. Another pre-start failure starts a
-  new 5-minute cooldown, while success resumes the normal cached WebSocket
-  connection. API error events do not trigger the extra fresh-WebSocket retry.
+- `auto`: tries cached WebSocket first. A failure before the first response event
+  falls back to SSE for that request, without retrying WebSocket in the same
+  request (including Pi's provider-level retries). After the first failure, the
+  next real request tries a fresh WebSocket with full context. Consecutive failures
+  keep that gateway/session on SSE for
+  5 minutes before another request can try WebSocket again. A failed recovery
+  starts a new 5-minute cooldown; a successfully completed WebSocket response
+  resets the failure sequence. Only one recovery request runs at a time;
+  concurrent requests use SSE until it finishes. Cancellation does not count as
+  a failure. Once any response event has arrived, a failure is surfaced without
+  replaying that request over SSE; recovery applies to later requests only.
+
+Explicit `websocket` and `websocket-cached` modes fail without SSE fallback.
+Recovery belongs to this extension's Responses bridge, not Pi's built-in Codex
+transport. It requires no fork-only WebSocket state accessors or extra
+configuration, so official Pi builds within the supported dependency range can
+use it too.
 
 The bridge uses Pi's existing request builder and response parser through its
 public `fetch` injection point; it does not copy Pi's Responses protocol code.
