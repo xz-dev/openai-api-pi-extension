@@ -6,17 +6,20 @@
  * - OPENAI_API_EXTENSION_BASE_URL / OPENAI_API_EXTENSION_API_KEY
  */
 import { getAgentDir, type ExtensionAPI, SettingsManager, VERSION } from "@earendil-works/pi-coding-agent";
+import * as piAI from "@earendil-works/pi-ai";
 import {
   type ApiKeyAuth,
   type ApiKeyCredential,
   type AuthContext,
   type AuthResult,
+  type Context,
   type Message,
   type Model,
   type Provider,
   type RefreshModelsContext,
 } from "@earendil-works/pi-ai";
 import { openAIResponsesApi } from "@earendil-works/pi-ai/compat";
+import { checkpointCandidate, checkpointsEnabled, encodeCheckpointOutput, type CheckpointOptions } from "./checkpoint-adapter.ts";
 import {
   createResponsesWebSocketBridge,
   getActualResponsesTransport,
@@ -26,6 +29,8 @@ import {
 } from "./responses-websocket-fetch.ts";
 
 const PROVIDER = "openai-api-extension";
+// Newer hosts require transcript-normalized tools/system messages; stock has no normalizer.
+const normalizeContext = (piAI as typeof piAI & { normalizeContext?: (context: Context) => Context }).normalizeContext;
 
 /**
  * Drop messages whose content is empty or whitespace-only before delegating to
@@ -347,6 +352,7 @@ function apiKeyAuth(
 export function createOpenAIApiProvider(
   initialModels: readonly GatewayModel[] = [],
   onCatalogError?: (message: string) => void,
+  getRawCheckpointExclude: () => unknown = () => undefined,
 ): Provider<"openai-responses"> {
   let models = initialModels;
   let initialModelsPublished = false;
@@ -354,6 +360,19 @@ export function createOpenAIApiProvider(
     | { baseUrl: string; apiKey: string; models: readonly GatewayModel[]; checkedAt: number }
     | undefined;
   const api = openAIResponsesApi();
+  const bridgeOptions = (model: GatewayModel, context: Context, options: CheckpointOptions) => {
+    const raw = Object.hasOwn(options, "responseCheckpointExclude") ? options.responseCheckpointExclude : getRawCheckpointExclude();
+    return { ...options, checkpoints: {
+      enabled: checkpointsEnabled(model, options, raw),
+      candidate: checkpointCandidate(context),
+      encodeOutput: (output: piAI.AssistantMessage) => encodeCheckpointOutput(api, model, context, output),
+    } };
+  };
+  const payloadHook = (enabled: boolean, original: CheckpointOptions["onPayload"]) =>
+    async (payload: unknown, model: GatewayModel) => {
+      if (enabled && payload && typeof payload === "object") (payload as { store?: boolean }).store = true;
+      return original?.(payload, model);
+    };
   const provider: Provider<"openai-responses"> = {
     id: PROVIDER,
     name: PROVIDER_NAME,
@@ -417,25 +436,34 @@ export function createOpenAIApiProvider(
     },
     stream: (model, context, options) => {
       const filteredContext = { ...context, messages: dropEmptyMessages(context.messages) };
+      const requestContext = normalizeContext?.(filteredContext) ?? filteredContext;
       if (!options?.transport || options.transport === "sse") {
         recordActualResponsesTransport(model.baseUrl, "sse", options?.sessionId);
-        return redactAssistantStream(api.stream(model, filteredContext, options), options?.apiKey);
+        return redactAssistantStream(api.stream(model, requestContext, { ...options, transport: "sse" }), options?.apiKey);
       }
-      const bridge = createResponsesWebSocketBridge(model, options);
+      // The bridge owns transport and continuation; see README.md#transports.
+      const owned = bridgeOptions(model, requestContext, options);
+      const bridge = createResponsesWebSocketBridge(model, owned);
+      const sdkOptions = { ...options, transport: "sse" as const, onTransport: undefined, fetch: bridge.fetch,
+        onPayload: payloadHook(owned.checkpoints.enabled, options.onPayload) };
       return redactAssistantStream(
-        wrapResponsesWebSocketStream(api.stream(model, filteredContext, { ...options, fetch: bridge.fetch }), bridge),
+        wrapResponsesWebSocketStream(api.stream(model, requestContext, sdkOptions), bridge),
         options.apiKey,
       );
     },
     streamSimple: (model, context, options) => {
       const filteredContext = { ...context, messages: dropEmptyMessages(context.messages) };
+      const requestContext = normalizeContext?.(filteredContext) ?? filteredContext;
       if (!options?.transport || options.transport === "sse") {
         recordActualResponsesTransport(model.baseUrl, "sse", options?.sessionId);
-        return redactAssistantStream(api.streamSimple(model, filteredContext, options), options?.apiKey);
+        return redactAssistantStream(api.streamSimple(model, requestContext, { ...options, transport: "sse" }), options?.apiKey);
       }
-      const bridge = createResponsesWebSocketBridge(model, options);
+      const owned = bridgeOptions(model, requestContext, options);
+      const bridge = createResponsesWebSocketBridge(model, owned);
+      const sdkOptions = { ...options, transport: "sse" as const, onTransport: undefined, fetch: bridge.fetch,
+        onPayload: payloadHook(owned.checkpoints.enabled, options.onPayload) };
       return redactAssistantStream(
-        wrapResponsesWebSocketStream(api.streamSimple(model, filteredContext, { ...options, fetch: bridge.fetch }), bridge),
+        wrapResponsesWebSocketStream(api.streamSimple(model, requestContext, sdkOptions), bridge),
         options.apiKey,
       );
     },
@@ -531,5 +559,19 @@ export default async function (pi: ExtensionAPI): Promise<void> {
       console.warn(`[openai-api-extension] model discovery failed: ${errorMessage(error)}`);
     }
   }
-  pi.registerProvider(createOpenAIApiProvider(models, reportCatalogError));
+  let settingsContext: { cwd: string; isProjectTrusted(): boolean } | undefined;
+  pi.on("session_start", async (_event, ctx) => { settingsContext = ctx; });
+  pi.registerProvider(createOpenAIApiProvider(models, reportCatalogError, () => {
+    try {
+      const settings = SettingsManager.create(settingsContext?.cwd ?? process.cwd(), getAgentDir(), {
+        projectTrusted: settingsContext?.isProjectTrusted() ?? false,
+      });
+      // Raw public snapshots work on stock too; never read/materialize native defaults.
+      const global = settings.getGlobalSettings() as Record<string, unknown>;
+      const project = settings.getProjectSettings() as Record<string, unknown>;
+      return Object.hasOwn(project, "responseCheckpointExclude") ? project.responseCheckpointExclude : global.responseCheckpointExclude;
+    } catch {
+      return ["*"]; // Unreadable policy must not enable storage.
+    }
+  }));
 }

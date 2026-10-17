@@ -12,6 +12,9 @@ import {
   type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
 
+import { captureCheckpoint, hashCanonical, planCheckpoint, responseEventOutput, responseOutputItemsCapturable,
+  type CheckpointCandidate, type ResponseCheckpoint } from "./response-checkpoints.ts";
+
 const SOCKET_TTL_MS = 5 * 60 * 1000;
 const AUTO_SSE_COOLDOWN_MS = 5 * 60 * 1000;
 const encoder = new TextEncoder();
@@ -23,6 +26,7 @@ type Continuation = {
   responseId: string;
   // Caller-owned roots can leave history only on the server.
   hasFullHistory: boolean;
+  encodedOutput?: unknown[];
 };
 type Connection = {
   ws: ResponsesWS;
@@ -38,12 +42,24 @@ type Pending = {
   request: RequestBody;
   hasFullHistory: boolean;
   iterator: AsyncIterator<ResponsesStreamMessage>;
+  scopeHash?: string;
+  completion?: Record<string, unknown>;
+  onStreamError?: (error: unknown) => void;
 };
 
 type BridgeOptions = Pick<
   SimpleStreamOptions,
   "apiKey" | "cacheRetention" | "fetch" | "sessionId" | "timeoutMs" | "transport" | "websocketConnectTimeoutMs"
->;
+> & {
+  headers?: SimpleStreamOptions["headers"];
+  checkpoints?: {
+    enabled: boolean;
+    candidate?: CheckpointCandidate;
+    encodeOutput(output: AssistantMessage): Promise<unknown[]>;
+  };
+  // Optional public host capability; stock Pi need not expose it.
+  onTransport?: (transport: string | undefined, model: Model<"openai-responses">) => void | Promise<void>;
+};
 
 const connections = new Map<string, Connection>();
 // Presence records a WS failure: 0 retries next request; a deadline enforces cooldown.
@@ -66,7 +82,7 @@ function cacheEnabled(options: BridgeOptions): boolean {
 
 function connectionKey(model: Model<"openai-responses">, options: BridgeOptions, headers: Headers): string | undefined {
   if (!cacheEnabled(options) || !options.sessionId) return undefined;
-  const identity = createHash("sha256").update(JSON.stringify([...headers])).digest("hex");
+  const identity = createHash("sha256").update(JSON.stringify([options.apiKey, [...headers]])).digest("hex");
   return `${model.baseUrl}\0${options.sessionId}\0${identity}`;
 }
 
@@ -149,6 +165,28 @@ function isInvalidPreviousResponseIdError(error: unknown): boolean {
     && (detail.code == null || detail.code === "invalid_request" || detail.code === "invalid_request_error");
 }
 
+// Documented pre-execution retention miss, not a capability rejection.
+function isMissingPreviousResponseError(error: unknown): boolean {
+  const event = error instanceof Error ? (error as { error?: unknown }).error : undefined;
+  if (!event || typeof event !== "object") return false;
+  const detail = (event as { error?: { code?: unknown; type?: unknown } }).error;
+  return detail?.code === "previous_response_not_found" && detail.type === "invalid_request_error";
+}
+
+async function checkpointScope(model: Model<"openai-responses">, options: BridgeOptions, request: Request): Promise<string> {
+  const headers = new Headers(request.headers);
+  const supplied = new Headers({ ...model.headers, ...options.headers } as HeadersInit);
+  // Ignore only SDK-generated transport values; caller values stay in provenance.
+  for (const name of ["x-client-request-id", "x-session-id", "session_id", "x-stainless-retry-count", "x-stainless-timeout"]) {
+    if (!supplied.has(name)) headers.delete(name);
+  }
+  headers.delete("authorization"); // WS uses the OpenAI client's key, unlike HTTP.
+  const credential = options.apiKey ?? request.headers.get("authorization")?.replace(/^Bearer\s+/i, "");
+  return hashCanonical({ adapter: "openai-api-extension/responses-v1", destination: model.baseUrl,
+    requestUrl: request.url, protocol: "responses-websocket", credential,
+    headers: Object.fromEntries(headers), suppliedHeaders: Object.fromEntries(supplied) });
+}
+
 function withoutInput(body: RequestBody): Omit<RequestBody, "input" | "previous_response_id"> {
   const { input: _input, previous_response_id: _previousResponseId, ...rest } = body;
   return rest;
@@ -169,6 +207,12 @@ function cachedBody(connection: Connection, body: RequestBody): RequestBody {
   const input = body.input ?? [];
   const previousInput = previous.request.input ?? [];
   if (input.length <= previousInput.length || JSON.stringify(input.slice(0, previousInput.length)) !== JSON.stringify(previousInput)) return body;
+  // Eligible nonpersistent continuations still prove the exact assistant prefix.
+  if (previous.encodedOutput) {
+    const end = previousInput.length + previous.encodedOutput.length;
+    if (end >= input.length || JSON.stringify(input.slice(previousInput.length, end)) !== JSON.stringify(previous.encodedOutput)) return body;
+    return { ...body, previous_response_id: previous.responseId, input: input.slice(end) } as RequestBody;
+  }
   let deltaStart = previousInput.length;
   if (!isAssistantResponseItem(input[deltaStart]!)) return body;
   while (deltaStart < input.length && isAssistantResponseItem(input[deltaStart]!)) deltaStart++;
@@ -213,7 +257,10 @@ async function firstMessage(pending: Pending, signal: AbortSignal): Promise<Resp
 function streamResponse(pending: Pending, first: ResponseStreamEvent, signal: AbortSignal): Response {
   const body = new ReadableStream<Uint8Array>({
     start(controller) {
-      const send = (event: ResponseStreamEvent) => controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+      const send = (event: ResponseStreamEvent) => {
+        if (event.type === "response.completed") pending.completion = event as unknown as Record<string, unknown>;
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+      };
       const terminal = (event: ResponseStreamEvent) =>
         event.type === "response.completed" || event.type === "response.incomplete" || event.type === "response.failed";
       const abort = () => closeConnection(pending.key, pending.connection, "aborted");
@@ -235,6 +282,7 @@ function streamResponse(pending: Pending, first: ResponseStreamEvent, signal: Ab
           controller.enqueue(encoder.encode("data: [DONE]\n\n"));
           controller.close();
         } catch (error) {
+          pending.onStreamError?.(error);
           controller.error(error);
         } finally {
           signal.removeEventListener("abort", abort);
@@ -255,6 +303,11 @@ export type ResponsesWebSocketBridge = {
   finish(output: AssistantMessage): Promise<void>;
 };
 
+/**
+ * Storage/repair policy: [Response checkpoints](README.md#response-checkpoints).
+ * Paired native adapter: https://github.com/xz-dev/pi/blob/patch/responses-websocket-transport/packages/ai/src/api/openai-responses-websocket.ts
+ * Portable kernel: [response-checkpoints.ts](response-checkpoints.ts).
+ */
 export function createResponsesWebSocketBridge(
   model: Model<"openai-responses">,
   options: BridgeOptions,
@@ -264,6 +317,9 @@ export function createResponsesWebSocketBridge(
   let terminalRepairFailure: { error: unknown } | undefined;
   const fallbackFetch = options.fetch ?? globalThis.fetch;
   const statusKey = transportKey(model.baseUrl, options.sessionId);
+  const notifyTransport = async (transport: string) => {
+    try { await options.onTransport?.(transport, model); } catch { /* observation must not cause inference replay */ }
+  };
   let recoveryProbe = false;
   // Pi may retry fetch within one model request; SSE stays selected until it ends.
   let useSse = false;
@@ -286,6 +342,7 @@ export function createResponsesWebSocketBridge(
         if (useSse || autoSseRecoveryInFlight.has(statusKey) || (fallbackUntil !== undefined && Date.now() < fallbackUntil)) {
           useSse = true;
           actualTransports.set(statusKey, "sse");
+          await notifyTransport("SSE");
           return fallbackFetch(fallbackRequest);
         }
         if (fallbackUntil !== undefined) {
@@ -295,9 +352,16 @@ export function createResponsesWebSocketBridge(
       }
 
       let referenceRepairAttempted = false;
+      let durableSent = false;
       try {
         const requestBody = JSON.parse(await request.text()) as RequestBody;
-        const { previous_response_id: _previousResponseId, ...fullBody } = requestBody;
+        const { previous_response_id: _previousResponseId, ...withoutParent } = requestBody;
+        const durable = options.checkpoints?.enabled === true;
+        const fullBody = durable && requestBody.previous_response_id != null ? requestBody : withoutParent;
+        const scopeHash = durable && requestBody.store === true ? await checkpointScope(model, options, request) : undefined;
+        const candidate = options.checkpoints?.candidate;
+        const plan = scopeHash && candidate ? await planCheckpoint({ request: requestBody as Record<string, unknown>,
+          candidate, scopeHash, now: Date.now(), eligible: true }) : undefined;
         // A pre-execution rejection of the bridge-owned cached anchor may
         // retry once on a fresh WebSocket with the saved complete request and
         // the parent removed. Only an explicit invalid-reference rejection of
@@ -315,14 +379,22 @@ export function createResponsesWebSocketBridge(
             request: requestBody,
             hasFullHistory: requestBody.previous_response_id == null,
             iterator,
+            scopeHash,
+            onStreamError: durable ? (error) => { terminalRepairFailure = { error }; } : undefined,
           };
           // Recovery must not reference state from the discarded connection,
           // and a scope that already rejected a cached anchor must not emit
           // another one on later turns.
           const anchorRejected = acquired.key !== undefined && rejectedContinuationKeys.has(acquired.key);
+          // Preserve caller ancestry and proven nonpersistent continuations without durable planning.
+          const inherited = durable && requestBody.previous_response_id == null
+            && (acquired.connection.continuation?.hasFullHistory === false
+              || (requestBody.store !== true && acquired.connection.continuation?.encodedOutput !== undefined))
+            ? cachedBody(acquired.connection, requestBody) : undefined;
           const delta = recoveryProbe || stripRejectedParent || anchorRejected || !cacheEnabled(options)
             ? undefined
-            : cachedBody(acquired.connection, requestBody);
+            : durable ? ((inherited !== requestBody ? inherited : undefined) ?? (plan?.request as RequestBody | undefined))
+              : cachedBody(acquired.connection, requestBody);
           const body = recoveryProbe || stripRejectedParent ? fullBody : (delta ?? requestBody);
           // A parent is bridge-owned only when cachedBody rewrote the request
           // into a delta; a caller-supplied previous_response_id is never a
@@ -330,19 +402,22 @@ export function createResponsesWebSocketBridge(
           const bridgeOwnedParent = delta !== undefined && delta !== requestBody
             ? delta.previous_response_id
             : undefined;
-          pending.hasFullHistory &&= bridgeOwnedParent === undefined
+          pending.hasFullHistory &&= bridgeOwnedParent === undefined || (durable && delta === plan?.request)
             || acquired.connection.continuation?.hasFullHistory === true;
+          durableSent = durable;
           pending.connection.ws.send({ type: "response.create", ...body } as ResponsesClientEvent);
           try {
             const first = await firstMessage(pending, request.signal);
             actualTransports.set(statusKey, cacheEnabled(options) ? "websocket-cached" : "websocket");
+            await notifyTransport(body.previous_response_id ? "WS/continuation" : "WS/full");
             return streamResponse(pending, first, request.signal);
           } catch (error) {
             const hasFullHistory = pending.hasFullHistory;
             closeConnection(pending.key, pending.connection, "request failed");
             pending = undefined;
-            if (hasFullHistory && bridgeOwnedParent !== undefined && isInvalidPreviousResponseIdError(error)) {
-              if (acquired.key) rejectedContinuationKeys.add(acquired.key);
+            if (hasFullHistory && bridgeOwnedParent !== undefined
+              && (isInvalidPreviousResponseIdError(error) || (durable && isMissingPreviousResponseError(error)))) {
+              if (acquired.key && isInvalidPreviousResponseIdError(error)) rejectedContinuationKeys.add(acquired.key);
               if (invalidRefRetry && !request.signal.aborted) {
                 invalidRefRetry = false;
                 stripRejectedParent = true;
@@ -354,26 +429,47 @@ export function createResponsesWebSocketBridge(
           }
         }
       } catch (error) {
-        if (referenceRepairAttempted) terminalRepairFailure = { error };
+        if (referenceRepairAttempted || durableSent) terminalRepairFailure = { error };
         if (pending) closeConnection(pending.key, pending.connection, "request failed");
         pending = undefined;
         if (recoveryProbe) autoSseRecoveryInFlight.delete(statusKey);
-        if (options.transport !== "auto" || request.signal.aborted) throw error;
+        if (durableSent || options.transport !== "auto" || request.signal.aborted) throw error;
         recordFailure();
         // A failed repair may already have generated; do not add an HTTP replay.
         if (referenceRepairAttempted) throw error;
         useSse = true;
         actualTransports.set(statusKey, "sse");
+        await notifyTransport("SSE");
         return fallbackFetch(fallbackRequest);
       }
     },
     async finish(output) {
       if (!pending) return;
+      const completed = responseEventOutput(pending.completion ?? {});
+      let encodedOutput: unknown[] | undefined;
+      if (options.checkpoints?.enabled && completed && completed.id === output.responseId) {
+        try { encodedOutput = await options.checkpoints.encodeOutput(output); }
+        catch { /* Unsupported host codec: no locally proven continuation. */ }
+      }
+      const outputComplete = encodedOutput !== undefined && completed !== undefined
+        && responseOutputItemsCapturable(completed.output, encodedOutput);
+      if (pending.scopeHash && pending.hasFullHistory && pending.request.store === true
+        && (output.stopReason === "stop" || output.stopReason === "toolUse")) {
+        try {
+          if (completed && completed.store !== false && outputComplete) {
+            const checkpoint = await captureCheckpoint({ request: pending.request as Record<string, unknown>,
+              responseId: completed.id, encodedPrefix: [...(pending.request.input ?? []), ...encodedOutput!],
+              scopeHash: pending.scopeHash, completed: true, stored: true, fullHistory: true, now: Date.now() });
+            if (checkpoint) (output as AssistantMessage & { responseCheckpoint?: ResponseCheckpoint }).responseCheckpoint = checkpoint;
+          }
+        } catch { /* Unsupported host codec: full history stays canonical, no attestation. */ }
+      }
       if (output.stopReason !== "error" && output.stopReason !== "aborted" && output.responseId && cacheEnabled(options)) {
         pending.connection.continuation = {
           request: pending.request,
           responseId: output.responseId,
           hasFullHistory: pending.hasFullHistory,
+          ...(outputComplete ? { encodedOutput } : {}),
         };
       }
       if (output.stopReason === "error" || output.stopReason === "aborted") {
