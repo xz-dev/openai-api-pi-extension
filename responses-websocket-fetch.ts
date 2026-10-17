@@ -15,11 +15,14 @@ import {
 const SOCKET_TTL_MS = 5 * 60 * 1000;
 const AUTO_SSE_COOLDOWN_MS = 5 * 60 * 1000;
 const encoder = new TextEncoder();
+const MESSAGE_ID_REJECTION = "previous_response_id must be a response.id (resp_*), not a message id";
 
 type RequestBody = Omit<ResponsesClientEvent, "type"> & { input?: ResponseInputItem[]; stream?: boolean };
 type Continuation = {
   request: RequestBody;
   responseId: string;
+  // Caller-owned roots can leave history only on the server.
+  hasFullHistory: boolean;
 };
 type Connection = {
   ws: ResponsesWS;
@@ -33,6 +36,7 @@ type Pending = {
   key?: string;
   keep: boolean;
   request: RequestBody;
+  hasFullHistory: boolean;
   iterator: AsyncIterator<ResponsesStreamMessage>;
 };
 
@@ -46,6 +50,11 @@ const connections = new Map<string, Connection>();
 const autoSseFallbackUntil = new Map<string, number>();
 const autoSseRecoveryInFlight = new Set<string>();
 const actualTransports = new Map<string, "sse" | "websocket" | "websocket-cached">();
+// Connection scopes where a cached continuation anchor was explicitly rejected
+// as an invalid reference. Further requests on that scope keep full input
+// instead of repeating the same rejected-anchor class every turn. Scoped to
+// the connection key, never to an ID prefix or a whole endpoint family.
+const rejectedContinuationKeys = new Set<string>();
 
 function transportKey(baseUrl: string, sessionId?: string): string {
   return `${baseUrl}\0${sessionId ?? ""}`;
@@ -114,6 +123,32 @@ function acquire(
   return { connection, key, keep };
 }
 
+class ResponsesWebSocketCloseError extends Error {
+  code: number;
+  reason: string;
+
+  constructor(code: number, reason: string) {
+    super(`Responses WebSocket closed (${code}): ${reason}`);
+    this.code = code;
+    this.reason = reason;
+  }
+}
+
+// This exact ingress validation is known to reject before generation.
+function isInvalidPreviousResponseIdError(error: unknown): boolean {
+  if (error instanceof ResponsesWebSocketCloseError) {
+    return error.code === 1008 && error.reason === MESSAGE_ID_REJECTION;
+  }
+  const event = error instanceof Error ? (error as { error?: unknown }).error : undefined;
+  const detail = event && typeof event === "object"
+    ? (event as { error?: { type?: unknown; code?: unknown; message?: unknown } }).error
+    : undefined;
+  return detail !== null && typeof detail === "object"
+    && detail.message === MESSAGE_ID_REJECTION
+    && detail.type === "invalid_request_error"
+    && (detail.code == null || detail.code === "invalid_request" || detail.code === "invalid_request_error");
+}
+
 function withoutInput(body: RequestBody): Omit<RequestBody, "input" | "previous_response_id"> {
   const { input: _input, previous_response_id: _previousResponseId, ...rest } = body;
   return rest;
@@ -167,7 +202,7 @@ async function firstMessage(pending: Pending, signal: AbortSignal): Promise<Resp
       const item = await nextItem(pending);
       if (item.done) throw new Error("Responses WebSocket closed before response started");
       if (item.value.type === "error") throw item.value.error;
-      if (item.value.type === "close") throw new Error(`Responses WebSocket closed (${item.value.code}): ${item.value.reason}`);
+      if (item.value.type === "close") throw new ResponsesWebSocketCloseError(item.value.code, item.value.reason);
       if (item.value.type === "message") return item.value.message;
     }
   } finally {
@@ -225,6 +260,8 @@ export function createResponsesWebSocketBridge(
   options: BridgeOptions,
 ): ResponsesWebSocketBridge {
   let pending: Pending | undefined;
+  // Provider retries reuse this bridge; a failed repair must stay terminal.
+  let terminalRepairFailure: { error: unknown } | undefined;
   const fallbackFetch = options.fetch ?? globalThis.fetch;
   const statusKey = transportKey(model.baseUrl, options.sessionId);
   let recoveryProbe = false;
@@ -243,6 +280,7 @@ export function createResponsesWebSocketBridge(
       if (request.method !== "POST" || !new URL(request.url).pathname.replace(/\/+$/, "").endsWith("/responses")) {
         return fallbackFetch(fallbackRequest);
       }
+      if (terminalRepairFailure) throw terminalRepairFailure.error;
       if (options.transport === "auto") {
         const fallbackUntil = autoSseFallbackUntil.get(statusKey);
         if (useSse || autoSseRecoveryInFlight.has(statusKey) || (fallbackUntil !== undefined && Date.now() < fallbackUntil)) {
@@ -256,29 +294,74 @@ export function createResponsesWebSocketBridge(
         }
       }
 
+      let referenceRepairAttempted = false;
       try {
         const requestBody = JSON.parse(await request.text()) as RequestBody;
-        const acquired = acquire(model, options, request.headers, recoveryProbe);
-        const iterator = acquired.connection.ws.stream();
-        pending = {
-          ...acquired,
-          idleTimeoutMs: options.timeoutMs,
-          request: requestBody,
-          iterator,
-        };
-        // Recovery must not reference state from the discarded connection.
         const { previous_response_id: _previousResponseId, ...fullBody } = requestBody;
-        const body = recoveryProbe ? fullBody : cacheEnabled(options) ? cachedBody(acquired.connection, requestBody) : requestBody;
-        pending.connection.ws.send({ type: "response.create", ...body } as ResponsesClientEvent);
-        const first = await firstMessage(pending, request.signal);
-        actualTransports.set(statusKey, cacheEnabled(options) ? "websocket-cached" : "websocket");
-        return streamResponse(pending, first, request.signal);
+        // A pre-execution rejection of the bridge-owned cached anchor may
+        // retry once on a fresh WebSocket with the saved complete request and
+        // the parent removed. Only an explicit invalid-reference rejection of
+        // a bridge-owned previous_response_id qualifies: caller-owned
+        // references fail closed, and ambiguous closes, partial output and
+        // auth/policy failures never replay.
+        let invalidRefRetry = !recoveryProbe;
+        let stripRejectedParent = recoveryProbe;
+        for (;;) {
+          const acquired = acquire(model, options, request.headers, recoveryProbe);
+          const iterator = acquired.connection.ws.stream();
+          pending = {
+            ...acquired,
+            idleTimeoutMs: options.timeoutMs,
+            request: requestBody,
+            hasFullHistory: requestBody.previous_response_id == null,
+            iterator,
+          };
+          // Recovery must not reference state from the discarded connection,
+          // and a scope that already rejected a cached anchor must not emit
+          // another one on later turns.
+          const anchorRejected = acquired.key !== undefined && rejectedContinuationKeys.has(acquired.key);
+          const delta = recoveryProbe || stripRejectedParent || anchorRejected || !cacheEnabled(options)
+            ? undefined
+            : cachedBody(acquired.connection, requestBody);
+          const body = recoveryProbe || stripRejectedParent ? fullBody : (delta ?? requestBody);
+          // A parent is bridge-owned only when cachedBody rewrote the request
+          // into a delta; a caller-supplied previous_response_id is never a
+          // bridge-owned baseline.
+          const bridgeOwnedParent = delta !== undefined && delta !== requestBody
+            ? delta.previous_response_id
+            : undefined;
+          pending.hasFullHistory &&= bridgeOwnedParent === undefined
+            || acquired.connection.continuation?.hasFullHistory === true;
+          pending.connection.ws.send({ type: "response.create", ...body } as ResponsesClientEvent);
+          try {
+            const first = await firstMessage(pending, request.signal);
+            actualTransports.set(statusKey, cacheEnabled(options) ? "websocket-cached" : "websocket");
+            return streamResponse(pending, first, request.signal);
+          } catch (error) {
+            const hasFullHistory = pending.hasFullHistory;
+            closeConnection(pending.key, pending.connection, "request failed");
+            pending = undefined;
+            if (hasFullHistory && bridgeOwnedParent !== undefined && isInvalidPreviousResponseIdError(error)) {
+              if (acquired.key) rejectedContinuationKeys.add(acquired.key);
+              if (invalidRefRetry && !request.signal.aborted) {
+                invalidRefRetry = false;
+                stripRejectedParent = true;
+                referenceRepairAttempted = true;
+                continue;
+              }
+            }
+            throw error;
+          }
+        }
       } catch (error) {
+        if (referenceRepairAttempted) terminalRepairFailure = { error };
         if (pending) closeConnection(pending.key, pending.connection, "request failed");
         pending = undefined;
         if (recoveryProbe) autoSseRecoveryInFlight.delete(statusKey);
         if (options.transport !== "auto" || request.signal.aborted) throw error;
         recordFailure();
+        // A failed repair may already have generated; do not add an HTTP replay.
+        if (referenceRepairAttempted) throw error;
         useSse = true;
         actualTransports.set(statusKey, "sse");
         return fallbackFetch(fallbackRequest);
@@ -287,7 +370,11 @@ export function createResponsesWebSocketBridge(
     async finish(output) {
       if (!pending) return;
       if (output.stopReason !== "error" && output.stopReason !== "aborted" && output.responseId && cacheEnabled(options)) {
-        pending.connection.continuation = { request: pending.request, responseId: output.responseId };
+        pending.connection.continuation = {
+          request: pending.request,
+          responseId: output.responseId,
+          hasFullHistory: pending.hasFullHistory,
+        };
       }
       if (output.stopReason === "error" || output.stopReason === "aborted") {
         closeConnection(pending.key, pending.connection, "request failed");
@@ -380,10 +467,12 @@ export function closeResponsesWebSockets(sessionId?: string): void {
     for (const key of autoSseFallbackUntil.keys()) if (key.endsWith(`\0${sessionId}`)) autoSseFallbackUntil.delete(key);
     for (const key of autoSseRecoveryInFlight) if (key.endsWith(`\0${sessionId}`)) autoSseRecoveryInFlight.delete(key);
     for (const key of actualTransports.keys()) if (key.endsWith(`\0${sessionId}`)) actualTransports.delete(key);
+    for (const key of rejectedContinuationKeys) if (key.includes(`\0${sessionId}\0`)) rejectedContinuationKeys.delete(key);
   } else {
     autoSseFallbackUntil.clear();
     autoSseRecoveryInFlight.clear();
     actualTransports.clear();
+    rejectedContinuationKeys.clear();
   }
 }
 
