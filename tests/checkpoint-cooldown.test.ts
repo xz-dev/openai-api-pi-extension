@@ -685,3 +685,36 @@ for (const transport of ["auto", "websocket-cached"] as const) {
     assert.equal(requests.at(-1)?.previous_response_id, caller.responseId);
   });
 }
+
+test("prod gateway output (logprobs: []) captures checkpoints, chains deltas and repairs a keeper miss", { timeout: 10_000 }, async () => {
+  const requests: Array<Record<string, unknown>> = [];
+  let chained = 0;
+  const upstream = await server((body, _connection, socket) => {
+    requests.push(body);
+    // Keeper restart: the second chained reference is gone.
+    if (body.previous_response_id && ++chained === 2) {
+      socket.send(JSON.stringify({ type: "error", status: 400, error: { code: "previous_response_not_found",
+        message: `Previous response with id '${body.previous_response_id}' not found.`,
+        param: "previous_response_id", type: "invalid_request_error" } }));
+      return;
+    }
+    for (const event of responseEvents(`resp_${requests.length}`, `answer ${requests.length}`)) {
+      socket.send(JSON.stringify(event).replaceAll('"annotations":[]', '"annotations":[],"logprobs":[]'));
+    }
+  });
+  const provider = createOpenAIApiProvider();
+  const opts = options("prod-logprobs");
+  let messages: Message[] = [{ role: "user", content: "one", timestamp: 1 }];
+  const outs = [];
+  for (let turn = 0; turn < 3; turn++) {
+    const out = await provider.streamSimple(model(upstream.baseUrl), { messages }, opts).result();
+    outs.push(out);
+    messages = [...messages, out, { role: "user", content: `next ${turn}`, timestamp: turn + 2 }];
+  }
+  assert.deepEqual(outs.map((out) => out.stopReason), ["stop", "stop", "stop"]);
+  assert.equal(requests[1]?.previous_response_id, "resp_1", "second turn sends a delta");
+  const repair = requests.at(-1)!;
+  assert.equal(repair.previous_response_id, undefined);
+  assert.equal(repair.store, undefined);
+  assert.equal((repair.input as unknown[]).length, 5);
+});
