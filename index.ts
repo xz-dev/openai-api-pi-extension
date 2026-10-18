@@ -353,6 +353,7 @@ export function createOpenAIApiProvider(
   initialModels: readonly GatewayModel[] = [],
   onCatalogError?: (message: string) => void,
   getRawCheckpointExclude: () => unknown = () => undefined,
+  getRawCheckpointMode: () => unknown = () => undefined,
 ): Provider<"openai-responses"> {
   let models = initialModels;
   let initialModelsPublished = false;
@@ -362,8 +363,9 @@ export function createOpenAIApiProvider(
   const api = openAIResponsesApi();
   const bridgeOptions = (model: GatewayModel, context: Context, options: CheckpointOptions) => {
     const raw = Object.hasOwn(options, "responseCheckpointExclude") ? options.responseCheckpointExclude : getRawCheckpointExclude();
+    const mode = Object.hasOwn(options, "responseCheckpointMode") ? options.responseCheckpointMode : getRawCheckpointMode();
     return { ...options, checkpoints: {
-      enabled: checkpointsEnabled(model, options, raw),
+      enabled: checkpointsEnabled(model, { ...options, responseCheckpointMode: mode }, raw),
       candidate: checkpointCandidate(context),
       encodeOutput: (output: piAI.AssistantMessage) => encodeCheckpointOutput(api, model, context, output),
     } };
@@ -572,6 +574,17 @@ export default async function (pi: ExtensionAPI): Promise<void> {
       return Object.hasOwn(project, "responseCheckpointExclude") ? project.responseCheckpointExclude : global.responseCheckpointExclude;
     } catch {
       return ["*"]; // Unreadable policy must not enable storage.
+    }
+  }, () => {
+    try {
+      const settings = SettingsManager.create(settingsContext?.cwd ?? process.cwd(), getAgentDir(), {
+        projectTrusted: settingsContext?.isProjectTrusted() ?? false,
+      });
+      const global = settings.getGlobalSettings() as Record<string, unknown>;
+      const project = settings.getProjectSettings() as Record<string, unknown>;
+      return Object.hasOwn(project, "responseCheckpointMode") ? project.responseCheckpointMode : global.responseCheckpointMode;
+    } catch {
+      return "declared"; // Unreadable mode must not widen eligibility.
     }
   }));
 }

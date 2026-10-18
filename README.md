@@ -124,15 +124,26 @@ host pi version.
 
 ## Response checkpoints
 
-Durable continuation supports **verified persistent Responses endpoints**, on
-`auto` or `websocket-cached` only. A reconnect or restored session can send an existing
-response ID plus new input instead of resending the whole conversation.
+Durable continuation can request `store: true` on eligible Responses endpoints,
+on `auto` or `websocket-cached` transport only. A reconnect or restored session
+can send an existing response ID plus new input instead of resending the whole
+conversation.
 
-The only checkpoint setting is optional `responseCheckpointExclude: string[]`:
+Two independent settings apply. `responseCheckpointMode` selects when to ask for
+checkpoints at all:
+
+| Mode | Meaning |
+| --- | --- |
+| `always` (default when absent) | Request `store: true` on every eligible endpoint, even when `compat.supportsResponseCheckpoints` is `false` |
+| `auto` | Request unless the model declares `compat.supportsResponseCheckpoints: false` |
+| `declared` | Request only with an exact `compat.supportsResponseCheckpoints: true` declaration, or the official OpenAI service |
+
+Malformed mode values disable checkpoints. The second setting is the per-target
+opt-out `responseCheckpointExclude: string[]`:
 
 | Raw setting | Plugin | Native fork without plugin |
 | --- | --- | --- |
-| Absent | Eligible targets enabled (`[]`) | Disabled (`["*"]`) |
+| Absent | Eligible targets enabled (`[]`) | Eligible targets enabled (`[]`) |
 | `[]` | Eligible targets enabled | Eligible targets enabled |
 | `["*"]` | All excluded | All excluded |
 
@@ -167,11 +178,11 @@ when the property is present.
 ### Endpoint capability and privacy
 
 Supported API-key mode at `https://api.openai.com/v1` has the official-service
-default. Unsupported Codex/ChatGPT modes stay unchanged. Custom services require
-an exact `compat.supportsResponseCheckpoints: true` declaration after verifying
-persistent Responses support for the actual endpoint/account. Brand, model ID,
-`resp_` prefix, generic compatibility, and acceptance of `store` do not establish
-capability.
+default. Unsupported Codex/ChatGPT modes stay unchanged. In `declared` mode
+custom services still require an exact `compat.supportsResponseCheckpoints: true`
+declaration after verifying persistent Responses support for the actual
+endpoint/account. `always` (the default) tries eligible endpoints even without
+a declaration; the cooldown below bounds the cost of a wrong guess.
 
 For an **already discovered** model, merge this override into
 `~/.pi/agent/models.json`, replacing `your-model-id` with its actual catalog ID:
@@ -195,11 +206,26 @@ Configure endpoint/auth and use the ordinary provider discovery/refresh lifecycl
 first. No direct catalog-store editing is needed.
 
 **Privacy:** eligible requests ask the server for `store: true` before the user's
-payload hook. Hook `store: false` prevents durable use/capture; server
-`store: false` prevents capture. Confirm remote retention/privacy requirements
-before enabling. Explicit SSE, uncached `websocket`, and `cacheRetention: "none"`
-do not enable this plugin feature. No TTL, answer cache, KV-cache hit, reduced
-billing, or server retention guarantee is invented.
+payload hook, on third-party gateways included by default. Hook `store: false`
+prevents durable use/capture; server `store: false` prevents capture. Use
+`responseCheckpointMode: "declared"` or `responseCheckpointExclude: ["*"]`
+to opt out. Confirm remote retention/privacy requirements before enabling.
+Explicit SSE, uncached `websocket`, and `cacheRetention: "none"` do not enable
+this plugin feature. No TTL, answer cache, KV-cache hit, reduced billing, or
+server retention guarantee is invented.
+
+### Verification cooldown
+
+Mode and gates decide whether to *try* checkpoints; a separate per-endpoint,
+per-session cooldown verifies that `store: true` continuation actually works.
+The first pre-execution reference failure — `previous_response_not_found`, a
+code-less `previous_response_id is not available` rejection, a rejection of the
+`store` parameter, or a previous_response_id capability rejection — repairs the
+turn once with full history (no `store`, no `previous_response_id`) and opens a
+5-minute cooldown. During cooldown the session sends full history without
+`store`. After the deadline, the next real request probes once with `store:
+true` plus full history; success clears the state, failure renews the cooldown.
+No background probes; nothing is persisted.
 
 ### Restore and safe failure
 
@@ -220,10 +246,10 @@ full history. A caller-owned parent is not replaced or declared full history.
 At most one WS repair is allowed for a proven pre-execution reference rejection
 with genuine complete local history. Missing stored responses and the original
 strict message-ID rejection repair are distinct: that existing repair includes
-the exact WS 1008 signature, not arbitrary policy closes. It remains independent
-of durable checkpoints. No replay after output, auth failure, unknown execution,
-or caller-dependent ancestry; no hidden provider retry or HTTP/SSE replay after
-a failed repair.
+the exact WS 1008 signature, not arbitrary policy closes. No replay after
+output, auth failure, unknown execution, or caller-dependent ancestry; no
+hidden provider retry or HTTP/SSE replay after a failed repair. Explicit SSE and the auto WS→SSE fallback never carry the
+policy `store: true`; a hook `store: false` is always kept.
 
 ### Source and validation scope
 

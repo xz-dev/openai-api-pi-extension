@@ -201,9 +201,11 @@ test("actual WS apiKey changes cannot share pooled socket or checkpoint under id
 
 test("malformed truthy capability never enables storage through real provider", async (t) => {
   const h = await harness(t);
+  // declared mode keeps the exact-true contract; always would legitimately try.
+  const options = { ...h.options, responseCheckpointMode: "declared" };
   for (const capability of ["true", 1, {}, [true]]) {
     const output: any = await h.makeModels().stream({ ...h.model, compat: { supportsResponseCheckpoints: capability } },
-      { messages: [user("one")] }, h.options).result();
+      { messages: [user("one")] }, options).result();
     assert.equal(output.stopReason, "stop", output.errorMessage);
     assert.notEqual(h.frames.at(-1).store, true);
     assert.equal(output.responseCheckpoint, undefined);
@@ -251,15 +253,19 @@ test("real provider raw policy and incoming override precedence never materializ
 
 test("unknown/false capability and SSE/uncached WS retain non-storage behavior", async (t) => {
   const h = await harness(t);
+  // declared mode pins the strict capability contract; hard gates apply to every mode.
   const cases = [
-    { capability: undefined, transport: "auto" }, { capability: false, transport: "auto" },
-    { capability: true, transport: "sse" }, { capability: true, transport: "websocket" },
+    { capability: undefined, transport: "auto", mode: "declared" },
+    { capability: false, transport: "auto", mode: "auto" },
+    { capability: true, transport: "sse" },
+    { capability: true, transport: "websocket" },
   ];
   for (const entry of cases) {
     closeResponsesWebSockets();
     let payload: any;
     const output: any = await h.makeModels().stream({ ...h.model, compat: { supportsResponseCheckpoints: entry.capability } },
       { messages: [user("one")] }, { ...h.options, transport: entry.transport,
+        ...(entry.mode ? { responseCheckpointMode: entry.mode } : {}),
         onPayload: (body: any) => { payload = wireBody(body); } }).result();
     assert.equal(output.stopReason, "stop", output.errorMessage);
     assert.equal(output.responseCheckpoint, undefined); assert.equal(payload.store, false);
@@ -415,14 +421,19 @@ for (const method of ["stream", "streamSimple"] as const) test(`${method}: missi
   closeResponsesWebSockets();
   const second: any = await h.makeModels()[method](h.model, { messages: [user("one"), first, user("two")] }, h.options).result();
   assert.equal(second.stopReason, "stop", second.errorMessage);
-  assert.ok(second.responseCheckpoint);
+  assert.equal(second.responseCheckpoint, undefined, "repair without store captures no checkpoint");
   const full = { ...h.frames[0], input: [input("one"), message(first.responseId), input("two")] };
   assert.deepEqual(h.frames[1], { ...h.frames[0], previous_response_id: first.responseId, input: [input("two")] });
-  assert.deepEqual(h.frames[2], full);
-  closeResponsesWebSockets();
+  // Reference repair resends full history without checkpoint fields and opens cooldown.
+  const { store: _s1, ...repair } = full;
+  assert.deepEqual(h.frames[2], repair);
+  // Cooldown: the next request also stays full-history without store. Sockets
+  // stay pooled: closeResponsesWebSockets() is session cleanup and would also
+  // clear the cooldown (asserted in checkpoint-cooldown.test.ts).
   const third: any = await h.makeModels()[method](h.model, { messages: [user("one"), first, user("two"), second, user("three")] }, h.options).result();
-  assert.ok(third.responseCheckpoint, third.errorMessage);
-  assert.deepEqual(h.frames[3], { ...h.frames[0], previous_response_id: second.responseId, input: [input("three")] });
+  assert.equal(third.stopReason, "stop", third.errorMessage);
+  const { store: _s2, ...cooled } = { ...h.frames[0], input: [input("one"), message(first.responseId), input("two"), message(second.responseId), input("three")] };
+  assert.deepEqual(h.frames[3], cooled);
   assert.equal(h.frames.length, 4);
   assert.equal(h.generations, 3);
   assert.equal(h.httpFrames.length, 0);
@@ -469,15 +480,18 @@ for (const transport of ["auto", "websocket-cached"] as const) for (const maxRet
     assert.equal(failed.stopReason, "error");
     assert.equal(failed.responseCheckpoint, undefined);
     assert.deepEqual(h.frames[1], { ...h.frames[0], previous_response_id: first.responseId, input: [input("two")] });
-    assert.deepEqual(h.frames[2], { ...h.frames[0], input: [input("one"), message(first.responseId), input("two")] });
+    const { store: _repairStore, ...repairFrame } = { ...h.frames[0], input: [input("one"), message(first.responseId), input("two")] };
+    assert.deepEqual(h.frames[2], repairFrame);
     assert.equal(h.frames.length, 3);
     assert.equal(h.generations, mode === "auth" ? 1 : 2);
     assert.equal(h.httpFrames.length, 0);
     h.behavior = undefined;
+    // Sockets stay pooled: session cleanup would also clear the cooldown.
     const later: any = await h.makeModels().stream(h.model, { messages: [user("independent")] }, options).result();
     assert.equal(later.stopReason, "stop", later.errorMessage);
-    assert.ok(later.responseCheckpoint);
-    assert.deepEqual(h.frames[3], { ...h.frames[0], input: [input("independent")] });
+    const { store: _cooledStore, ...cooledFrame } = { ...h.frames[0], input: [input("independent")] };
+    assert.deepEqual(h.frames[3], cooledFrame, "cooldown keeps checkpoints off");
+    assert.equal(later.responseCheckpoint, undefined);
     assert.equal(h.frames.length, 4);
     assert.equal(h.generations, mode === "auth" ? 2 : 3);
     assert.equal(h.httpFrames.length, 0);

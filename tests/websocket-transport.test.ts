@@ -593,6 +593,9 @@ for (const scenario of ["explicit", "implicit", "inherited"] as const) {
       const output = await provider.streamSimple(model(upstream.baseUrl), { messages }, {
         apiKey: "bridge-key", transport: "websocket-cached", sessionId: `caller-ancestry-${scenario}`,
         websocketConnectTimeoutMs: 1_000,
+        // "explicit" pins the connection-local resp_* rewrite; durable checkpoints
+        // send a caller parent verbatim instead (durable-provider caller-supplied tests).
+        ...(scenario === "explicit" ? { responseCheckpointExclude: ["*"] } : {}),
         ...(turn === 1 || scenario === "explicit" ? { samplingParams: { previous_response_id: "resp_external_root" } } : {}),
       }).result();
       if (turn === rejectAt) {
@@ -690,6 +693,9 @@ test("auto falls back on cached failure and recovers with full context on the ne
     samplingParams: { previous_response_id: "caller-provided" },
     transport: "auto" as const,
     sessionId: "cached-fresh-recovery",
+    // Transport-only fixture: default checkpoint mode "always" would fence the
+    // post-send replay this test exercises, so durable checkpoints opt out.
+    responseCheckpointExclude: ["*"],
     websocketConnectTimeoutMs: 1_000,
   };
   const first = await provider.streamSimple(
@@ -758,6 +764,9 @@ test("auto cools down only after the next-request fresh WebSocket also fails", a
     apiKey: "bridge-key",
     transport: "auto" as const,
     sessionId: "cached-fresh-sse-fallback",
+    // Transport-only fixture: default checkpoint mode "always" would fence the
+    // post-send replay this test exercises, so durable checkpoints opt out.
+    responseCheckpointExclude: ["*"],
     websocketConnectTimeoutMs: 1_000,
   };
   const first = await provider.streamSimple(
@@ -884,6 +893,9 @@ test("auto does not retry a reused cached WebSocket after an API error event", a
     apiKey: "bridge-key",
     transport: "auto" as const,
     sessionId: "cached-api-error",
+    // Transport-only fixture: default checkpoint mode "always" would fence the
+    // post-send replay this test exercises, so durable checkpoints opt out.
+    responseCheckpointExclude: ["*"],
     websocketConnectTimeoutMs: 1_000,
   };
   const first = await provider.streamSimple(
@@ -963,10 +975,14 @@ test("websocket-cached omits every prior assistant response item from delta inpu
     completed(socket, `resp_${requests.length}`, `answer ${requests.length}`);
   });
   const provider = createOpenAIApiProvider();
+  // Default responseCheckpointMode is "always"; this test pins the
+  // connection-local cache, so durable checkpoints opt out here.
+  const base = { apiKey: "bridge-key", transport: "websocket-cached" as const, sessionId: "multi-item-cache",
+    responseCheckpointExclude: ["*"] };
   const first = await provider.streamSimple(
     model(upstream.baseUrl),
     { messages: [{ role: "user", content: "one", timestamp: 1 }] },
-    { apiKey: "bridge-key", transport: "websocket-cached", sessionId: "multi-item-cache" },
+    base,
   ).result();
   first.content.unshift({
     type: "thinking",
@@ -982,7 +998,7 @@ test("websocket-cached omits every prior assistant response item from delta inpu
         { role: "user", content: "two", timestamp: 2 },
       ],
     },
-    { apiKey: "bridge-key", transport: "websocket-cached", sessionId: "multi-item-cache" },
+    base,
   ).result();
 
   assert.equal(requests[1]?.previous_response_id, "resp_1");
@@ -1075,6 +1091,9 @@ test("auto retries after each 5-minute cooldown and resets failures after WebSoc
     apiKey: "bridge-key",
     transport: "auto" as const,
     sessionId: "auto-recovery",
+    // Transport-only fixture: default checkpoint mode "always" would fence the
+    // post-send replay this test exercises, so durable checkpoints opt out.
+    responseCheckpointExclude: ["*"],
     websocketConnectTimeoutMs: 1_000,
   };
   const request = (text: string) => provider.streamSimple(

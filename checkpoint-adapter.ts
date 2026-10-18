@@ -4,7 +4,15 @@ import type { openAIResponsesApi } from "@earendil-works/pi-ai/compat";
 import { minimatch } from "minimatch";
 import type { CheckpointCandidate } from "./response-checkpoints.ts";
 
-export type CheckpointOptions = SimpleStreamOptions & { responseCheckpointExclude?: unknown };
+export type CheckpointOptions = SimpleStreamOptions & { responseCheckpointExclude?: unknown; responseCheckpointMode?: unknown };
+
+const CHECKPOINT_MODES = new Set(["always", "auto", "declared"]);
+
+/** Mode resolution: absent stays absent => "always"; malformed values fail closed (disabled). */
+export function checkpointMode(raw: unknown): "always" | "auto" | "declared" | undefined {
+  if (raw === undefined) return "always";
+  return typeof raw === "string" && CHECKPOINT_MODES.has(raw) ? (raw as "always" | "auto" | "declared") : undefined;
+}
 const publicAI = piAI as typeof piAI & {
   normalizeContext?: (context: Context) => Context;
   getDeclaredTools?: (messages: Context["messages"]) => Context["tools"];
@@ -16,13 +24,20 @@ const publicAI = piAI as typeof piAI & {
  */
 export function checkpointsEnabled(model: Model<"openai-responses">, options: CheckpointOptions, raw: unknown): boolean {
   if (options.cacheRetention === "none" || !["auto", "websocket-cached"].includes(options.transport ?? "")) return false;
-  if (model.provider === "openai-codex" || model.baseUrl.includes("chatgpt.com")) return false;
+  let host = "";
+  try { host = new URL(model.baseUrl).hostname.toLowerCase(); } catch { return false; }
+  if (model.provider === "openai-codex" || host === "chatgpt.com" || host.endsWith(".chatgpt.com")) return false;
   const official = model.baseUrl === "https://api.openai.com/v1";
   // The bridge authenticates WS with apiKey, not an HTTP Authorization override.
   const key = options.apiKey ?? new Headers(options.headers as HeadersInit).get("authorization")?.replace(/^Bearer\s+/i, "");
   if (official && !key?.startsWith("sk-")) return false;
+  const mode = checkpointMode(options.responseCheckpointMode);
   const capability = (model.compat as { supportsResponseCheckpoints?: boolean } | undefined)?.supportsResponseCheckpoints;
-  if (capability !== true && !(capability === undefined && official)) return false;
+  // "always": try even when compat declares false. "auto": try unless declared false.
+  // "declared": exact true, or the official service default. Malformed mode is disabled.
+  const eligible = mode === "always" || (mode === "auto" && capability !== false)
+    || (mode === "declared" && (capability === true || (capability === undefined && official)));
+  if (!eligible) return false;
   const exclude = raw === undefined ? [] : raw;
   if (!Array.isArray(exclude) || !Array.from(exclude).every((pattern) => typeof pattern === "string")) return false;
   return !exclude.some((pattern) => pattern === "*" || [model.provider, model.id, `${model.provider}/${model.id}`]

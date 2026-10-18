@@ -17,6 +17,8 @@ import { captureCheckpoint, hashCanonical, planCheckpoint, responseEventOutput, 
 
 const SOCKET_TTL_MS = 5 * 60 * 1000;
 const AUTO_SSE_COOLDOWN_MS = 5 * 60 * 1000;
+// Checkpoint verification cooldown, mirrored on the WS->SSE cooldown window.
+const CHECKPOINT_COOLDOWN_MS = AUTO_SSE_COOLDOWN_MS;
 const encoder = new TextEncoder();
 const MESSAGE_ID_REJECTION = "previous_response_id must be a response.id (resp_*), not a message id";
 
@@ -43,6 +45,10 @@ type Pending = {
   hasFullHistory: boolean;
   iterator: AsyncIterator<ResponsesStreamMessage>;
   scopeHash?: string;
+  // Whether the wire body actually carried the policy-owned store:true.
+  sentStore?: boolean;
+  // The socket reached OPEN, so a queued frame was flushed to the server.
+  opened?: boolean;
   completion?: Record<string, unknown>;
   onStreamError?: (error: unknown) => void;
 };
@@ -71,6 +77,12 @@ const actualTransports = new Map<string, "sse" | "websocket" | "websocket-cached
 // instead of repeating the same rejected-anchor class every turn. Scoped to
 // the connection key, never to an ID prefix or a whole endpoint family.
 const rejectedContinuationKeys = new Set<string>();
+// Checkpoint verification cooldown per transportKey (endpoint+session):
+// a deadline suppresses checkpoints (full history, no store, no capture);
+// the in-flight set limits post-deadline probing to one real request.
+// Independent of autoSseFallbackUntil: transport fallback never gates this.
+const checkpointCooldownUntil = new Map<string, number>();
+const checkpointProbeInFlight = new Set<string>();
 
 function transportKey(baseUrl: string, sessionId?: string): string {
   return `${baseUrl}\0${sessionId ?? ""}`;
@@ -93,12 +105,14 @@ function closeConnection(key: string | undefined, connection: Connection, reason
 }
 
 function release(pending: Pending): void {
-  if (pending.keep && pending.key) {
+  if (pending.keep && pending.key && connections.get(pending.key) === pending.connection) {
     pending.connection.busy = false;
     pending.connection.timer = setTimeout(() => {
       if (!pending.connection.busy) closeConnection(pending.key, pending.connection, "idle timeout");
     }, SOCKET_TTL_MS);
   } else {
+    // A busy pooled entry overtaken by a replacement connection is
+    // unreachable: close it rather than leaking the socket.
     closeConnection(pending.key, pending.connection, "complete");
   }
 }
@@ -150,6 +164,20 @@ class ResponsesWebSocketCloseError extends Error {
   }
 }
 
+// Any status other than 400, a non-invalid-request type or an auth-like code
+// anywhere in the envelope makes the legacy message-ID rejection ambiguous.
+function hasConflictingEvidence(error: unknown): boolean {
+  if (error instanceof ResponsesWebSocketCloseError) return false; // exact WS1008 signature only
+  const event = error instanceof Error ? (error as { error?: unknown }).error : undefined;
+  if (!event || typeof event !== "object") return true;
+  const frame = event as Record<string, unknown>;
+  const detail = frame.error && typeof frame.error === "object" ? frame.error as Record<string, unknown> : {};
+  return [frame.status, detail.status].some((status) => typeof status === "number" && status !== 400)
+    || (typeof detail.type === "string" && detail.type !== "invalid_request_error")
+    || [frame.code, detail.code].some((code) => typeof code === "string"
+      && code !== "invalid_request" && code !== "invalid_request_error");
+}
+
 // This exact ingress validation is known to reject before generation.
 function isInvalidPreviousResponseIdError(error: unknown): boolean {
   if (error instanceof ResponsesWebSocketCloseError) {
@@ -171,6 +199,46 @@ function isMissingPreviousResponseError(error: unknown): boolean {
   if (!event || typeof event !== "object") return false;
   const detail = (event as { error?: { code?: unknown; type?: unknown } }).error;
   return detail?.code === "previous_response_not_found" && detail.type === "invalid_request_error";
+}
+
+const REJECTION_WORDING = /unsupported|not supported|unknown|invalid|not allowed|unrecognized/i;
+const REFERENCE_UNAVAILABLE = /previous_response_id[^\n]*not available|previous[ _]response[^\n]*not found/i;
+
+// The four checkpoint failure signals (spec B), mirroring the native owner:
+// the coded retention miss; Sub2API's code-less "previous_response_id is not
+// available"; a store-parameter rejection; a previous_response_id capability
+// rejection. Every fence runs first: a non-400 status, a non-invalid-request
+// type or an unrelated code (auth, quota, server error) never replays.
+function isCheckpointReferenceFailure(error: unknown): boolean {
+  const event = error instanceof Error ? (error as { error?: unknown }).error : undefined;
+  if (!event || typeof event !== "object") return false;
+  const object = (value: unknown) => value && typeof value === "object" ? value as Record<string, unknown> : undefined;
+  const frame = event as Record<string, unknown>;
+  const detail = object(frame.error);
+  if (!detail) return false;
+  // Read every envelope location; any disagreement is conflicting evidence.
+  const envelopes = [frame, detail, object(object(frame.response)?.error)].filter((entry) => entry !== undefined);
+  const values = (field: string, kind: "string" | "number") => envelopes.map((entry) => entry[field])
+    .filter((value) => typeof value === kind && !(field === "type" && (value === "error" || value === "response.failed")));
+  const statuses = values("status", "number");
+  const types = values("type", "string");
+  const codes = new Set(values("code", "string"));
+  const params = new Set(values("param", "string"));
+  if (statuses.some((status) => status !== 400)) return false;
+  if (types.some((type) => type !== "invalid_request_error")) return false;
+  if (codes.size > 1 || params.size > 1) return false;
+  const [code] = codes;
+  const [param] = params;
+  const message = typeof detail.message === "string" ? detail.message : "";
+  const checkpointParam = param === "store" || param === "previous_response_id";
+  if (code === "unsupported_parameter" || code === "unknown_parameter") return checkpointParam;
+  if (code !== undefined) return code === "previous_response_not_found";
+  // Code-less shapes must positively prove an invalid-request rejection.
+  if (statuses.length === 0 && types.length === 0) return false;
+  if (checkpointParam) return REJECTION_WORDING.test(message) || REFERENCE_UNAVAILABLE.test(message);
+  return REFERENCE_UNAVAILABLE.test(message)
+    || (/\bstore\b/i.test(message) && REJECTION_WORDING.test(message))
+    || (/\bprevious_response_id\b/i.test(message) && REJECTION_WORDING.test(message));
 }
 
 async function checkpointScope(model: Model<"openai-responses">, options: BridgeOptions, request: Request): Promise<string> {
@@ -245,9 +313,21 @@ async function firstMessage(pending: Pending, signal: AbortSignal): Promise<Resp
     while (true) {
       const item = await nextItem(pending);
       if (item.done) throw new Error("Responses WebSocket closed before response started");
+      if (item.value.type === "open") pending.opened = true;
       if (item.value.type === "error") throw item.value.error;
       if (item.value.type === "close") throw new ResponsesWebSocketCloseError(item.value.code, item.value.reason);
-      if (item.value.type === "message") return item.value.message;
+      if (item.value.type === "message") {
+        const message = item.value.message as { type?: string; response?: { error?: unknown; status?: unknown } };
+        // A first-frame response.failed is a pre-output rejection: classify it like an error event.
+        // Other response.failed frames keep the original stream path (no replay).
+        if (message.type === "response.failed" && message.response?.error) {
+          // Keep the frame-level status/code so conflicting evidence is still fenced.
+          const { response: _response, type: _type, ...frame } = message as Record<string, unknown>;
+          const failure = Object.assign(new Error("Responses request failed"), { error: { ...frame, error: message.response.error } });
+          if (isCheckpointReferenceFailure(failure)) throw failure;
+        }
+        return item.value.message;
+      }
     }
   } finally {
     signal.removeEventListener("abort", abort);
@@ -317,16 +397,54 @@ export function createResponsesWebSocketBridge(
   let terminalRepairFailure: { error: unknown } | undefined;
   const fallbackFetch = options.fetch ?? globalThis.fetch;
   const statusKey = transportKey(model.baseUrl, options.sessionId);
+  // Checkpoint state is per endpoint+session+credential (a store rejection on
+  // one account says nothing about another); transport state stays per session.
+  // Effective WS credential, as createConnection() resolves it (apiKey, else the Authorization header).
+  let checkpointKey = statusKey;
+  const bindCheckpointKey = (headers: Headers) => {
+    const credential = options.apiKey ?? headers.get("authorization")?.replace(/^Bearer\s+/i, "") ?? "";
+    checkpointKey = `${statusKey}\0${createHash("sha256").update(credential).digest("hex")}`;
+  };
   const notifyTransport = async (transport: string) => {
     try { await options.onTransport?.(transport, model); } catch { /* observation must not cause inference replay */ }
   };
   let recoveryProbe = false;
   // Pi may retry fetch within one model request; SSE stays selected until it ends.
   let useSse = false;
+  // Checkpoint cooldown for this bridge instance: true when this request took
+  // the single post-deadline probe slot (statusKey-scoped, see maps above).
+  let checkpointProbe = false;
+  // Resolved checkpoint eligibility for THIS request after cooldown gating.
+  const resolveCheckpoints = (vetoed: boolean): boolean => {
+    if (options.checkpoints?.enabled !== true) return false;
+    if (!options.sessionId) return true; // sessionless: no state, per spec
+    const until = checkpointCooldownUntil.get(checkpointKey);
+    if (until === undefined) return true;
+    // A hook store:false never claims the probe; cooldown still forces full context.
+    if (vetoed || Date.now() < until) return false;
+    if (checkpointProbeInFlight.has(checkpointKey)) return false;
+    checkpointProbeInFlight.add(checkpointKey);
+    checkpointProbe = true;
+    return true;
+  };
+  const openCheckpointCooldown = () => {
+    if (!options.sessionId) return;
+    checkpointCooldownUntil.set(checkpointKey, Date.now() + CHECKPOINT_COOLDOWN_MS);
+    if (checkpointProbe) { checkpointProbeInFlight.delete(checkpointKey); checkpointProbe = false; }
+  };
   const recordFailure = () => {
     if (options.transport === "auto" && options.sessionId) {
       autoSseFallbackUntil.set(statusKey, autoSseFallbackUntil.has(statusKey) ? Date.now() + AUTO_SSE_COOLDOWN_MS : 0);
     }
+  };
+
+  // SSE is a hard checkpoint gate: drop the policy-owned store:true (a hook's
+  // explicit store:false and a caller parent pass through unchanged).
+  const sseFetch = async (fallbackRequest: Request) => {
+    if (options.checkpoints?.enabled !== true) return fallbackFetch(fallbackRequest);
+    const body = JSON.parse(await fallbackRequest.text()) as RequestBody;
+    if (body.store === true) delete body.store;
+    return fallbackFetch(new Request(fallbackRequest, { body: JSON.stringify(body) }));
   };
 
   return {
@@ -343,7 +461,7 @@ export function createResponsesWebSocketBridge(
           useSse = true;
           actualTransports.set(statusKey, "sse");
           await notifyTransport("SSE");
-          return fallbackFetch(fallbackRequest);
+          return sseFetch(fallbackRequest);
         }
         if (fallbackUntil !== undefined) {
           autoSseRecoveryInFlight.add(statusKey);
@@ -352,14 +470,36 @@ export function createResponsesWebSocketBridge(
       }
 
       let referenceRepairAttempted = false;
+      // Durable intent reached the wire: fences provider retries regardless
+      // of whether the server accepted the request.
       let durableSent = false;
+      // The server accepted a request on this fetch (first event arrived):
+      // only then may checkpoint eligibility suppress the SSE fallback.
+      let wireAccepted = false;
+      // Checkpoint failure signals seen on this fetch (first failure only).
+      let checkpointFailedSignal: unknown;
+      let checkpointIntentSent = false;
+      // true when resolveCheckpoints() suppressed checkpoints for this request
+      // (cooldown active); distinct from policy-disabled, whose wire body keeps
+      // the SDK-default store value verbatim.
+      let cooldownSuppressed = false;
       try {
+        bindCheckpointKey(request.headers);
         const requestBody = JSON.parse(await request.text()) as RequestBody;
-        const { previous_response_id: _previousResponseId, ...withoutParent } = requestBody;
-        const durable = options.checkpoints?.enabled === true;
-        const fullBody = durable && requestBody.previous_response_id != null ? requestBody : withoutParent;
+        const { previous_response_id: _previousResponseId, store: _policyStore, ...strippedBody } = requestBody;
+        // Keep a hook's explicit store:false (privacy veto); only policy store:true is dropped.
+        const bareBody: RequestBody = requestBody.store === false ? { ...strippedBody, store: false } : strippedBody;
+        const durable = resolveCheckpoints(requestBody.store === false);
+        cooldownSuppressed = options.checkpoints?.enabled === true && !durable;
+        const fullBody = durable && requestBody.previous_response_id != null ? requestBody : bareBody;
+        // Repair/cooldown body: full history, no previous_response_id, policy
+        // store omitted (a hook's explicit store:false is kept).
+        const repairBody = bareBody;
+        // Cooldown body: a caller-owned parent keeps its lineage (hasFullHistory stays false).
+        const cooldownBody: RequestBody = requestBody.previous_response_id != null
+          ? { ...bareBody, previous_response_id: requestBody.previous_response_id } : bareBody;
         const scopeHash = durable && requestBody.store === true ? await checkpointScope(model, options, request) : undefined;
-        const candidate = options.checkpoints?.candidate;
+        const candidate = durable ? options.checkpoints?.candidate : undefined;
         const plan = scopeHash && candidate ? await planCheckpoint({ request: requestBody as Record<string, unknown>,
           candidate, scopeHash, now: Date.now(), eligible: true }) : undefined;
         // A pre-execution rejection of the bridge-owned cached anchor may
@@ -395,7 +535,43 @@ export function createResponsesWebSocketBridge(
             ? undefined
             : durable ? ((inherited !== requestBody ? inherited : undefined) ?? (plan?.request as RequestBody | undefined))
               : cachedBody(acquired.connection, requestBody);
-          const body = recoveryProbe || stripRejectedParent ? fullBody : (delta ?? requestBody);
+          // Cooldown keeps checkpoints fully off: full history, no store, no
+          // parent — even though the payload hook already set store:true.
+          // A post-deadline probe sends store:true with full history. A repair
+          // resends full history with checkpoint fields omitted. Normal durable
+          // operation keeps the policy store (or a hook's explicit store value)
+          // and any caller-owned parent verbatim.
+          // A WS-recovery probe sends a parent-free full body (base-branch
+          // contract): the caller envelope survives, the parent does not.
+          // A caller-rooted connection lineage (unknown server history) under cooldown
+          // or probe keeps chaining it, whatever the store value; replacing it with
+          // local input would silently drop history, so an unchainable request fails closed.
+          const callerRooted = (cooldownSuppressed || checkpointProbe) && requestBody.previous_response_id == null
+            && acquired.connection.continuation?.hasFullHistory === false && cacheEnabled(options);
+          let lineageChain: RequestBody | undefined;
+          if (callerRooted) {
+            const previous = acquired.connection.continuation!;
+            const { store: _previousStore, ...previousRequest } = previous.request;
+            const { store: _requestStore, ...unstored } = requestBody;
+            const chained = cachedBody({ ...acquired.connection, continuation: { ...previous, request: previousRequest } }, unstored);
+            if (chained.previous_response_id == null) {
+              // shortcut: fails closed instead of reconstructing caller-owned history; revisit if callers need it.
+              // Nothing was sent: keep the pooled connection and its provenance; terminal for
+              // this request (no SSE fallback, no provider retry with partial history).
+              release(pending);
+              pending = undefined;
+              const failure = new Error("Cannot continue a caller-rooted conversation during checkpoint cooldown");
+              terminalRepairFailure = { error: failure };
+              throw Object.assign(failure, { checkpointLineageUnavailable: true });
+            }
+            lineageChain = requestBody.store === false ? { ...chained, store: false } : chained;
+          }
+          const body = recoveryProbe ? bareBody
+            : stripRejectedParent ? repairBody
+            : lineageChain ? lineageChain
+            : checkpointProbe ? ({ ...fullBody, store: true } as RequestBody)
+            : cooldownSuppressed ? cooldownBody
+            : (delta ?? requestBody);
           // A parent is bridge-owned only when cachedBody rewrote the request
           // into a delta; a caller-supplied previous_response_id is never a
           // bridge-owned baseline.
@@ -404,19 +580,42 @@ export function createResponsesWebSocketBridge(
             : undefined;
           pending.hasFullHistory &&= bridgeOwnedParent === undefined || (durable && delta === plan?.request)
             || acquired.connection.continuation?.hasFullHistory === true;
-          durableSent = durable;
+          if (lineageChain) pending.hasFullHistory = false;
+          checkpointIntentSent ||= body.store === true || bridgeOwnedParent !== undefined;
+          pending.sentStore = body.store === true;
           pending.connection.ws.send({ type: "response.create", ...body } as ResponsesClientEvent);
           try {
             const first = await firstMessage(pending, request.signal);
+            wireAccepted = true;
+            durableSent = durableSent || durable;
             actualTransports.set(statusKey, cacheEnabled(options) ? "websocket-cached" : "websocket");
             await notifyTransport(body.previous_response_id ? "WS/continuation" : "WS/full");
             return streamResponse(pending, first, request.signal);
           } catch (error) {
+            // ResponsesWS queues send() until OPEN: a failed handshake never
+            // transmitted the frame, so auto may still fall back to SSE.
+            durableSent ||= durable && pending.opened === true;
             const hasFullHistory = pending.hasFullHistory;
             closeConnection(pending.key, pending.connection, "request failed");
             pending = undefined;
+            // A checkpoint failure signal on a request that actually carried
+            // checkpoint intent: repair once (full history, fields omitted)
+            // and open the cooldown. Auth/ambiguous failures never qualify.
+            if (durable && checkpointIntentSent && !stripRejectedParent && isCheckpointReferenceFailure(error)
+              && (hasFullHistory || !cacheEnabled(options))) {
+              checkpointFailedSignal = error;
+              openCheckpointCooldown(); // first signal: cooldown opens now,
+              // whether the repair below succeeds, fails or is fenced.
+              if (invalidRefRetry && !request.signal.aborted) {
+                invalidRefRetry = false;
+                stripRejectedParent = true;
+                referenceRepairAttempted = true;
+                continue;
+              }
+            }
             if (hasFullHistory && bridgeOwnedParent !== undefined
-              && (isInvalidPreviousResponseIdError(error) || (durable && isMissingPreviousResponseError(error)))) {
+              && ((isInvalidPreviousResponseIdError(error) && !hasConflictingEvidence(error))
+                || (durable && isMissingPreviousResponseError(error) && isCheckpointReferenceFailure(error)))) {
               if (acquired.key && isInvalidPreviousResponseIdError(error)) rejectedContinuationKeys.add(acquired.key);
               if (invalidRefRetry && !request.signal.aborted) {
                 invalidRefRetry = false;
@@ -429,18 +628,26 @@ export function createResponsesWebSocketBridge(
           }
         }
       } catch (error) {
+        if ((error as { checkpointLineageUnavailable?: boolean }).checkpointLineageUnavailable) {
+          if (checkpointProbe) { checkpointProbeInFlight.delete(checkpointKey); checkpointProbe = false; }
+          throw error;
+        }
+        // Any non-aborted probe failure renews the cooldown (a caught signal
+        // already did); only a captured checkpoint proves store:true again.
+        if (checkpointProbe && !request.signal.aborted) openCheckpointCooldown();
+        else if (checkpointProbe) { checkpointProbeInFlight.delete(checkpointKey); checkpointProbe = false; }
         if (referenceRepairAttempted || durableSent) terminalRepairFailure = { error };
         if (pending) closeConnection(pending.key, pending.connection, "request failed");
         pending = undefined;
         if (recoveryProbe) autoSseRecoveryInFlight.delete(statusKey);
-        if (durableSent || options.transport !== "auto" || request.signal.aborted) throw error;
+        if (durableSent || options.transport !== "auto" || request.signal.aborted || wireAccepted) throw error;
         recordFailure();
         // A failed repair may already have generated; do not add an HTTP replay.
         if (referenceRepairAttempted) throw error;
         useSse = true;
         actualTransports.set(statusKey, "sse");
         await notifyTransport("SSE");
-        return fallbackFetch(fallbackRequest);
+        return sseFetch(fallbackRequest);
       }
     },
     async finish(output) {
@@ -453,7 +660,7 @@ export function createResponsesWebSocketBridge(
       }
       const outputComplete = encodedOutput !== undefined && completed !== undefined
         && responseOutputItemsCapturable(completed.output, encodedOutput);
-      if (pending.scopeHash && pending.hasFullHistory && pending.request.store === true
+      if (pending.scopeHash && pending.hasFullHistory && pending.sentStore === true
         && (output.stopReason === "stop" || output.stopReason === "toolUse")) {
         try {
           if (completed && completed.store !== false && outputComplete) {
@@ -478,6 +685,16 @@ export function createResponsesWebSocketBridge(
       } else {
         if (options.transport === "auto") autoSseFallbackUntil.delete(statusKey);
         release(pending);
+      }
+      if (checkpointProbe) {
+        // Cooldown clears ONLY after a probe that captured a checkpoint
+        // (spec B / round-2 rule 7); otherwise state stays and the slot frees.
+        const captured = output.stopReason !== "error" && output.stopReason !== "aborted"
+          && (output as AssistantMessage & { responseCheckpoint?: ResponseCheckpoint }).responseCheckpoint !== undefined;
+        if (captured) checkpointCooldownUntil.delete(checkpointKey);
+        else if (output.stopReason !== "aborted") checkpointCooldownUntil.set(checkpointKey, Date.now() + CHECKPOINT_COOLDOWN_MS);
+        checkpointProbeInFlight.delete(checkpointKey);
+        checkpointProbe = false;
       }
       if (recoveryProbe) autoSseRecoveryInFlight.delete(statusKey);
       pending = undefined;
@@ -564,11 +781,15 @@ export function closeResponsesWebSockets(sessionId?: string): void {
     for (const key of autoSseRecoveryInFlight) if (key.endsWith(`\0${sessionId}`)) autoSseRecoveryInFlight.delete(key);
     for (const key of actualTransports.keys()) if (key.endsWith(`\0${sessionId}`)) actualTransports.delete(key);
     for (const key of rejectedContinuationKeys) if (key.includes(`\0${sessionId}\0`)) rejectedContinuationKeys.delete(key);
+    for (const key of checkpointCooldownUntil.keys()) if (key.includes(`\0${sessionId}\0`)) checkpointCooldownUntil.delete(key);
+    for (const key of checkpointProbeInFlight) if (key.includes(`\0${sessionId}\0`)) checkpointProbeInFlight.delete(key);
   } else {
     autoSseFallbackUntil.clear();
     autoSseRecoveryInFlight.clear();
     actualTransports.clear();
     rejectedContinuationKeys.clear();
+    checkpointCooldownUntil.clear();
+    checkpointProbeInFlight.clear();
   }
 }
 

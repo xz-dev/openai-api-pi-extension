@@ -1,0 +1,687 @@
+import assert from "node:assert/strict";
+import { afterEach, test } from "node:test";
+import type { Server } from "node:http";
+import { WebSocketServer } from "ws";
+import type { Message } from "@earendil-works/pi-ai";
+import { createOpenAIApiProvider } from "../index.ts";
+import { closeResponsesWebSockets } from "../responses-websocket-fetch.ts";
+
+const servers: Array<Server | WebSocketServer> = [];
+
+afterEach(async () => {
+  closeResponsesWebSockets();
+  // Unconditional teardown: terminate fixture clients so close() never waits.
+  for (const server of servers) if (server instanceof WebSocketServer) for (const client of server.clients) client.terminate();
+  await Promise.all(servers.splice(0).map((server) => new Promise<void>((resolve) => server.close(() => resolve()))));
+});
+
+function model(baseUrl: string) {
+  return {
+    id: "mock-gpt",
+    name: "Mock GPT",
+    provider: "openai-api-extension",
+    api: "openai-responses" as const,
+    baseUrl,
+    reasoning: false,
+    input: ["text"] as Array<"text" | "image">,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 128000,
+    maxTokens: 1024,
+  };
+}
+
+function responseEvents(responseId: string, text: string) {
+  const message = {
+    id: `msg_${responseId}`,
+    type: "message",
+    role: "assistant",
+    status: "completed",
+    content: [{ type: "output_text", text, annotations: [] }],
+  };
+  return [
+    { type: "response.created", response: { id: responseId } },
+    { type: "response.output_item.added", output_index: 0, item: message },
+    { type: "response.output_text.delta", output_index: 0, content_index: 0, delta: text },
+    { type: "response.output_item.done", output_index: 0, item: message },
+    {
+      type: "response.completed",
+      response: {
+        id: responseId,
+        status: "completed",
+        output: [message],
+        usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+      },
+    },
+  ];
+}
+
+function completed(socket: import("ws").WebSocket, responseId: string, text: string) {
+  for (const event of responseEvents(responseId, text)) socket.send(JSON.stringify(event));
+}
+
+const REFERENCE_FAILURES = {
+  notFound: { type: "invalid_request_error", code: "previous_response_not_found", message: "Previous response not found" },
+  notAvailable: { type: "invalid_request_error", message: "previous_response_id is not available for this user" },
+  storeRejected: { type: "invalid_request_error", code: "unsupported_parameter", param: "store",
+    message: "store is not supported for this model" },
+  parentUnsupported: { type: "invalid_request_error", code: "unsupported_parameter", param: "previous_response_id",
+    message: "previous_response_id is unsupported" },
+  codelessMessage: { type: "invalid_request_error", message: "previous response state was not found" },
+} as const;
+
+async function server(
+  onRequest: (body: Record<string, unknown>, connection: number, socket: import("ws").WebSocket) => void,
+) {
+  const wss = new WebSocketServer({ port: 0, host: "127.0.0.1" });
+  servers.push(wss);
+  await new Promise<void>((resolve) => wss.once("listening", resolve));
+  let connections = 0;
+  wss.on("connection", (socket) => {
+    const connection = ++connections;
+    socket.on("message", (raw) => onRequest(JSON.parse(String(raw)), connection, socket));
+  });
+  const address = wss.address();
+  assert.ok(address && typeof address === "object");
+  return { baseUrl: `http://127.0.0.1:${address.port}/v1`, get connections() { return connections; } };
+}
+
+const options = (sessionId: string) => ({
+  apiKey: "bridge-key",
+  transport: "websocket-cached" as const,
+  sessionId,
+  websocketConnectTimeoutMs: 1_000,
+});
+
+function reject(socket: import("ws").WebSocket, error: Record<string, unknown>) {
+  socket.send(JSON.stringify({ type: "error", error, sequence_number: 0 }));
+}
+
+for (const [signal, failure] of Object.entries(REFERENCE_FAILURES)) {
+  test(`checkpoint reference failure ${signal}: one repair without store/previous_response_id, then cooldown`, { timeout: 10_000 }, async () => {
+    const requests: Array<Record<string, unknown>> = [];
+    const upstream = await server((body, _connection, socket) => {
+      requests.push(body);
+      if (body.previous_response_id || (body.store === true && signal === "storeRejected" && requests.length === 1)) {
+        reject(socket, failure);
+        return;
+      }
+      completed(socket, `resp_${requests.length}`, `answer ${requests.length}`);
+    });
+    const provider = createOpenAIApiProvider();
+    const opts = options(`checkpoint-cooldown-${signal}`);
+    const first = await provider.streamSimple(
+      model(upstream.baseUrl),
+      { messages: [{ role: "user", content: "one", timestamp: 1 }] },
+      opts,
+    ).result();
+    assert.equal(first.stopReason, "stop", first.errorMessage);
+
+    const messages: Message[] = [
+      { role: "user", content: "one", timestamp: 1 }, first,
+      { role: "user", content: "two", timestamp: 2 },
+    ];
+    const second = await provider.streamSimple(model(upstream.baseUrl), { messages }, opts).result();
+    assert.equal(second.stopReason, "stop", second.errorMessage);
+    // Exactly one rejected request and one full-history repair without
+    // store/previous_response_id.
+    const rejected = requests.filter((body) => body.previous_response_id || (signal === "storeRejected" && body.store === true));
+    const repair = requests.at(-1)!;
+    assert.equal(rejected.length, 1);
+    assert.equal(repair.previous_response_id, undefined);
+    assert.equal(repair.store, undefined, "repair must not resend store");
+    assert.ok(Array.isArray(repair.input) && repair.input.length > 1, "repair resends full history");
+
+    // Cooldown: next request keeps full history and no store.
+    const third = await provider.streamSimple(model(upstream.baseUrl), {
+      messages: [...messages, second, { role: "user", content: "three", timestamp: 3 }],
+    }, opts).result();
+    assert.equal(third.stopReason, "stop", third.errorMessage);
+    const cooled = requests.at(-1)!;
+    assert.equal(cooled.previous_response_id, undefined);
+    assert.equal(cooled.store, undefined);
+    assert.ok(Array.isArray(cooled.input) && cooled.input.length > 2);
+  });
+}
+
+test("checkpoint probe after cooldown sends store:true + full history; success resumes delta", { timeout: 10_000 }, async (context) => {
+  context.mock.timers.enable({ apis: ["Date"], now: 0 });
+  const requests: Array<Record<string, unknown>> = [];
+  const upstream = await server((body, _connection, socket) => {
+    requests.push(body);
+    if (requests.length === 2) { reject(socket, REFERENCE_FAILURES.notFound); return; }
+    completed(socket, `resp_${requests.length}`, `answer ${requests.length}`);
+  });
+  const provider = createOpenAIApiProvider();
+  const opts = options("checkpoint-probe-resume");
+  const first = await provider.streamSimple(
+    model(upstream.baseUrl),
+    { messages: [{ role: "user", content: "one", timestamp: 1 }] },
+    opts,
+  ).result();
+  const messages: Message[] = [{ role: "user", content: "one", timestamp: 1 }, first,
+    { role: "user", content: "two", timestamp: 2 }];
+  const second = await provider.streamSimple(model(upstream.baseUrl), { messages }, opts).result();
+  assert.equal(second.stopReason, "stop", second.errorMessage);
+  assert.equal(requests[1]?.previous_response_id, first.responseId);
+  assert.equal(requests[2]?.store, undefined, "repair drops store");
+
+  // Inside cooldown: full history, no store.
+  context.mock.timers.tick(299_999);
+  await provider.streamSimple(model(upstream.baseUrl), {
+    messages: [...messages, second, { role: "user", content: "three", timestamp: 3 }],
+  }, opts).result();
+  assert.equal(requests.at(-1)?.store, undefined);
+  assert.equal(requests.at(-1)?.previous_response_id, undefined);
+
+  // Probe at the deadline: store:true plus full history, no parent.
+  context.mock.timers.tick(1);
+  const probed = await provider.streamSimple(model(upstream.baseUrl), {
+    messages: [...messages, second, { role: "user", content: "three", timestamp: 3 }],
+  }, opts).result();
+  assert.equal(probed.stopReason, "stop", probed.errorMessage);
+  const probe = requests.at(-1)!;
+  assert.equal(probe.store, true);
+  assert.equal(probe.previous_response_id, undefined);
+  assert.ok(Array.isArray(probe.input) && probe.input.length > 2);
+
+  // Success cleared state: next turn continues with a delta.
+  const next = await provider.streamSimple(model(upstream.baseUrl), {
+    messages: [
+      { role: "user", content: "one", timestamp: 1 }, first,
+      { role: "user", content: "two", timestamp: 2 }, second,
+      { role: "user", content: "three", timestamp: 3 }, probed,
+      { role: "user", content: "four", timestamp: 4 },
+    ],
+  }, opts).result();
+  assert.equal(next.stopReason, "stop", next.errorMessage);
+  const delta = requests.at(-1)!;
+  assert.equal(delta.previous_response_id, probed.responseId);
+  assert.equal((delta.input as unknown[]).length, 1);
+});
+
+test("failed checkpoint probe renews the cooldown", { timeout: 10_000 }, async (context) => {
+  context.mock.timers.enable({ apis: ["Date"], now: 0 });
+  const requests: Array<Record<string, unknown>> = [];
+  const upstream = await server((body, _connection, socket) => {
+    requests.push(body);
+    if (body.previous_response_id || body.store === true) {
+      reject(socket, REFERENCE_FAILURES.storeRejected);
+      return;
+    }
+    completed(socket, `resp_${requests.length}`, `answer ${requests.length}`);
+  });
+  const provider = createOpenAIApiProvider();
+  const opts = options("checkpoint-probe-renew");
+  const first = await provider.streamSimple(
+    model(upstream.baseUrl),
+    { messages: [{ role: "user", content: "one", timestamp: 1 }] },
+    opts,
+  ).result();
+  assert.equal(first.stopReason, "stop", first.errorMessage);
+  assert.equal(requests.length, 2, "store rejection already repaired the first turn");
+  assert.equal(requests[0]?.store, true);
+  assert.equal(requests[1]?.store, undefined);
+
+  context.mock.timers.tick(300_000);
+  // Probe carries store:true again and is rejected; repair then cooldown renews.
+  const second = await provider.streamSimple(model(upstream.baseUrl), {
+    messages: [{ role: "user", content: "one", timestamp: 1 }, first, { role: "user", content: "two", timestamp: 2 }],
+  }, opts).result();
+  assert.equal(second.stopReason, "stop", second.errorMessage);
+  assert.equal(requests[2]?.store, true, "probe retried store");
+  assert.equal(requests[2]?.previous_response_id, undefined);
+  assert.equal(requests[3]?.store, undefined, "probe repair drops store");
+
+  const third = await provider.streamSimple(model(upstream.baseUrl), {
+    messages: [{ role: "user", content: "one", timestamp: 1 }, first,
+      { role: "user", content: "two", timestamp: 2 }, second,
+      { role: "user", content: "three", timestamp: 3 }],
+  }, opts).result();
+  assert.equal(third.stopReason, "stop", third.errorMessage);
+  assert.equal(requests.at(-1)?.store, undefined, "renewed cooldown keeps store off");
+});
+
+test("one checkpoint probe per session; an overlapping request stays off", { timeout: 10_000 }, async (context) => {
+  context.mock.timers.enable({ apis: ["Date"], now: 0 });
+  const requests: Array<Record<string, unknown>> = [];
+  let probeSocket: import("ws").WebSocket | undefined;
+  let probeId = "";
+  let rejected = false;
+  let probeArrived!: () => void;
+  const probeSeen = new Promise<void>((resolve) => { probeArrived = resolve; });
+  const upstream = await server((body, _connection, socket) => {
+    requests.push(body);
+    if (body.previous_response_id && !rejected) { rejected = true; reject(socket, REFERENCE_FAILURES.notFound); return; }
+    if (rejected && body.store === true && probeSocket === undefined) {
+      // First post-cooldown store:true request is the probe; the socket is
+      // held until the concurrent request lands.
+      probeSocket = socket;
+      probeId = `resp_${requests.length}`;
+      socket.send(JSON.stringify(responseEvents(probeId, "probe answer")[0]));
+      probeArrived();
+      return;
+    }
+    completed(socket, `resp_${requests.length}`, `answer ${requests.length}`);
+  });
+  // Unconditional teardown: a held probe socket must never hang the suite.
+  context.signal.addEventListener("abort", () => probeSocket?.terminate());
+  const provider = createOpenAIApiProvider();
+  const opts = options("checkpoint-probe-single");
+  const first = await provider.streamSimple(
+    model(upstream.baseUrl),
+    { messages: [{ role: "user", content: "one", timestamp: 1 }] },
+    opts,
+  ).result();
+  assert.equal(first.stopReason, "stop", first.errorMessage);
+  const messages: Message[] = [{ role: "user", content: "one", timestamp: 1 }, first,
+    { role: "user", content: "two", timestamp: 2 }];
+  await provider.streamSimple(model(upstream.baseUrl), { messages }, opts).result();
+  context.mock.timers.tick(300_000);
+
+  const probe = provider.streamSimple(model(upstream.baseUrl), {
+    messages: [...messages, { role: "user", content: "three", timestamp: 3 }],
+  }, opts).result();
+  await Promise.race([probeSeen, new Promise<never>((_, reject) =>
+    setTimeout(() => reject(new Error("probe never arrived")), 5_000).unref())]);
+  const concurrent = await provider.streamSimple(model(upstream.baseUrl), {
+    messages: [...messages, { role: "user", content: "concurrent", timestamp: 3 }],
+  }, { ...opts, sessionId: "checkpoint-probe-single" }).result();
+  assert.equal(concurrent.stopReason, "stop", concurrent.errorMessage);
+  assert.equal(requests.at(-1)?.store, undefined, "overlapping request stays off while probe is in flight");
+  for (const event of responseEvents(probeId, "probe answer").slice(1)) probeSocket!.send(JSON.stringify(event));
+  assert.equal((await probe).stopReason, "stop");
+});
+
+for (const [name, error, status] of [
+  ["server_error 500 not found", { type: "server_error", code: "previous_response_not_found", message: "gone" }, 500],
+  ["internal_error with store param", { type: "server_error", code: "internal_error", param: "store", message: "store invalid" }, 400],
+  ["authentication_error with store param", { type: "authentication_error", param: "store", message: "store invalid" }, 400],
+  ["unrelated code with store param", { type: "invalid_request_error", code: "model_not_found", param: "store", message: "store invalid" }, undefined],
+  ["untyped code-less message", { message: "previous_response_id is not available for this user" }, undefined],
+] as const) {
+  test(`non-signal rejection (${name}) is never replayed and opens no cooldown`, { timeout: 10_000 }, async () => {
+    const requests: Array<Record<string, unknown>> = [];
+    const upstream = await server((body, _connection, socket) => {
+      requests.push(body);
+      if (requests.length === 1) {
+        socket.send(JSON.stringify({ type: "error", error, ...(status ? { status } : {}), sequence_number: 0 }));
+        return;
+      }
+      completed(socket, `resp_${requests.length}`, "ok");
+    });
+    const provider = createOpenAIApiProvider();
+    const opts = options(`non-signal-${name}`);
+    const first = await provider.streamSimple(model(upstream.baseUrl),
+      { messages: [{ role: "user", content: "one", timestamp: 1 }] }, { ...opts, maxRetries: 0 }).result();
+    assert.equal(first.stopReason, "error");
+    assert.equal(requests.length, 1, "no replay");
+    const second = await provider.streamSimple(model(upstream.baseUrl),
+      { messages: [{ role: "user", content: "again", timestamp: 2 }] }, opts).result();
+    assert.equal(second.stopReason, "stop", second.errorMessage);
+    assert.equal(requests.at(-1)?.store, true, "no cooldown opened");
+  });
+}
+
+test("non-signal probe failure renews the cooldown without replay", { timeout: 10_000 }, async (context) => {
+  context.mock.timers.enable({ apis: ["Date"], now: 0 });
+  const requests: Array<Record<string, unknown>> = [];
+  let probeFails = false;
+  const upstream = await server((body, _connection, socket) => {
+    requests.push(body);
+    if (requests.length === 1) { reject(socket, REFERENCE_FAILURES.storeRejected); return; }
+    if (probeFails && body.store === true) {
+      socket.send(JSON.stringify({ type: "error", error: { type: "server_error", message: "boom" }, status: 500 }));
+      return;
+    }
+    completed(socket, `resp_${requests.length}`, "ok");
+  });
+  const provider = createOpenAIApiProvider();
+  const opts = { ...options("probe-non-signal"), maxRetries: 0 };
+  const ask = (text: string) => provider.streamSimple(model(upstream.baseUrl),
+    { messages: [{ role: "user", content: text, timestamp: 1 }] }, opts).result();
+  assert.equal((await ask("one")).stopReason, "stop");
+  assert.equal(requests.length, 2);
+  context.mock.timers.tick(300_000);
+  probeFails = true;
+  assert.equal((await ask("probe")).stopReason, "error");
+  assert.equal(requests.length, 3, "probe never replayed");
+  assert.equal(requests[2]?.store, true);
+  probeFails = false;
+  assert.equal((await ask("next")).stopReason, "stop");
+  assert.equal(requests.at(-1)?.store, undefined, "renewed cooldown keeps store off");
+});
+
+test("auto with checkpoints on still falls back to SSE on a pre-open handshake failure", { timeout: 10_000 }, async () => {
+  const { createServer } = await import("node:http");
+  const bodies: Array<Record<string, unknown>> = [];
+  const http = createServer(async (request, response) => {
+    let raw = "";
+    for await (const chunk of request) raw += chunk;
+    bodies.push(JSON.parse(raw));
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    for (const event of responseEvents("resp_sse", "sse ok")) response.write(`data: ${JSON.stringify(event)}\n\n`);
+    response.end("data: [DONE]\n\n");
+  });
+  http.on("upgrade", (_request, socket) => socket.destroy());
+  servers.push(http);
+  await new Promise<void>((resolve) => http.listen(0, "127.0.0.1", resolve));
+  const address = http.address();
+  assert.ok(address && typeof address === "object");
+  const out = await createOpenAIApiProvider().streamSimple(
+    model(`http://127.0.0.1:${address.port}/v1`),
+    { messages: [{ role: "user", content: "one", timestamp: 1 }] },
+    { apiKey: "bridge-key", transport: "auto", sessionId: "checkpoint-handshake-sse", websocketConnectTimeoutMs: 1_000 },
+  ).result();
+  assert.equal(out.stopReason, "stop", out.errorMessage);
+  assert.equal(bodies.length, 1);
+  assert.notEqual(bodies[0]?.store, true, "SSE fallback never carries store:true");
+  assert.equal(bodies[0]?.previous_response_id, undefined);
+});
+
+test("hook store:false keeps its veto through cooldown and never claims the probe", { timeout: 10_000 }, async (context) => {
+  context.mock.timers.enable({ apis: ["Date"], now: 0 });
+  const requests: Array<Record<string, unknown>> = [];
+  const upstream = await server((body, _connection, socket) => {
+    requests.push(body);
+    if (requests.length === 1) { reject(socket, REFERENCE_FAILURES.storeRejected); return; }
+    completed(socket, `resp_${requests.length}`, `answer ${requests.length}`);
+  });
+  const provider = createOpenAIApiProvider();
+  const opts = options("hook-veto-cooldown");
+  const vetoed = { ...opts, onPayload: (payload: any) => ({ ...payload, store: false }) };
+  const first = await provider.streamSimple(model(upstream.baseUrl),
+    { messages: [{ role: "user", content: "one", timestamp: 1 }] }, opts).result();
+  assert.equal(first.stopReason, "stop", first.errorMessage);
+  assert.equal(requests.length, 2);
+  const messages: Message[] = [{ role: "user", content: "one", timestamp: 1 }, first, { role: "user", content: "two", timestamp: 2 }];
+  const second = await provider.streamSimple(model(upstream.baseUrl), { messages }, vetoed).result();
+  assert.equal(second.stopReason, "stop", second.errorMessage);
+  assert.equal(requests[2]?.store, false);
+  const third = await provider.streamSimple(model(upstream.baseUrl),
+    { messages: [...messages, second, { role: "user", content: "three", timestamp: 3 }] }, vetoed).result();
+  assert.equal(third.stopReason, "stop", third.errorMessage);
+  assert.equal(requests[3]?.store, false);
+  assert.equal(requests[3]?.previous_response_id, undefined, "cooldown forces full context");
+  assert.ok(Array.isArray(requests[3]?.input) && requests[3].input.length > 2);
+  // After the deadline a vetoed request does not consume the probe slot...
+  context.mock.timers.tick(300_000);
+  await provider.streamSimple(model(upstream.baseUrl),
+    { messages: [{ role: "user", content: "veto", timestamp: 4 }] }, vetoed).result();
+  assert.equal(requests[4]?.store, false);
+  // ...so the next policy request is still the store:true probe.
+  await provider.streamSimple(model(upstream.baseUrl),
+    { messages: [{ role: "user", content: "probe", timestamp: 5 }] }, opts).result();
+  assert.equal(requests[5]?.store, true);
+});
+
+test("500 previous_response_not_found never replays through the legacy repair branch", { timeout: 10_000 }, async () => {
+  const requests: Array<Record<string, unknown>> = [];
+  const upstream = await server((body, _connection, socket) => {
+    requests.push(body);
+    if (body.previous_response_id) {
+      socket.send(JSON.stringify({ type: "error", status: 500,
+        error: { type: "invalid_request_error", code: "previous_response_not_found", message: "gone" } }));
+      return;
+    }
+    completed(socket, `resp_${requests.length}`, "ok");
+  });
+  const provider = createOpenAIApiProvider();
+  const opts = { ...options("legacy-500"), maxRetries: 0 };
+  const first = await provider.streamSimple(model(upstream.baseUrl),
+    { messages: [{ role: "user", content: "one", timestamp: 1 }] }, opts).result();
+  const second = await provider.streamSimple(model(upstream.baseUrl), { messages: [
+    { role: "user", content: "one", timestamp: 1 }, first, { role: "user", content: "two", timestamp: 2 }] }, opts).result();
+  assert.equal(second.stopReason, "error");
+  assert.equal(requests.length, 2, "no replay after an ambiguous 500");
+});
+
+test("cooldown keeps a caller-owned previous_response_id", { timeout: 10_000 }, async () => {
+  const requests: Array<Record<string, unknown>> = [];
+  const upstream = await server((body, _connection, socket) => {
+    requests.push(body);
+    if (requests.length === 1) { reject(socket, REFERENCE_FAILURES.storeRejected); return; }
+    completed(socket, `resp_${requests.length}`, "ok");
+  });
+  const provider = createOpenAIApiProvider();
+  const opts = options("cooldown-caller-parent");
+  await provider.streamSimple(model(upstream.baseUrl), { messages: [{ role: "user", content: "one", timestamp: 1 }] }, opts).result();
+  assert.equal(requests.length, 2);
+  await provider.streamSimple(model(upstream.baseUrl), { messages: [{ role: "user", content: "delta", timestamp: 2 }] },
+    { ...opts, onPayload: (payload: any) => ({ ...payload, previous_response_id: "resp_external_root" }) }).result();
+  assert.equal(requests[2]?.previous_response_id, "resp_external_root");
+  assert.equal(requests[2]?.store, undefined);
+});
+
+for (const target of ["store", "previous_response_id"] as const) {
+  test(`first-frame response.failed ${target} rejection repairs once`, { timeout: 10_000 }, async () => {
+    const requests: Array<Record<string, unknown>> = [];
+    const upstream = await server((body, _connection, socket) => {
+      requests.push(body);
+      const hit = target === "store" ? body.store === true : Boolean(body.previous_response_id);
+      if (hit && requests.length <= (target === "store" ? 1 : 2)) {
+        socket.send(JSON.stringify({ type: "response.failed", response: { id: "resp_failed", status: "failed",
+          error: { type: "invalid_request_error", param: target, message: "Unsupported parameter" } } }));
+        return;
+      }
+      completed(socket, `resp_${requests.length}`, "ok");
+    });
+    const provider = createOpenAIApiProvider();
+    const opts = options(`response-failed-${target}`);
+    const first = await provider.streamSimple(model(upstream.baseUrl),
+      { messages: [{ role: "user", content: "one", timestamp: 1 }] }, opts).result();
+    assert.equal(first.stopReason, "stop", first.errorMessage);
+    if (target === "previous_response_id") {
+      const second = await provider.streamSimple(model(upstream.baseUrl), { messages: [
+        { role: "user", content: "one", timestamp: 1 }, first, { role: "user", content: "two", timestamp: 2 }] }, opts).result();
+      assert.equal(second.stopReason, "stop", second.errorMessage);
+      assert.equal(requests.length, 3);
+    } else {
+      assert.equal(requests.length, 2);
+    }
+    const repair = requests.at(-1)!;
+    assert.equal(repair.store, undefined);
+    assert.equal(repair.previous_response_id, undefined);
+  });
+}
+
+test("aborted probe releases its claim without renewing; next request probes", { timeout: 10_000 }, async (context) => {
+  context.mock.timers.enable({ apis: ["Date"], now: 0 });
+  const requests: Array<Record<string, unknown>> = [];
+  let hold = false;
+  let held!: () => void;
+  const arrived = new Promise<void>((resolve) => { held = resolve; });
+  const upstream = await server((body, _connection, socket) => {
+    requests.push(body);
+    if (requests.length === 1) { reject(socket, REFERENCE_FAILURES.storeRejected); return; }
+    if (hold) { held(); return; } // never answers: the client aborts
+    completed(socket, `resp_${requests.length}`, "ok");
+  });
+  const provider = createOpenAIApiProvider();
+  const opts = { ...options("probe-abort"), maxRetries: 0 };
+  const ask = (text: string, signal?: AbortSignal) => provider.streamSimple(model(upstream.baseUrl),
+    { messages: [{ role: "user", content: text, timestamp: 1 }] }, { ...opts, signal }).result();
+  await ask("one");
+  context.mock.timers.tick(300_000);
+  hold = true;
+  const controller = new AbortController();
+  const probe = ask("probe", controller.signal);
+  await arrived;
+  controller.abort();
+  assert.equal((await probe).stopReason, "aborted");
+  assert.equal(requests.at(-1)?.store, true);
+  hold = false;
+  await ask("next");
+  assert.equal(requests.at(-1)?.store, true, "claim released and deadline not renewed: next request probes");
+});
+
+test("probe that captures nothing renews the cooldown", { timeout: 10_000 }, async (context) => {
+  context.mock.timers.enable({ apis: ["Date"], now: 0 });
+  const requests: Array<Record<string, unknown>> = [];
+  const upstream = await server((body, _connection, socket) => {
+    requests.push(body);
+    if (requests.length === 1) { reject(socket, REFERENCE_FAILURES.storeRejected); return; }
+    const events = responseEvents(`resp_${requests.length}`, "ok");
+    const done = events.at(-1) as { response: Record<string, unknown> };
+    done.response.store = false; // server declines storage: no checkpoint captured
+    for (const event of events) socket.send(JSON.stringify(event));
+  });
+  const provider = createOpenAIApiProvider();
+  const opts = options("probe-uncaptured");
+  const ask = (text: string) => provider.streamSimple(model(upstream.baseUrl),
+    { messages: [{ role: "user", content: text, timestamp: 1 }] }, opts).result();
+  await ask("one");
+  context.mock.timers.tick(300_000);
+  assert.equal((await ask("probe")).stopReason, "stop");
+  assert.equal(requests.at(-1)?.store, true);
+  await ask("next");
+  assert.equal(requests.at(-1)?.store, undefined, "uncaptured probe renewed the cooldown");
+});
+
+test("checkpoint cooldown is partitioned by credential", { timeout: 10_000 }, async () => {
+  const requests: Array<Record<string, unknown>> = [];
+  const upstream = await server((body, _connection, socket) => {
+    requests.push(body);
+    if (requests.length === 1) { reject(socket, REFERENCE_FAILURES.storeRejected); return; }
+    completed(socket, `resp_${requests.length}`, "ok");
+  });
+  const provider = createOpenAIApiProvider();
+  const opts = options("credential-partition");
+  await provider.streamSimple(model(upstream.baseUrl), { messages: [{ role: "user", content: "a", timestamp: 1 }] }, opts).result();
+  assert.equal(requests.length, 2);
+  await provider.streamSimple(model(upstream.baseUrl), { messages: [{ role: "user", content: "b", timestamp: 1 }] },
+    { ...opts, apiKey: "other-account-key" }).result();
+  assert.equal(requests[2]?.store, true, "another credential is not cooled down");
+});
+
+for (const [name, frame] of [
+  ["status 500", { status: 500 }],
+  ["401 invalid_api_key", { status: 401, error: { code: "invalid_api_key" } }],
+] as const) {
+  test(`legacy message-ID rejection with ${name} is never replayed`, { timeout: 10_000 }, async () => {
+    const requests: Array<Record<string, unknown>> = [];
+    const upstream = await server((body, _connection, socket) => {
+      requests.push(body);
+      if (body.previous_response_id) {
+        const error = { type: "invalid_request_error",
+          message: "previous_response_id must be a response.id (resp_*), not a message id",
+          ...("error" in frame ? frame.error : {}) };
+        socket.send(JSON.stringify({ type: "error", ...("status" in frame ? { status: frame.status } : {}), error }));
+        return;
+      }
+      completed(socket, `resp_${requests.length}`, "ok");
+    });
+    const provider = createOpenAIApiProvider();
+    const opts = { ...options(`legacy-conflict-${name}`), maxRetries: 0, responseCheckpointExclude: ["*"] };
+    const first = await provider.streamSimple(model(upstream.baseUrl),
+      { messages: [{ role: "user", content: "one", timestamp: 1 }] }, opts).result();
+    const second = await provider.streamSimple(model(upstream.baseUrl), { messages: [
+      { role: "user", content: "one", timestamp: 1 }, first, { role: "user", content: "two", timestamp: 2 }] }, opts).result();
+    assert.equal(second.stopReason, "error");
+    assert.equal(requests.length, 2, "no replay");
+  });
+}
+
+for (const [name, extra] of [["status 500", { status: 500 }], ["code invalid_api_key", { code: "invalid_api_key" }]] as const) {
+  test(`response.failed store rejection with frame-level ${name} is never replayed`, { timeout: 10_000 }, async () => {
+    const requests: Array<Record<string, unknown>> = [];
+    const upstream = await server((body, _connection, socket) => {
+      requests.push(body);
+      socket.send(JSON.stringify({ type: "response.failed", ...extra, response: { id: "resp_failed", status: "failed",
+        error: { type: "invalid_request_error", param: "store", message: "Unsupported parameter" } } }));
+    });
+    const out = await createOpenAIApiProvider().streamSimple(model(upstream.baseUrl),
+      { messages: [{ role: "user", content: "one", timestamp: 1 }] }, { ...options(`failed-frame-${name}`), maxRetries: 0 }).result();
+    assert.equal(out.stopReason, "error");
+    assert.equal(requests.length, 1);
+  });
+}
+
+test("cooldown keeps chaining an inherited caller-rooted descendant", { timeout: 10_000 }, async (context) => {
+  context.mock.timers.enable({ apis: ["Date"], now: 0 });
+  const requests: Array<Record<string, unknown>> = [];
+  const upstream = await server((body, _connection, socket) => {
+    requests.push(body);
+    if (requests.length === 1) { reject(socket, REFERENCE_FAILURES.storeRejected); return; }
+    completed(socket, `resp_${requests.length}`, `answer ${requests.length}`);
+  });
+  const provider = createOpenAIApiProvider();
+  const opts = options("cooldown-descendant");
+  await provider.streamSimple(model(upstream.baseUrl), { messages: [{ role: "user", content: "one", timestamp: 1 }] }, opts).result();
+  const callerMessages: Message[] = [{ role: "user", content: "delta", timestamp: 2 }];
+  const caller = await provider.streamSimple(model(upstream.baseUrl), { messages: callerMessages },
+    { ...opts, onPayload: (payload: any) => ({ ...payload, previous_response_id: "resp_external_root" }) }).result();
+  assert.equal(caller.stopReason, "stop", caller.errorMessage);
+  assert.equal(requests[2]?.previous_response_id, "resp_external_root");
+  const descendant: any = await provider.streamSimple(model(upstream.baseUrl),
+    { messages: [...callerMessages, caller, { role: "user", content: "two", timestamp: 3 }] }, opts).result();
+  assert.equal(descendant.stopReason, "stop", descendant.errorMessage);
+  assert.equal(requests[3]?.previous_response_id, caller.responseId, "descendant chains the caller-rooted response");
+  assert.equal((requests[3]?.input as unknown[]).length, 1);
+  assert.equal(requests[3]?.store, undefined);
+  assert.equal(descendant.responseCheckpoint, undefined);
+  // A hook store:false descendant still chains the lineage.
+  const vetoMessages: Message[] = [...callerMessages, caller, { role: "user", content: "two", timestamp: 3 }, descendant,
+    { role: "user", content: "veto", timestamp: 4 }];
+  const vetoed: any = await provider.streamSimple(model(upstream.baseUrl), { messages: vetoMessages },
+    { ...opts, onPayload: (payload: any) => ({ ...payload, store: false }) }).result();
+  assert.equal(vetoed.stopReason, "stop", vetoed.errorMessage);
+  assert.equal(requests[4]?.previous_response_id, descendant.responseId);
+  assert.equal(requests[4]?.store, false);
+  // After expiry the probe keeps chaining and captures nothing.
+  context.mock.timers.tick(300_000);
+  const probe: any = await provider.streamSimple(model(upstream.baseUrl),
+    { messages: [...vetoMessages, vetoed, { role: "user", content: "probe", timestamp: 5 }] }, opts).result();
+  assert.equal(probe.stopReason, "stop", probe.errorMessage);
+  assert.equal(requests[5]?.previous_response_id, vetoed.responseId);
+  assert.equal((requests[5]?.input as unknown[]).length, 1);
+  assert.equal(probe.responseCheckpoint, undefined);
+});
+
+test("checkpoint cooldown is partitioned by Authorization-header credential", { timeout: 10_000 }, async () => {
+  const requests: Array<Record<string, unknown>> = [];
+  const upstream = await server((body, _connection, socket) => {
+    requests.push(body);
+    if (requests.length === 1) { reject(socket, REFERENCE_FAILURES.storeRejected); return; }
+    completed(socket, `resp_${requests.length}`, "ok");
+  });
+  const provider = createOpenAIApiProvider();
+  const { apiKey: _apiKey, ...base } = options("header-credential-partition");
+  await provider.streamSimple(model(upstream.baseUrl), { messages: [{ role: "user", content: "a", timestamp: 1 }] },
+    { ...base, headers: { Authorization: "Bearer account-a" } }).result();
+  assert.equal(requests.length, 2);
+  await provider.streamSimple(model(upstream.baseUrl), { messages: [{ role: "user", content: "b", timestamp: 1 }] },
+    { ...base, headers: { Authorization: "Bearer account-b" } }).result();
+  assert.equal(requests[2]?.store, true, "account B is not cooled down by account A");
+});
+
+for (const transport of ["auto", "websocket-cached"] as const) {
+  test(`${transport}: unchainable caller-rooted request fails closed with no WS/SSE request, lineage survives`, { timeout: 10_000 }, async () => {
+    const requests: Array<Record<string, unknown>> = [];
+    let sse = 0;
+    const upstream = await server((body, _connection, socket) => {
+      requests.push(body);
+      if (requests.length === 1) { reject(socket, REFERENCE_FAILURES.storeRejected); return; }
+      completed(socket, `resp_${requests.length}`, `answer ${requests.length}`);
+    });
+    const provider = createOpenAIApiProvider();
+    const opts = { ...options(`unchainable-${transport}`), transport, maxRetries: 2,
+      fetch: async () => { sse++; return new Response("unexpected", { status: 500 }); } };
+    await provider.streamSimple(model(upstream.baseUrl), { messages: [{ role: "user", content: "one", timestamp: 1 }] }, opts).result();
+    const callerMessages: Message[] = [{ role: "user", content: "delta", timestamp: 2 }];
+    const caller = await provider.streamSimple(model(upstream.baseUrl), { messages: callerMessages },
+      { ...opts, onPayload: (payload: any) => ({ ...payload, previous_response_id: "resp_external_root" }) }).result();
+    assert.equal(caller.stopReason, "stop", caller.errorMessage);
+    const before = requests.length;
+    const next: Message[] = [...callerMessages, caller, { role: "user", content: "two", timestamp: 3 }];
+    // A changed request option (maxTokens) cannot match the caller-rooted baseline.
+    const changed = await provider.streamSimple({ ...model(upstream.baseUrl), maxTokens: 128 }, { messages: next },
+      { ...opts, onPayload: (payload: any) => ({ ...payload, store: false }) }).result();
+    assert.equal(changed.stopReason, "error");
+    assert.equal(requests.length, before, "no WS request");
+    assert.equal(sse, 0, "no SSE fallback");
+    // A matching retry still chains the caller-rooted response.
+    const retried = await provider.streamSimple(model(upstream.baseUrl), { messages: next }, opts).result();
+    assert.equal(retried.stopReason, "stop", retried.errorMessage);
+    assert.equal(requests.at(-1)?.previous_response_id, caller.responseId);
+  });
+}
