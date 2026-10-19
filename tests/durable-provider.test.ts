@@ -9,6 +9,7 @@ import { createModels, InMemoryCredentialStore } from "@earendil-works/pi-ai";
 import { discoverAndLoadExtensions, ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
 import { createOpenAIApiProvider } from "../index.ts";
 import { closeResponsesWebSockets } from "../responses-websocket-fetch.ts";
+import { readJsonBody } from "./fixtures/wire-decode.ts";
 
 const user = (text: string) => ({ role: "user" as const, content: text, timestamp: 1 });
 const input = (text: string) => ({ role: "user", content: [{ type: "input_text", text }] });
@@ -36,9 +37,7 @@ async function harness(t: any) {
   let accountHeader = "x-tenant";
   const httpFrames: any[] = [];
   const http = createServer(async (request, response) => {
-    let body = "";
-    for await (const chunk of request) body += chunk;
-    httpFrames.push(JSON.parse(body));
+    httpFrames.push(await readJsonBody(request));
     response.writeHead(200, { "content-type": "text/event-stream" });
     for (const event of events(`opaque_${++generations}`)) response.write(`data: ${JSON.stringify(event)}\n\n`);
     response.end("data: [DONE]\n\n");

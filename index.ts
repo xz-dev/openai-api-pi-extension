@@ -20,6 +20,7 @@ import {
 } from "@earendil-works/pi-ai";
 import { openAIResponsesApi } from "@earendil-works/pi-ai/compat";
 import { checkpointCandidate, checkpointsEnabled, encodeCheckpointOutput, type CheckpointOptions } from "./checkpoint-adapter.ts";
+import { compressionFetch } from "./request-compression.ts";
 import {
   createResponsesWebSocketBridge,
   getActualResponsesTransport,
@@ -441,7 +442,9 @@ export function createOpenAIApiProvider(
       const requestContext = normalizeContext?.(filteredContext) ?? filteredContext;
       if (!options?.transport || options.transport === "sse") {
         recordActualResponsesTransport(model.baseUrl, "sse", options?.sessionId);
-        return redactAssistantStream(api.stream(model, requestContext, { ...options, transport: "sse" }), options?.apiKey);
+        // Host skips automatic encoding for a custom fetch: opt in at the wire.
+        const wireFetch = compressionFetch(options?.fetch ?? globalThis.fetch);
+        return redactAssistantStream(api.stream(model, requestContext, { ...options, transport: "sse", fetch: wireFetch }), options?.apiKey);
       }
       // The bridge owns transport and continuation; see README.md#transports.
       const owned = bridgeOptions(model, requestContext, options);
@@ -458,7 +461,8 @@ export function createOpenAIApiProvider(
       const requestContext = normalizeContext?.(filteredContext) ?? filteredContext;
       if (!options?.transport || options.transport === "sse") {
         recordActualResponsesTransport(model.baseUrl, "sse", options?.sessionId);
-        return redactAssistantStream(api.streamSimple(model, requestContext, { ...options, transport: "sse" }), options?.apiKey);
+        const wireFetch = compressionFetch(options?.fetch ?? globalThis.fetch);
+        return redactAssistantStream(api.streamSimple(model, requestContext, { ...options, transport: "sse", fetch: wireFetch }), options?.apiKey);
       }
       const owned = bridgeOptions(model, requestContext, options);
       const bridge = createResponsesWebSocketBridge(model, owned);

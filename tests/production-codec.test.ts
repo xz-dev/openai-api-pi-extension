@@ -10,6 +10,7 @@ import { WebSocketServer } from "ws";
 import { discoverAndLoadExtensions, ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
 import { openAIResponsesApi } from "@earendil-works/pi-ai/compat";
 import { encodeCheckpointOutput } from "../checkpoint-adapter.ts";
+import { readJsonBody } from "./fixtures/wire-decode.ts";
 
 const project = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const input = (text: string) => ({ role: "user", content: [{ type: "input_text", text }] });
@@ -60,8 +61,7 @@ async function fixture(t: any, toolTurn = false) {
   const frames: any[] = [], httpFrames: any[] = [], headers: any[] = [];
   let generations = 0;
   const http = createServer(async (request, response) => {
-    let body = ""; for await (const chunk of request) body += chunk;
-    httpFrames.push(JSON.parse(body));
+    httpFrames.push(await readJsonBody(request));
     response.writeHead(500); response.end("unexpected HTTP inference");
   });
   const wss = new WebSocketServer({ server: http });

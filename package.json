@@ -9,6 +9,7 @@
   },
   "files": [
     "index.ts",
+    "request-compression.ts",
     "responses-websocket-fetch.ts",
     "response-checkpoints.ts",
     "checkpoint-adapter.ts",
@@ -26,8 +27,8 @@
   ],
   "type": "module",
   "scripts": {
-    "check": "node --check index.ts && node --test tests/*.test.ts",
-    "test": "node --test tests/*.test.ts"
+    "check": "node --check index.ts && npm run test",
+    "test": "node --import ./tests/fixtures/request-compression-preload.mjs --test tests/*.test.ts"
   },
   "dependencies": {
     "minimatch": "10.2.6",

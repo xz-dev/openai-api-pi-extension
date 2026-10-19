@@ -5,6 +5,7 @@ import { WebSocketServer } from "ws";
 import type { Message } from "@earendil-works/pi-ai";
 import { createOpenAIApiProvider } from "../index.ts";
 import { closeResponsesWebSockets } from "../responses-websocket-fetch.ts";
+import { readJsonBody } from "./fixtures/wire-decode.ts";
 
 const servers: Array<Server | WebSocketServer> = [];
 
@@ -355,9 +356,7 @@ test("auto with checkpoints on still falls back to SSE on a pre-open handshake f
   const { createServer } = await import("node:http");
   const bodies: Array<Record<string, unknown>> = [];
   const http = createServer(async (request, response) => {
-    let raw = "";
-    for await (const chunk of request) raw += chunk;
-    bodies.push(JSON.parse(raw));
+    bodies.push(await readJsonBody(request) as Record<string, unknown>);
     response.writeHead(200, { "content-type": "text/event-stream" });
     for (const event of responseEvents("resp_sse", "sse ok")) response.write(`data: ${JSON.stringify(event)}\n\n`);
     response.end("data: [DONE]\n\n");

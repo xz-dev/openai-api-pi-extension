@@ -3,6 +3,7 @@ import { createServer, type Server } from "node:http";
 import { after, before, test } from "node:test";
 import { createModels, InMemoryCredentialStore } from "@earendil-works/pi-ai";
 import { createOpenAIApiProvider } from "../index.ts";
+import { readJsonBody } from "./fixtures/wire-decode.ts";
 
 const PROVIDER = "openai-api-extension";
 let server: Server;
@@ -21,9 +22,7 @@ before(async () => {
   server = createServer(async (request, response) => {
     captured.url = request.url;
     captured.authorization = request.headers.authorization;
-    let body = "";
-    for await (const chunk of request) body += chunk;
-    captured.body = JSON.parse(body) as Record<string, unknown>;
+    captured.body = (await readJsonBody(request)) as Record<string, unknown>;
 
     const message = {
       id: "msg_mock_1",

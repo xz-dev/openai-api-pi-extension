@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import OpenAI from "openai";
 import { ResponsesWS } from "openai/resources/responses/ws";
+import type { NodeWebSocket } from "openai/internal/ws-adapter-node";
 import type { ResponsesStreamMessage } from "openai/resources/responses/internal-base";
 import type { ResponseInputItem, ResponseStreamEvent, ResponsesClientEvent } from "openai/resources/responses/responses";
 import {
@@ -11,6 +12,7 @@ import {
   registerSessionResourceCleanup,
   type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
+import { compressionFetch, getWebSocketCompressionPolicy } from "./request-compression.ts";
 
 import { captureCheckpoint, hashCanonical, planCheckpoint, responseEventOutput, responseOutputItemsCapturable,
   type CheckpointCandidate, type ResponseCheckpoint } from "./response-checkpoints.ts";
@@ -121,22 +123,25 @@ function websocketHeaders(headers: Headers): Record<string, string> {
   return Object.fromEntries([...headers].filter(([name]) => name !== "authorization"));
 }
 
-function createConnection(model: Model<"openai-responses">, options: BridgeOptions, headers: Headers): Connection {
+type CompressionPolicy = Awaited<ReturnType<typeof getWebSocketCompressionPolicy>>;
+
+function createConnection(model: Model<"openai-responses">, options: BridgeOptions, headers: Headers, compression: CompressionPolicy): Connection {
   const apiKey = options.apiKey ?? headers.get("authorization")?.replace(/^Bearer\s+/i, "");
   const client = new OpenAI({ apiKey, baseURL: model.baseUrl, maxRetries: 0 });
-  return {
-    ws: new ResponsesWS(client, {
-      handshakeTimeout: options.websocketConnectTimeoutMs,
-      headers: websocketHeaders(headers),
-    }),
-    busy: true,
-  };
+  const ws = new ResponsesWS(client, {
+    handshakeTimeout: options.websocketConnectTimeoutMs,
+    headers: websocketHeaders(headers),
+    perMessageDeflate: compression.perMessageDeflate,
+  });
+  ws.socket.once("open", () => compression.recordNegotiated((ws.socket as NodeWebSocket).platformSocket.extensions));
+  return { ws, busy: true };
 }
 
 function acquire(
   model: Model<"openai-responses">,
   options: BridgeOptions,
   headers: Headers,
+  compression: CompressionPolicy,
   forceFresh = false,
 ): Pick<Pending, "connection" | "key" | "keep"> {
   const key = connectionKey(model, options, headers);
@@ -147,7 +152,7 @@ function acquire(
     return { connection: existing, key, keep: true };
   }
 
-  const connection = createConnection(model, options, headers);
+  const connection = createConnection(model, options, headers, compression);
   const keep = Boolean(key);
   if (key) connections.set(key, connection);
   return { connection, key, keep };
@@ -395,7 +400,8 @@ export function createResponsesWebSocketBridge(
   let pending: Pending | undefined;
   // Provider retries reuse this bridge; a failed repair must stay terminal.
   let terminalRepairFailure: { error: unknown } | undefined;
-  const fallbackFetch = options.fetch ?? globalThis.fetch;
+  // Compression applies only at the real HTTP send; WS/JSON bridge input stays raw.
+  const fallbackFetch = compressionFetch(options.fetch ?? globalThis.fetch);
   const statusKey = transportKey(model.baseUrl, options.sessionId);
   // Checkpoint state is per endpoint+session+credential (a store rejection on
   // one account says nothing about another); transport state stays per session.
@@ -511,7 +517,13 @@ export function createResponsesWebSocketBridge(
         let invalidRefRetry = !recoveryProbe;
         let stripRejectedParent = recoveryProbe;
         for (;;) {
-          const acquired = acquire(model, options, request.headers, recoveryProbe);
+          const socketUrl = new URL(request.url);
+          socketUrl.protocol = socketUrl.protocol === "https:" ? "wss:" : "ws:";
+          const compressionHeaders = new Headers(request.headers);
+          if (options.apiKey) compressionHeaders.set("authorization", `Bearer ${options.apiKey}`);
+          const compression = await getWebSocketCompressionPolicy(socketUrl.toString(), compressionHeaders);
+          // Resolve policy before entering the synchronous connection-pool critical section.
+          const acquired = acquire(model, options, request.headers, compression, recoveryProbe);
           const iterator = acquired.connection.ws.stream();
           pending = {
             ...acquired,

@@ -6,6 +6,7 @@ import { createModels, InMemoryCredentialStore } from "@earendil-works/pi-ai";
 import * as responses from "@earendil-works/pi-ai/api/openai-responses";
 import { createOpenAIApiProvider } from "../index.ts";
 import { closeResponsesWebSockets, getActualResponsesTransport } from "../responses-websocket-fetch.ts";
+import { readJsonBody } from "./fixtures/wire-decode.ts";
 
 function events(id: string) {
   const item = { id: `msg_${id}`, type: "message", role: "assistant", status: "completed",
@@ -29,9 +30,7 @@ for (const method of ["stream", "streamSimple"] as const) {
       let generations = 0;
       const http = createServer(async (request, response) => {
         httpRequests++;
-        let body = "";
-        for await (const chunk of request) body += chunk;
-        frames.push(JSON.parse(body));
+        frames.push(await readJsonBody(request));
         response.writeHead(200, { "content-type": "text/event-stream" });
         for (const event of events(`resp_${++generations}`)) response.write(`data: ${JSON.stringify(event)}\n\n`);
         response.end("data: [DONE]\n\n");
