@@ -12,7 +12,8 @@ import {
   registerSessionResourceCleanup,
   type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
-import { compressionFetch, getWebSocketCompressionPolicy } from "./request-compression.ts";
+import { compressionFetch, getRequestCompressionEncoding, getWebSocketCompressionEncoding,
+  getWebSocketCompressionPolicy, transportLabel } from "./request-compression.ts";
 
 import { captureCheckpoint, hashCanonical, planCheckpoint, responseEventOutput, responseOutputItemsCapturable,
   type CheckpointCandidate, type ResponseCheckpoint } from "./response-checkpoints.ts";
@@ -447,10 +448,15 @@ export function createResponsesWebSocketBridge(
   // SSE is a hard checkpoint gate: drop the policy-owned store:true (a hook's
   // explicit store:false and a caller parent pass through unchanged).
   const sseFetch = async (fallbackRequest: Request) => {
-    if (options.checkpoints?.enabled !== true) return fallbackFetch(fallbackRequest);
-    const body = JSON.parse(await fallbackRequest.text()) as RequestBody;
-    if (body.store === true) delete body.store;
-    return fallbackFetch(new Request(fallbackRequest, { body: JSON.stringify(body) }));
+    let wireRequest = fallbackRequest;
+    if (options.checkpoints?.enabled === true) {
+      const body = JSON.parse(await fallbackRequest.text()) as RequestBody;
+      if (body.store === true) delete body.store;
+      wireRequest = new Request(fallbackRequest, { body: JSON.stringify(body) });
+    }
+    const response = await fallbackFetch(wireRequest);
+    await notifyTransport(transportLabel("SSE", getRequestCompressionEncoding(response)));
+    return response;
   };
 
   return {
@@ -466,7 +472,6 @@ export function createResponsesWebSocketBridge(
         if (useSse || autoSseRecoveryInFlight.has(statusKey) || (fallbackUntil !== undefined && Date.now() < fallbackUntil)) {
           useSse = true;
           actualTransports.set(statusKey, "sse");
-          await notifyTransport("SSE");
           return sseFetch(fallbackRequest);
         }
         if (fallbackUntil !== undefined) {
@@ -601,7 +606,8 @@ export function createResponsesWebSocketBridge(
             wireAccepted = true;
             durableSent = durableSent || durable;
             actualTransports.set(statusKey, cacheEnabled(options) ? "websocket-cached" : "websocket");
-            await notifyTransport(body.previous_response_id ? "WS/continuation" : "WS/full");
+            await notifyTransport(transportLabel(body.previous_response_id ? "WS/continuation" : "WS/full",
+              getWebSocketCompressionEncoding((pending.connection.ws.socket as NodeWebSocket).platformSocket.extensions)));
             return streamResponse(pending, first, request.signal);
           } catch (error) {
             // ResponsesWS queues send() until OPEN: a failed handshake never
@@ -658,7 +664,6 @@ export function createResponsesWebSocketBridge(
         if (referenceRepairAttempted) throw error;
         useSse = true;
         actualTransports.set(statusKey, "sse");
-        await notifyTransport("SSE");
         return sseFetch(fallbackRequest);
       }
     },

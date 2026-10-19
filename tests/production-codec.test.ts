@@ -44,7 +44,7 @@ async function fixture(t: any, toolTurn = false) {
   const source = join(dir, "plugin");
   const pkg = JSON.parse(await readFile(join(project, "package.json"), "utf8"));
   await mkdir(source);
-  for (const file of pkg.files) await cp(join(project, file), join(source, file));
+  for (const file of pkg.files) await cp(join(project, file), join(source, file), { recursive: true });
   await mkdir(join(source, "tests/fixtures"), { recursive: true });
   await cp(join(project, "tests/fixtures/checkpoint-cleanup-extension.ts"), join(source, "tests/fixtures/checkpoint-cleanup-extension.ts"));
   const packages = ["balanced-match", "brace-expansion", "minimatch", "openai", "ws"];

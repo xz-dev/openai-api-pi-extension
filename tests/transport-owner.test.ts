@@ -21,9 +21,10 @@ function events(id: string) {
   ];
 }
 
+for (const compressed of [false, true]) {
 for (const method of ["stream", "streamSimple"] as const) {
   for (const transport of ["auto", "websocket-cached", "websocket", "sse", undefined] as const) {
-    test(`SDK entry ${method}/${transport}: bridge owns frames and actual transport`, async (t) => {
+    test(`SDK entry ${method}/${transport}, compression=${compressed}: bridge owns frames and actual transport`, async (t) => {
       const frames: Record<string, any>[] = [];
       let wsConnections = 0;
       let httpRequests = 0;
@@ -35,7 +36,7 @@ for (const method of ["stream", "streamSimple"] as const) {
         for (const event of events(`resp_${++generations}`)) response.write(`data: ${JSON.stringify(event)}\n\n`);
         response.end("data: [DONE]\n\n");
       });
-      const wss = new WebSocketServer({ server: http });
+      const wss = new WebSocketServer({ server: http, perMessageDeflate: compressed });
       wss.on("connection", (socket) => {
         wsConnections++;
         socket.on("message", (raw) => {
@@ -97,11 +98,13 @@ for (const method of ["stream", "streamSimple"] as const) {
       assert.equal(responses.getOpenAIResponsesWebSocketDebugStats?.(sessionId), undefined, "native planner/pool must stay unused");
       // Stock has no observer for explicit SSE; preserve that host behavior.
       if (!usesSse || responses.getOpenAIResponsesWebSocketDebugStats) {
-        assert.deepEqual(notifications, [[usesSse ? "SSE" : "WS/full", model.id],
-          [usesSse ? "SSE" : cached ? "WS/continuation" : "WS/full", model.id]]);
+        const suffix = compressed ? " DEFLATE" : "";
+        assert.deepEqual(notifications, [[usesSse ? "SSE Zstd" : `WS/full${suffix}`, model.id],
+          [usesSse ? "SSE Zstd" : `${cached ? "WS/continuation" : "WS/full"}${suffix}`, model.id]]);
       }
     });
   }
+}
 }
 
 for (const observer of ["absent", "throw", "reject"] as const) {
@@ -183,7 +186,7 @@ test("auto reports actual SSE fallback; rejected observer cannot replay inferenc
         throw new Error("observer unavailable");
       } }).result();
   assert.equal(output.stopReason, "stop", output.errorMessage);
-  assert.deepEqual(labels, ["SSE"]);
+  assert.deepEqual(labels, ["SSE Zstd"]);
   assert.equal(upgrades, 1);
   assert.equal(generations, 1);
   assert.equal(getActualResponsesTransport(model.baseUrl, "fallback-observer"), "sse");

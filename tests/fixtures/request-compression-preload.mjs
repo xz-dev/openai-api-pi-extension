@@ -28,8 +28,9 @@ if (helper) {
     const file = join(dir, `shim-${shim.counter++}.mjs`);
     writeFileSync(file,
       `export * from ${JSON.stringify(target)};\n` +
-      `export { createRequestCompressionFetch } from ${JSON.stringify(helperUrl)};\n` +
-      `export { getWebSocketCompressionPolicy } from ${JSON.stringify(new URL("./websocket-compression.ts", helperUrl).href)};\n`);
+      `export { createRequestCompressionFetch, getRequestCompressionEncoding } from ${JSON.stringify(helperUrl)};\n` +
+      `export { transportLabel } from ${JSON.stringify(new URL("./event-stream.ts", helperUrl).href)};\n` +
+      `export { getWebSocketCompressionEncoding, getWebSocketCompressionPolicy } from ${JSON.stringify(new URL("./websocket-compression.ts", helperUrl).href)};\n`);
     return pathToFileURL(file).href;
   };
   shim.counter = 0;

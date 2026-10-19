@@ -81,12 +81,18 @@ test("direct SSE request compresses the JSON body on the wire", async () => {
 });
 
 // auto -> SSE fallback path goes through the same wrapped final sender.
-test("auto SSE fallback compresses through the bridge's final sender", async () => {
+for (const acceptedEncoding of ["zstd", "gzip", undefined]) {
+test(`auto SSE fallback labels the final upload encoding: ${acceptedEncoding ?? "identity"}`, async () => {
   const encodings: Array<string | undefined> = [];
+  const labels: Array<string | undefined> = [];
   const http = createServer(async (request, response) => {
     const raw: Buffer[] = [];
     for await (const chunk of request) raw.push(Buffer.from(chunk as Uint8Array));
     encodings.push(request.headers["content-encoding"] as string | undefined);
+    if (request.headers["content-encoding"] !== acceptedEncoding) {
+      response.writeHead(415, { "accept-encoding": acceptedEncoding ?? "identity" }).end();
+      return;
+    }
     decode(request, Buffer.concat(raw)); // must parse cleanly after decode
     response.writeHead(200, { "content-type": "text/event-stream" });
     for (const event of sseEvents("resp_fallback_compressed")) response.write(`data: ${JSON.stringify(event)}\n\n`);
@@ -101,12 +107,15 @@ test("auto SSE fallback compresses through the bridge's final sender", async () 
   const output = await createOpenAIApiProvider().streamSimple(
     model(`http://127.0.0.1:${address.port}/v1`),
     { messages: [{ role: "user", content: BIG, timestamp: 1 }] },
-    { apiKey: "compress-key", transport: "auto", sessionId: "auto-compress", websocketConnectTimeoutMs: 500 },
+    { apiKey: "compress-key", transport: "auto", sessionId: "auto-compress", websocketConnectTimeoutMs: 500,
+      onTransport: (label: string | undefined) => { labels.push(label); } },
   ).result();
   assert.equal(output.stopReason, "stop", output.errorMessage);
-  assert.equal(encodings.length, 1);
-  assert.equal(encodings[0], "zstd");
+  assert.deepEqual(encodings, acceptedEncoding === "zstd" ? ["zstd"]
+    : acceptedEncoding === "gzip" ? ["zstd", "gzip"] : ["zstd", "gzip", "deflate", "br", undefined]);
+  assert.deepEqual(labels, [acceptedEncoding === "zstd" ? "SSE Zstd" : acceptedEncoding === "gzip" ? "SSE gzip" : "SSE"]);
 });
+}
 
 // HTTP content-encoding applies only to the HTTP upload; the JSON payload the
 // bridge sends over WS stays plain JSON (this says nothing about negotiated
