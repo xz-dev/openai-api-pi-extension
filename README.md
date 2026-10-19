@@ -62,7 +62,8 @@ access.
 
 ## Host requirement
 
-Requires Pi's shared transport-compression APIs. Update the host first; see
+Requires xz-dev/pi **1.3.0-xz.328.1.g2e2d9ad8** or newer with the shared
+transport-compression APIs. Update the host first; see
 [compatible hosts and upgrade order](docs/request-compression.md#host-requirement).
 
 ## Install
@@ -129,7 +130,9 @@ host pi version.
 ## Request compression
 
 Lossless HTTP and WebSocket compression reuses Pi's shared policy without changing
-model input or image quality. See [compression and compatible hosts](docs/request-compression.md)
+model input or image quality. The default Working label shows the active algorithm,
+for example `SSE Zstd` or `WS/continuation DEFLATE`; uncompressed requests keep
+the original protocol label. See [compression and compatible hosts](docs/request-compression.md)
 and the [paired Pi guide](https://github.com/xz-dev/pi/blob/main/docs/request-compression.md).
 
 ## Response checkpoints

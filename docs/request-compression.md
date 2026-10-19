@@ -10,14 +10,17 @@ for those rules and their limits.
 
 ## Host requirement
 
-Update Pi before installing or updating this extension, then restart Pi. The host
-must export both functions from `@earendil-works/pi-ai`:
+Use xz-dev/pi
+[1.3.0-xz.328.1.g2e2d9ad8](https://github.com/xz-dev/pi/releases/tag/xz-v1.3.0-xz.328.1.g2e2d9ad8)
+or newer. Update Pi before updating this extension, then restart Pi. Other hosts
+must export these functions from `@earendil-works/pi-ai`:
 
 - `createRequestCompressionFetch`
 - `getWebSocketCompressionPolicy`
+- `getRequestCompressionEncoding`
+- `getWebSocketCompressionEncoding`
+- `transportLabel`
 
-The first compatible downstream release is
-[1.3.0-xz.320.1.ge10c8c68](https://github.com/xz-dev/pi/releases/tag/xz-v1.3.0-xz.320.1.ge10c8c68).
 The declared peer-version range alone does not establish these capabilities.
 An older host without the exports fails when loading the extension; there is no
 production fallback to a local helper or an environment-selected module.
@@ -43,6 +46,15 @@ for its endpoint/credential scope until process exit. Missing response
 WebSocket application messages remain JSON. Gzip/zstd HTTP bodies are never sent
 as WebSocket application frames.
 
+## See the active algorithm
+
+The default Working label appends one space and the algorithm: `SSE Zstd`,
+`SSE gzip`, `SSE DEFLATE`, `SSE Brotli`, or `WS/continuation DEFLATE`.
+HTTP uses the final upload encoding after any refusal fallback. WebSockets
+show `DEFLATE` only after `permessage-deflate` negotiation, including pooled
+connections. Uncompressed or unobservable compression adds nothing.
+These labels describe the endpoint connection, not a proxy's upstream hop.
+
 ## Recovery and storage stay separate
 
 Compression does not choose a transport, reset recovery cooldowns, authorize
@@ -65,7 +77,7 @@ real-gateway compatibility.
 When development dependencies predate the host exports, set
 `PI_REQUEST_COMPRESSION_HELPER` to the updated host source
 `packages/ai/src/utils/request-compression.ts` for local tests. The test-only
-preload loads its sibling `websocket-compression.ts` as well. This is not a
+preload loads its sibling `websocket-compression.ts` and `event-stream.ts` as well. This is not a
 production fallback; no machine-specific path is embedded in the package.
 
 Return to [setup and transport selection](../README.md), or read
