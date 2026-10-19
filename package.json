@@ -14,6 +14,7 @@
     "response-checkpoints.ts",
     "checkpoint-adapter.ts",
     "README.md",
+    "docs/",
     "LICENSE"
   ],
   "engines": {
