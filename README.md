@@ -60,6 +60,10 @@ credentials refresh through Pi's provider lifecycle. If discovery fails, Pi
 retains the last persisted catalog; offline startup restores it without network
 access.
 
+## Host requirement
+
+Request compression requires a Pi build whose `@earendil-works/pi-ai` exports `createRequestCompressionFetch` and `getWebSocketCompressionPolicy`. The declared peer version range alone does not establish that capability. Older hosts without these exports fail at module load; install the matching updated host before this plugin revision. Earlier stock-host validation results below describe the pre-compression revision, not this new requirement.
+
 ## Install
 
 ```
@@ -96,8 +100,7 @@ Pi's `transport` setting selects behavior:
 Explicit `websocket` and `websocket-cached` modes fail without SSE fallback.
 Recovery belongs to this extension's Responses bridge, not Pi's built-in Codex
 transport. It requires no fork-only WebSocket state accessors or extra
-configuration, so official Pi builds within the supported dependency range can
-use it too.
+configuration. The host must also meet the [compression API requirement](#host-requirement).
 
 The bridge uses Pi's existing request builder and response parser through its
 public `fetch` injection point; it does not copy Pi's Responses protocol code.
@@ -115,12 +118,22 @@ plugin defaults or native `['*']` defaults being inserted. The actual bridge
 owner applies [checkpoint policy and storage](#response-checkpoints); eligible
 durable requests have stricter replay limits than ordinary auto fallback.
 Public context normalization is used only when available on the host, preserving
-system prompts and tool declarations on newer Pi while supporting stock 0.84.2.
+system prompts and tool declarations; compression itself requires the updated host exports.
 
 Because message conversion runs inside Pi's shared `transformMessages` step,
 the extension itself drops empty-content user/assistant messages (for example
 watchdog inquiry fold markers) before delegating, so requests stay clean on any
 host pi version.
+
+## Request compression
+
+Direct SSE uploads and auto-mode HTTP fallbacks use Pi's shared `createRequestCompressionFetch` only at the final network sender. The bridge still parses plain JSON before choosing its transport; there is no copied codec implementation or independent HTTP downgrade cache in this plugin.
+
+Unknown endpoints are actively tried with zstd level 3. Explicit encoding refusals step down through gzip level 4, deflate, Brotli, then plain JSON. State is process-local, target/credential-scoped, never persisted and never automatically upgraded. A missing `Accept-Encoding` response does not disable probing. Generic JSON errors, authentication failures, rate limits, server/network errors and cancellation do not justify another compression attempt.
+
+WebSockets separately use shared `getWebSocketCompressionPolicy` with the existing SDK/ws client. Negotiated `permessage-deflate` compresses actual upload frames while application payloads remain JSON. A declined extension is not offered again for that target/auth scope until process exit. Existing transport and checkpoint cooldown rules remain independent.
+
+Compression is lossless: image bytes, resolution, quality and model input are unchanged. Smaller network payloads do not imply fewer tokens or guaranteed lower first-token latency.
 
 ## Response checkpoints
 
@@ -334,9 +347,11 @@ the real discovery error (HTTP status and a short body, no URL or API key).
 ## Development
 
 ```
-npm install
+npm install --ignore-scripts
 npm test        # node:test provider lifecycle, loader, and transport tests
 ```
+
+When the development dependency predates the new host exports, set `PI_REQUEST_COMPRESSION_HELPER` to the updated host source file `packages/ai/src/utils/request-compression.ts` for local tests. The test-only preload also loads its sibling `websocket-compression.ts`; it is never a production fallback. No machine-specific path is embedded in the package.
 
 [`tests/transport-owner.test.ts`](tests/transport-owner.test.ts) exercises the real SDK `createModels` entry and
 direct provider calls against loopback Responses servers. It checks full/delta
