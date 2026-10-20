@@ -19,6 +19,8 @@ import { captureCheckpoint, hashCanonical, planCheckpoint, responseEventOutput, 
   type CheckpointCandidate, type ResponseCheckpoint } from "./response-checkpoints.ts";
 
 const SOCKET_TTL_MS = 5 * 60 * 1000;
+const ANCHOR_TTL_MS = 10 * 60 * 1000;
+const MAX_ANCHORS = 32;
 const AUTO_SSE_COOLDOWN_MS = 5 * 60 * 1000;
 // Checkpoint verification cooldown, mirrored on the WS->SSE cooldown window.
 const CHECKPOINT_COOLDOWN_MS = AUTO_SSE_COOLDOWN_MS;
@@ -32,6 +34,8 @@ type Continuation = {
   // Caller-owned roots can leave history only on the server.
   hasFullHistory: boolean;
   encodedOutput?: unknown[];
+  // Present only on a server-confirmed anchor carried across sockets.
+  expiresAt?: number;
 };
 type Connection = {
   ws: ResponsesWS;
@@ -71,6 +75,7 @@ type BridgeOptions = Pick<
 };
 
 const connections = new Map<string, Connection>();
+const anchors = new Map<string, Continuation>();
 // Presence records a WS failure: 0 retries next request; a deadline enforces cooldown.
 const autoSseFallbackUntil = new Map<string, number>();
 const autoSseRecoveryInFlight = new Set<string>();
@@ -146,14 +151,18 @@ function acquire(
   forceFresh = false,
 ): Pick<Pending, "connection" | "key" | "keep"> {
   const key = connectionKey(model, options, headers);
-  const existing = !forceFresh && key ? connections.get(key) : undefined;
-  if (existing && !existing.busy && existing.ws.socket.readyState === 1) {
+  const existing = key ? connections.get(key) : undefined;
+  if (!forceFresh && existing && !existing.busy && existing.ws.socket.readyState === 1) {
     if (existing.timer) clearTimeout(existing.timer);
     existing.busy = true;
     return { connection: existing, key, keep: true };
   }
+  if (existing && !existing.busy) closeConnection(key, existing, "reconnect");
 
   const connection = createConnection(model, options, headers, compression);
+  const anchor = key ? anchors.get(key) : undefined;
+  if (anchor && anchor.expiresAt! <= Date.now()) anchors.delete(key!);
+  else if (!forceFresh) connection.continuation = anchor;
   const keep = Boolean(key);
   if (key) connections.set(key, connection);
   return { connection, key, keep };
@@ -277,7 +286,8 @@ function isAssistantResponseItem(item: ResponseInputItem): boolean {
 
 function cachedBody(connection: Connection, body: RequestBody): RequestBody {
   const previous = connection.continuation;
-  if (!previous || JSON.stringify(withoutInput(body)) !== JSON.stringify(withoutInput(previous.request))) return body;
+  if (!previous || (previous.expiresAt !== undefined && (previous.expiresAt <= Date.now() || body.previous_response_id != null))
+    || JSON.stringify(withoutInput(body)) !== JSON.stringify(withoutInput(previous.request))) return body;
   const input = body.input ?? [];
   const previousInput = previous.request.input ?? [];
   if (input.length <= previousInput.length || JSON.stringify(input.slice(0, previousInput.length)) !== JSON.stringify(previousInput)) return body;
@@ -408,7 +418,15 @@ export function createResponsesWebSocketBridge(
   // one account says nothing about another); transport state stays per session.
   // Effective WS credential, as createConnection() resolves it (apiKey, else the Authorization header).
   let checkpointKey = statusKey;
+  let anchorKey: string | undefined;
+  const clearAnchor = () => {
+    if (!anchorKey) return;
+    anchors.delete(anchorKey);
+    const connection = connections.get(anchorKey);
+    if (connection?.continuation?.expiresAt !== undefined) connection.continuation = undefined;
+  };
   const bindCheckpointKey = (headers: Headers) => {
+    anchorKey = connectionKey(model, options, headers);
     const credential = options.apiKey ?? headers.get("authorization")?.replace(/^Bearer\s+/i, "") ?? "";
     checkpointKey = `${statusKey}\0${createHash("sha256").update(credential).digest("hex")}`;
   };
@@ -435,12 +453,14 @@ export function createResponsesWebSocketBridge(
     return true;
   };
   const openCheckpointCooldown = () => {
+    clearAnchor();
     if (!options.sessionId) return;
     checkpointCooldownUntil.set(checkpointKey, Date.now() + CHECKPOINT_COOLDOWN_MS);
     if (checkpointProbe) { checkpointProbeInFlight.delete(checkpointKey); checkpointProbe = false; }
   };
   const recordFailure = () => {
     if (options.transport === "auto" && options.sessionId) {
+      clearAnchor();
       autoSseFallbackUntil.set(statusKey, autoSseFallbackUntil.has(statusKey) ? Date.now() + AUTO_SSE_COOLDOWN_MS : 0);
     }
   };
@@ -467,10 +487,12 @@ export function createResponsesWebSocketBridge(
         return fallbackFetch(fallbackRequest);
       }
       if (terminalRepairFailure) throw terminalRepairFailure.error;
+      bindCheckpointKey(request.headers);
       if (options.transport === "auto") {
         const fallbackUntil = autoSseFallbackUntil.get(statusKey);
         if (useSse || autoSseRecoveryInFlight.has(statusKey) || (fallbackUntil !== undefined && Date.now() < fallbackUntil)) {
           useSse = true;
+          clearAnchor();
           actualTransports.set(statusKey, "sse");
           return sseFetch(fallbackRequest);
         }
@@ -481,6 +503,8 @@ export function createResponsesWebSocketBridge(
       }
 
       let referenceRepairAttempted = false;
+      // Stored reconnects allow only the explicit reference repair, never HTTP replay.
+      let storedAnchorAttempted = false;
       // Durable intent reached the wire: fences provider retries regardless
       // of whether the server accepted the request.
       let durableSent = false;
@@ -495,13 +519,13 @@ export function createResponsesWebSocketBridge(
       // the SDK-default store value verbatim.
       let cooldownSuppressed = false;
       try {
-        bindCheckpointKey(request.headers);
         const requestBody = JSON.parse(await request.text()) as RequestBody;
         const { previous_response_id: _previousResponseId, store: _policyStore, ...strippedBody } = requestBody;
         // Keep a hook's explicit store:false (privacy veto); only policy store:true is dropped.
         const bareBody: RequestBody = requestBody.store === false ? { ...strippedBody, store: false } : strippedBody;
         const durable = resolveCheckpoints(requestBody.store === false);
         cooldownSuppressed = options.checkpoints?.enabled === true && !durable;
+        if (cooldownSuppressed || checkpointProbe || recoveryProbe) clearAnchor();
         const fullBody = durable && requestBody.previous_response_id != null ? requestBody : bareBody;
         // Repair/cooldown body: full history, no previous_response_id, policy
         // store omitted (a hook's explicit store:false is kept).
@@ -546,6 +570,7 @@ export function createResponsesWebSocketBridge(
           // Preserve caller ancestry and proven nonpersistent continuations without durable planning.
           const inherited = durable && requestBody.previous_response_id == null
             && (acquired.connection.continuation?.hasFullHistory === false
+              || acquired.connection.continuation?.expiresAt !== undefined
               || (requestBody.store !== true && acquired.connection.continuation?.encodedOutput !== undefined))
             ? cachedBody(acquired.connection, requestBody) : undefined;
           const delta = recoveryProbe || stripRejectedParent || anchorRejected || !cacheEnabled(options)
@@ -595,6 +620,10 @@ export function createResponsesWebSocketBridge(
           const bridgeOwnedParent = delta !== undefined && delta !== requestBody
             ? delta.previous_response_id
             : undefined;
+          const storedAnchorSent = acquired.connection.continuation?.expiresAt !== undefined
+            && bridgeOwnedParent === acquired.connection.continuation.responseId && body.previous_response_id === bridgeOwnedParent;
+          storedAnchorAttempted ||= storedAnchorSent;
+          if (storedAnchorSent) pending.onStreamError = (error) => { terminalRepairFailure = { error }; };
           pending.hasFullHistory &&= bridgeOwnedParent === undefined || (durable && delta === plan?.request)
             || acquired.connection.continuation?.hasFullHistory === true;
           if (lineageChain) pending.hasFullHistory = false;
@@ -633,7 +662,8 @@ export function createResponsesWebSocketBridge(
             }
             if (hasFullHistory && bridgeOwnedParent !== undefined
               && ((isInvalidPreviousResponseIdError(error) && !hasConflictingEvidence(error))
-                || (durable && isMissingPreviousResponseError(error) && isCheckpointReferenceFailure(error)))) {
+                || (isMissingPreviousResponseError(error) && isCheckpointReferenceFailure(error)))) {
+              clearAnchor();
               if (acquired.key && isInvalidPreviousResponseIdError(error)) rejectedContinuationKeys.add(acquired.key);
               if (invalidRefRetry && !request.signal.aborted) {
                 invalidRefRetry = false;
@@ -654,11 +684,11 @@ export function createResponsesWebSocketBridge(
         // already did); only a captured checkpoint proves store:true again.
         if (checkpointProbe && !request.signal.aborted) openCheckpointCooldown();
         else if (checkpointProbe) { checkpointProbeInFlight.delete(checkpointKey); checkpointProbe = false; }
-        if (referenceRepairAttempted || durableSent) terminalRepairFailure = { error };
+        if (referenceRepairAttempted || durableSent || storedAnchorAttempted) terminalRepairFailure = { error };
         if (pending) closeConnection(pending.key, pending.connection, "request failed");
         pending = undefined;
         if (recoveryProbe) autoSseRecoveryInFlight.delete(statusKey);
-        if (durableSent || options.transport !== "auto" || request.signal.aborted || wireAccepted) throw error;
+        if (durableSent || storedAnchorAttempted || options.transport !== "auto" || request.signal.aborted || wireAccepted) throw error;
         recordFailure();
         // A failed repair may already have generated; do not add an HTTP replay.
         if (referenceRepairAttempted) throw error;
@@ -671,7 +701,8 @@ export function createResponsesWebSocketBridge(
       if (!pending) return;
       const completed = responseEventOutput(pending.completion ?? {});
       let encodedOutput: unknown[] | undefined;
-      if (options.checkpoints?.enabled && completed && completed.id === output.responseId) {
+      if (options.checkpoints && (options.checkpoints.enabled || (pending.sentStore && completed?.store === true))
+        && completed && completed.id === output.responseId) {
         try { encodedOutput = await options.checkpoints.encodeOutput(output); }
         catch { /* Unsupported host codec: no locally proven continuation. */ }
       }
@@ -698,7 +729,10 @@ export function createResponsesWebSocketBridge(
       }
       if (output.stopReason === "error" || output.stopReason === "aborted") {
         closeConnection(pending.key, pending.connection, "request failed");
-        if (output.stopReason === "error") recordFailure();
+        if (output.stopReason === "error") {
+          if (!terminalRepairFailure) pending.onStreamError?.(new Error(output.errorMessage ?? "Responses request failed"));
+          recordFailure();
+        }
       } else {
         if (options.transport === "auto") autoSseFallbackUntil.delete(statusKey);
         release(pending);
@@ -712,6 +746,17 @@ export function createResponsesWebSocketBridge(
         else if (output.stopReason !== "aborted") checkpointCooldownUntil.set(checkpointKey, Date.now() + CHECKPOINT_COOLDOWN_MS);
         checkpointProbeInFlight.delete(checkpointKey);
         checkpointProbe = false;
+      }
+      const continuation = pending.connection.continuation;
+      if (continuation && pending.key && pending.hasFullHistory && pending.sentStore === true && completed?.store === true
+        && completed.id === output.responseId && outputComplete
+        && (output.stopReason === "stop" || output.stopReason === "toolUse")
+        && !recoveryProbe && !checkpointCooldownUntil.has(checkpointKey) && !rejectedContinuationKeys.has(pending.key)) {
+        const now = Date.now();
+        for (const [key, anchor] of anchors) if (anchor.expiresAt! <= now) anchors.delete(key);
+        anchors.delete(pending.key);
+        anchors.set(pending.key, { ...continuation, expiresAt: now + ANCHOR_TTL_MS });
+        if (anchors.size > MAX_ANCHORS) anchors.delete(anchors.keys().next().value!);
       }
       if (recoveryProbe) autoSseRecoveryInFlight.delete(statusKey);
       pending = undefined;
@@ -797,6 +842,7 @@ export function closeResponsesWebSockets(sessionId?: string): void {
     for (const key of autoSseFallbackUntil.keys()) if (key.endsWith(`\0${sessionId}`)) autoSseFallbackUntil.delete(key);
     for (const key of autoSseRecoveryInFlight) if (key.endsWith(`\0${sessionId}`)) autoSseRecoveryInFlight.delete(key);
     for (const key of actualTransports.keys()) if (key.endsWith(`\0${sessionId}`)) actualTransports.delete(key);
+    for (const key of anchors.keys()) if (key.includes(`\0${sessionId}\0`)) anchors.delete(key);
     for (const key of rejectedContinuationKeys) if (key.includes(`\0${sessionId}\0`)) rejectedContinuationKeys.delete(key);
     for (const key of checkpointCooldownUntil.keys()) if (key.includes(`\0${sessionId}\0`)) checkpointCooldownUntil.delete(key);
     for (const key of checkpointProbeInFlight) if (key.includes(`\0${sessionId}\0`)) checkpointProbeInFlight.delete(key);
@@ -804,6 +850,7 @@ export function closeResponsesWebSockets(sessionId?: string): void {
     autoSseFallbackUntil.clear();
     autoSseRecoveryInFlight.clear();
     actualTransports.clear();
+    anchors.clear();
     rejectedContinuationKeys.clear();
     checkpointCooldownUntil.clear();
     checkpointProbeInFlight.clear();

@@ -1272,3 +1272,34 @@ for (const outcome of ["error", "aborted"] as const) {
     assert.equal(upgradeAttempts, 3, "aborted probe must release its slot without adding a cooldown");
   });
 }
+
+test("real provider reconnect uses confirmed memory anchor without persisted checkpoint metadata", async () => {
+  const requests: Array<{ body: Record<string, unknown>; connection: number }> = [];
+  let firstSocket: import("ws").WebSocket;
+  const upstream = await server((body, connection, socket) => {
+    firstSocket ??= socket;
+    requests.push({ body, connection });
+    for (const event of responseEvents(`resp_memory_${requests.length}`, "stored answer")) {
+      if (event.type === "response.completed") (event.response as any).store = true;
+      socket.send(JSON.stringify(event));
+    }
+  });
+  const provider = createOpenAIApiProvider();
+  const labels: string[] = [];
+  const options = { apiKey: "bridge-key", transport: "websocket-cached" as const, sessionId: "stored-memory",
+    onTransport: (label: string) => { labels.push(label); } };
+  const one = { role: "user" as const, content: "one", timestamp: 1 };
+  const first = await provider.streamSimple(model(upstream.baseUrl), { messages: [one] }, options).result();
+  assert.equal(first.stopReason, "stop", first.errorMessage);
+  const { responseCheckpoint: _checkpoint, ...withoutCheckpoint } = first as typeof first & { responseCheckpoint?: unknown };
+  await new Promise<void>((resolve) => { firstSocket.once("close", () => resolve()); firstSocket.close(1000, "idle timeout"); });
+  const second = await provider.streamSimple(model(upstream.baseUrl), {
+    messages: [one, withoutCheckpoint, { role: "user", content: "two", timestamp: 2 }],
+  }, options).result();
+  assert.equal(second.stopReason, "stop", second.errorMessage);
+  assert.equal(upstream.connections, 2);
+  assert.equal(requests.length, 2);
+  assert.equal(requests[1].body.previous_response_id, first.responseId);
+  assert.deepEqual(requests[1].body.input, [{ role: "user", content: [{ type: "input_text", text: "two" }] }]);
+  assert.deepEqual(labels, ["WS/full", "WS/continuation"]);
+});

@@ -106,6 +106,23 @@ During cooldown, send full history without storage. After the deadline, the
 next real request probes once with `store: true` and full history. Success
 clears the state; failure renews it. No background probes or persisted cooldown.
 
+## Reconnect without checkpoint metadata
+
+The bridge also keeps the latest confirmed anchor in memory for each exact
+endpoint, credential, header set and session. After an idle close, a new socket
+can send that response ID and only the new input, even when the assistant message
+has no persisted checkpoint metadata. The envelope and encoded history prefix
+must still match; the transport label reports `WS/continuation`.
+
+An in-memory anchor requires sent `store: true`, a successful completion explicitly
+acknowledging `store: true`, and complete local history with verified encoded
+output. Omitted or false storage acknowledgement cannot create this anchor.
+Failed or partial turns never replace it. The cache holds at most 32 identities,
+expires anchors after ten minutes without extending their age on use, and clears
+them on session shutdown, cooldown, recovery probes and reference rejection.
+These are client bounds, not a server-retention guarantee. A cache miss sends full
+history; durable message checkpoints below remain a separate restore path.
+
 ## Restore and safe failure
 
 A completed stored assistant response with independently complete local history
@@ -136,7 +153,8 @@ Explicit SSE and allowed auto WS-to-SSE fallback never carry policy
   [portable kernel](../response-checkpoints.ts).
 - [Durable-provider tests](../tests/durable-provider.test.ts),
   [policy tests](../tests/checkpoint-policy.test.ts),
-  [cooldown tests](../tests/checkpoint-cooldown.test.ts) and
+  [cooldown tests](../tests/checkpoint-cooldown.test.ts),
+  [cross-socket tests](../tests/cross-connection-continuation.test.ts) and
   [production-codec tests](../tests/production-codec.test.ts).
 - Native Pi: [settings](https://github.com/xz-dev/pi/blob/main/packages/coding-agent/docs/settings.md#response-checkpoints),
   [endpoint capabilities](https://github.com/xz-dev/pi/blob/main/packages/coding-agent/docs/models.md#response-checkpoint-capability)
