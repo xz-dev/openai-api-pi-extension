@@ -107,10 +107,11 @@ for (const changed of ["credential", "headers", "session", "endpoint"] as const)
   const h = await harness(t);
   const headers = { authorization: "Bearer identical-http-override", "x-tenant": "first" };
   const first = await h.turn(body(), {}, headers); await h.disconnect();
-  const overrides = changed === "credential" ? { apiKey: "different-key" }
-    : changed === "session" ? { sessionId: "different-session" } : {};
+  const overrides = changed === "session" ? { sessionId: "different-session" } : {};
   if (changed === "endpoint") h.model.baseUrl += "/other";
-  await h.turn(extended(first.responseId), overrides, changed === "headers" ? { ...headers, "x-tenant": "second" } : headers);
+  await h.turn(extended(first.responseId), overrides, changed === "credential"
+    ? { ...headers, authorization: "Bearer different-actual-credential" }
+    : changed === "headers" ? { ...headers, "x-tenant": "second" } : headers);
   assert.equal(h.frames[1].body.previous_response_id, undefined);
   assert.deepEqual(h.frames[1].body.input, extended(first.responseId).input);
 });
@@ -252,14 +253,14 @@ test("auto recovery discards old anchor and probes with full input", async (t) =
   const h = await harness(t); h.options.transport = "auto";
   const first = await h.turn(); await h.disconnect();
   h.behavior = (socket) => {
-    socket.send(JSON.stringify({ type: "response.created", response: { id: "resp_failed" } }));
-    socket.send(JSON.stringify({ ...missing, status: 500 })); return true;
+    socket.send(JSON.stringify({ type: "response.created", response: { id: "resp_failed" } }), () => socket.terminate());
+    return true;
   };
   await assert.rejects(h.turn(extended(first.responseId)));
   h.behavior = undefined;
   await h.turn(extended(first.responseId));
   assert.equal(h.frames[2].body.previous_response_id, undefined);
-  assert.equal(h.frames[2].body.store, undefined);
+  assert.equal(h.frames[2].body.store, true, "transport retry preserves caller storage intent");
   assert.deepEqual(h.frames[2].body.input, extended(first.responseId).input);
 });
 

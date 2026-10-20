@@ -40,7 +40,9 @@ its JSON parser.
 
 The extension imports the host policy rather than copying codecs or keeping a
 second downgrade cache. A refusal remembered by that policy stays remembered
-for its endpoint/credential scope until process exit. Missing response
+for its endpoint/credential scope until process exit. WebSocket compression
+identity uses actual Authorization (request header over model header over API
+key); an unused API key cannot reset that policy. Missing response
 `Accept-Encoding` does not disable probing.
 
 WebSocket application messages remain JSON. Gzip/zstd HTTP bodies are never sent

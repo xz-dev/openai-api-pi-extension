@@ -39,7 +39,7 @@ function events(id: string, items: any[]) {
     usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } } });
   return result;
 }
-async function fixture(t: any, toolTurn = false) {
+async function fixture(t: any, toolTurn = false, omitAnnotations = false) {
   const dir = await mkdtemp(join(tmpdir(), "production-codec-"));
   const source = join(dir, "plugin");
   const pkg = JSON.parse(await readFile(join(project, "package.json"), "utf8"));
@@ -77,7 +77,8 @@ async function fixture(t: any, toolTurn = false) {
       const prior = stored.get(frame.previous_response_id) ?? local.get(frame.previous_response_id);
       assert.ok(!frame.previous_response_id || prior, "parent must exist on this backend");
       const id = `opaque_${++generations}`;
-      const items = toolTurn && generations === 1 ? [reasoning, { ...call, status: "completed" }, { ...grammar, status: "completed" }] : [textItem(id)];
+      const items = toolTurn && generations === 1 ? [reasoning, { ...call, status: "completed" }, { ...grammar, status: "completed" }]
+        : [omitAnnotations ? { ...textItem(id), content: [{ type: "output_text", text: "ok" }] } : textItem(id)];
       const full = [...(prior ?? []), ...frame.input, ...items];
       local.set(id, full); if (frame.store) stored.set(id, full);
       for (const event of events(id, items)) socket.send(JSON.stringify(event));
@@ -115,8 +116,8 @@ async function fixture(t: any, toolTurn = false) {
     cleanup: () => cleanup!(), get generations() { return generations; } };
 }
 
-for (const toolTurn of [false, true]) test(`production-only loader: ${toolTurn ? "function/grammar/encrypted reasoning" : "text"} JSONL resumes, preparation has no side effects`, { timeout: 20000 }, async (t) => {
-  const h = await fixture(t, toolTurn);
+for (const [toolTurn, omitAnnotations] of [[false, false], [true, false], [false, true]]) test(`production-only loader: ${toolTurn ? "function/grammar/encrypted reasoning" : omitAnnotations ? "text without annotations" : "text"} JSONL resumes, preparation has no side effects`, { timeout: 20000 }, async (t) => {
+  const h = await fixture(t, toolTurn, omitAnnotations);
   const session = SessionManager.create(h.dir, h.dir);
   session.appendMessage(user("one"));
   const context = { messages: session.buildSessionContext().messages, ...(toolTurn ? { tools } : {}) };

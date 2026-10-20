@@ -182,7 +182,7 @@ test("function call, encrypted reasoning and tool result survive JSONL and resum
   assert.equal(h.headers.length, 2);
 });
 
-test("actual WS apiKey changes cannot share pooled socket or checkpoint under identical HTTP Authorization", async (t) => {
+test("unused apiKey changes preserve socket/checkpoint; effective Authorization changes isolate both", async (t) => {
   const h = await harness(t);
   const headers = { Authorization: "Bearer identical-http-override" };
   const first: any = await h.makeModels().stream(h.model, { messages: [user("one")] }, { ...h.options, headers }).result();
@@ -191,11 +191,36 @@ test("actual WS apiKey changes cannot share pooled socket or checkpoint under id
     { ...h.options, headers, apiKey: "different-dummy-ws-key" }).result();
   assert.equal(second.stopReason, "stop", second.errorMessage);
   assert.ok(second.responseCheckpoint);
-  assert.deepEqual(h.frames[1], { ...h.frames[0], input: [input("one"), message(first.responseId), input("two")] });
-  assert.deepEqual(h.headers.map((entry) => entry.authorization), ["Bearer dummy-durable-key", "Bearer different-dummy-ws-key"]);
-  assert.equal(h.headers.length, 2);
-  assert.equal(h.frames.length, 2);
-  assert.equal(h.generations, 2);
+  assert.deepEqual(h.frames[1], { ...h.frames[0], previous_response_id: first.responseId, input: [input("two")] });
+  assert.deepEqual(h.headers.map((entry) => entry.authorization), ["Bearer identical-http-override"]);
+  assert.equal(h.headers.length, 1, "unused key must not invalidate pooled socket");
+  const third: any = await h.makeModels().stream(h.model, { messages: [user("one"), first, user("three")] },
+    { ...h.options, headers: { authorization: "Bearer different-actual-credential" } }).result();
+  assert.ok(third.responseCheckpoint, third.errorMessage);
+  assert.deepEqual(h.frames[2], { ...h.frames[0], input: [input("one"), message(first.responseId), input("three")] });
+  assert.deepEqual(h.headers.map((entry) => entry.authorization), ["Bearer identical-http-override", "Bearer different-actual-credential"]);
+  assert.equal(h.frames.length, 3);
+  assert.equal(h.generations, 3);
+});
+
+for (const method of ["stream", "streamSimple"] as const) test(`${method}: model/options Authorization precedence is case-insensitive on wire`, async (t) => {
+  const h = await harness(t);
+  const model = { ...h.model, headers: { Authorization: "Bearer model-credential" } };
+  const first: any = await createOpenAIApiProvider()[method](model, { messages: [user("one")] }, h.options).result();
+  assert.ok(first.responseCheckpoint, first.errorMessage);
+  const second: any = await createOpenAIApiProvider()[method](model, { messages: [user("two")] },
+    { ...h.options, headers: { authorization: "Bearer option-credential" } }).result();
+  assert.ok(second.responseCheckpoint, second.errorMessage);
+  assert.deepEqual(h.headers.map((entry) => entry.authorization), ["Bearer model-credential", "Bearer option-credential"]);
+});
+
+test("cf-aig-authorization is sent without unused automatic Authorization", async (t) => {
+  const h = await harness(t);
+  const output: any = await h.makeModels().stream(h.model, { messages: [user("one")] },
+    { ...h.options, headers: { "cf-aig-authorization": "Bearer cloudflare-credential" } }).result();
+  assert.ok(output.responseCheckpoint, output.errorMessage);
+  assert.equal(h.headers[0]["cf-aig-authorization"], "Bearer cloudflare-credential");
+  assert.equal(h.headers[0].authorization, undefined);
 });
 
 test("malformed truthy capability never enables storage through real provider", async (t) => {

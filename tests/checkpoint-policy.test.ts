@@ -67,3 +67,16 @@ test("checkpoint policy: responseCheckpointMode matrix over compat declaration a
   assert.equal(checkpointsEnabled({ ...custom, baseUrl: "https://api.chatgpt.com/v1" },
     options("always"), []), false, "chatgpt subdomain");
 });
+
+test("checkpoint policy uses effective model/options Authorization, not unused apiKey", () => {
+  const model: any = { provider: "openai", id: "mock", baseUrl: "https://api.openai.com/v1" };
+  const options: any = { transport: "auto", apiKey: "sk-unused" };
+  assert.equal(checkpointsEnabled(model, { ...options, transport: undefined }, []), true, "absent transport defaults to auto");
+  assert.equal(checkpointsEnabled(model, { ...options, headers: { Authorization: "Bearer chatgpt-token" } }, []), false);
+  assert.equal(checkpointsEnabled({ ...model, headers: { Authorization: "Bearer chatgpt-token" } }, options, []), false);
+  assert.equal(checkpointsEnabled({ ...model, headers: { Authorization: "Bearer chatgpt-token" } },
+    { ...options, apiKey: "unused", headers: { authorization: "Bearer sk-effective" } }, []), true);
+  assert.equal(checkpointsEnabled({ ...model, headers: { authorization: "Bearer sk-model" } },
+    { ...options, headers: { Authorization: "Bearer chatgpt-token" } }, []), false);
+  assert.equal(checkpointsEnabled(model, { ...options, headers: { "cf-aig-authorization": "Bearer cf-token" } }, []), false);
+});

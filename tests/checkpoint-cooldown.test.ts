@@ -167,7 +167,7 @@ test("checkpoint probe after cooldown sends store:true + full history; success r
   assert.equal(requests[2]?.store, undefined, "repair drops store");
 
   // Inside cooldown: full history, no store.
-  context.mock.timers.tick(299_999);
+  context.mock.timers.tick(119_999);
   await provider.streamSimple(model(upstream.baseUrl), {
     messages: [...messages, second, { role: "user", content: "three", timestamp: 3 }],
   }, opts).result();
@@ -223,7 +223,7 @@ test("failed checkpoint probe renews the cooldown", { timeout: 10_000 }, async (
   assert.equal(requests[0]?.store, true);
   assert.equal(requests[1]?.store, undefined);
 
-  context.mock.timers.tick(300_000);
+  context.mock.timers.tick(120_000);
   // Probe carries store:true again and is rejected; repair then cooldown renews.
   const second = await provider.streamSimple(model(upstream.baseUrl), {
     messages: [{ role: "user", content: "one", timestamp: 1 }, first, { role: "user", content: "two", timestamp: 2 }],
@@ -277,7 +277,7 @@ test("one checkpoint probe per session; an overlapping request stays off", { tim
   const messages: Message[] = [{ role: "user", content: "one", timestamp: 1 }, first,
     { role: "user", content: "two", timestamp: 2 }];
   await provider.streamSimple(model(upstream.baseUrl), { messages }, opts).result();
-  context.mock.timers.tick(300_000);
+  context.mock.timers.tick(120_000);
 
   const probe = provider.streamSimple(model(upstream.baseUrl), {
     messages: [...messages, { role: "user", content: "three", timestamp: 3 }],
@@ -342,7 +342,7 @@ test("non-signal probe failure renews the cooldown without replay", { timeout: 1
     { messages: [{ role: "user", content: text, timestamp: 1 }] }, opts).result();
   assert.equal((await ask("one")).stopReason, "stop");
   assert.equal(requests.length, 2);
-  context.mock.timers.tick(300_000);
+  context.mock.timers.tick(120_000);
   probeFails = true;
   assert.equal((await ask("probe")).stopReason, "error");
   assert.equal(requests.length, 3, "probe never replayed");
@@ -366,11 +366,14 @@ test("auto with checkpoints on still falls back to SSE on a pre-open handshake f
   await new Promise<void>((resolve) => http.listen(0, "127.0.0.1", resolve));
   const address = http.address();
   assert.ok(address && typeof address === "object");
-  const out = await createOpenAIApiProvider().streamSimple(
+  const provider = createOpenAIApiProvider();
+  const ask = () => provider.streamSimple(
     model(`http://127.0.0.1:${address.port}/v1`),
     { messages: [{ role: "user", content: "one", timestamp: 1 }] },
-    { apiKey: "bridge-key", transport: "auto", sessionId: "checkpoint-handshake-sse", websocketConnectTimeoutMs: 1_000 },
+    { apiKey: "bridge-key", transport: "auto", sessionId: "checkpoint-handshake-sse", maxRetries: 0, websocketConnectTimeoutMs: 1_000 },
   ).result();
+  for (let i = 0; i < 3; i++) assert.equal((await ask()).stopReason, "error");
+  const out = await ask();
   assert.equal(out.stopReason, "stop", out.errorMessage);
   assert.equal(bodies.length, 1);
   assert.notEqual(bodies[0]?.store, true, "SSE fallback never carries store:true");
@@ -403,7 +406,7 @@ test("hook store:false keeps its veto through cooldown and never claims the prob
   assert.equal(requests[3]?.previous_response_id, undefined, "cooldown forces full context");
   assert.ok(Array.isArray(requests[3]?.input) && requests[3].input.length > 2);
   // After the deadline a vetoed request does not consume the probe slot...
-  context.mock.timers.tick(300_000);
+  context.mock.timers.tick(120_000);
   await provider.streamSimple(model(upstream.baseUrl),
     { messages: [{ role: "user", content: "veto", timestamp: 4 }] }, vetoed).result();
   assert.equal(requests[4]?.store, false);
@@ -500,7 +503,7 @@ test("aborted probe releases its claim without renewing; next request probes", {
   const ask = (text: string, signal?: AbortSignal) => provider.streamSimple(model(upstream.baseUrl),
     { messages: [{ role: "user", content: text, timestamp: 1 }] }, { ...opts, signal }).result();
   await ask("one");
-  context.mock.timers.tick(300_000);
+  context.mock.timers.tick(120_000);
   hold = true;
   const controller = new AbortController();
   const probe = ask("probe", controller.signal);
@@ -529,7 +532,7 @@ test("probe that captures nothing renews the cooldown", { timeout: 10_000 }, asy
   const ask = (text: string) => provider.streamSimple(model(upstream.baseUrl),
     { messages: [{ role: "user", content: text, timestamp: 1 }] }, opts).result();
   await ask("one");
-  context.mock.timers.tick(300_000);
+  context.mock.timers.tick(120_000);
   assert.equal((await ask("probe")).stopReason, "stop");
   assert.equal(requests.at(-1)?.store, true);
   await ask("next");
@@ -627,7 +630,7 @@ test("cooldown keeps chaining an inherited caller-rooted descendant", { timeout:
   assert.equal(requests[4]?.previous_response_id, descendant.responseId);
   assert.equal(requests[4]?.store, false);
   // After expiry the probe keeps chaining and captures nothing.
-  context.mock.timers.tick(300_000);
+  context.mock.timers.tick(120_000);
   const probe: any = await provider.streamSimple(model(upstream.baseUrl),
     { messages: [...vetoMessages, vetoed, { role: "user", content: "probe", timestamp: 5 }] }, opts).result();
   assert.equal(probe.stopReason, "stop", probe.errorMessage);
@@ -644,13 +647,16 @@ test("checkpoint cooldown is partitioned by Authorization-header credential", { 
     completed(socket, `resp_${requests.length}`, "ok");
   });
   const provider = createOpenAIApiProvider();
-  const { apiKey: _apiKey, ...base } = options("header-credential-partition");
+  const base = options("header-credential-partition");
   await provider.streamSimple(model(upstream.baseUrl), { messages: [{ role: "user", content: "a", timestamp: 1 }] },
     { ...base, headers: { Authorization: "Bearer account-a" } }).result();
   assert.equal(requests.length, 2);
+  await provider.streamSimple(model(upstream.baseUrl), { messages: [{ role: "user", content: "same", timestamp: 1 }] },
+    { ...base, apiKey: "different-unused-key", headers: { authorization: "Bearer account-a" } }).result();
+  assert.equal(requests[2]?.store, undefined, "unused apiKey change retains actual account cooldown");
   await provider.streamSimple(model(upstream.baseUrl), { messages: [{ role: "user", content: "b", timestamp: 1 }] },
     { ...base, headers: { Authorization: "Bearer account-b" } }).result();
-  assert.equal(requests[2]?.store, true, "account B is not cooled down by account A");
+  assert.equal(requests[3]?.store, true, "account B is not cooled down by account A");
 });
 
 for (const transport of ["auto", "websocket-cached"] as const) {
@@ -716,4 +722,184 @@ test("prod gateway output (logprobs: []) captures checkpoints, chains deltas and
   assert.equal(repair.previous_response_id, undefined);
   assert.equal(repair.store, undefined);
   assert.equal((repair.input as unknown[]).length, 5);
+});
+
+test("checkpoint failures step 2/3/4/5/5 minutes; captured success resets progression", { timeout: 10_000 }, async (context) => {
+  context.mock.timers.enable({ apis: ["Date"], now: 0 });
+  const requests: Array<Record<string, unknown>> = [];
+  let rejects = true;
+  const upstream = await server((body, _connection, socket) => {
+    requests.push(body);
+    if (rejects && body.store === true) { reject(socket, REFERENCE_FAILURES.storeRejected); return; }
+    completed(socket, `resp_${requests.length}`, "ok");
+  });
+  const provider = createOpenAIApiProvider();
+  const opts = { ...options("probe-progression"), maxRetries: 0 };
+  const ask = () => provider.streamSimple(model(upstream.baseUrl),
+    { messages: [{ role: "user", content: "one", timestamp: 1 }] }, opts).result();
+  assert.equal((await ask()).stopReason, "stop");
+  for (const minutes of [2, 3, 4, 5, 5]) {
+    context.mock.timers.tick(minutes * 60_000 - 1);
+    await ask();
+    assert.equal(requests.at(-1)?.store, undefined, `suppressed before ${minutes}-minute deadline`);
+    context.mock.timers.tick(1);
+    await ask();
+    assert.equal(requests.at(-2)?.store, true, `probe at ${minutes}-minute deadline`);
+    assert.equal(requests.at(-1)?.store, undefined, "one store-off repair");
+  }
+  rejects = false;
+  context.mock.timers.tick(300_000);
+  const success: any = await ask();
+  assert.ok(success.responseCheckpoint, success.errorMessage);
+  rejects = true;
+  await ask();
+  context.mock.timers.tick(119_999);
+  await ask(); assert.equal(requests.at(-1)?.store, undefined);
+  context.mock.timers.tick(1);
+  await ask(); assert.equal(requests.at(-2)?.store, true, "new failure starts at two minutes again");
+});
+
+test("held rejected probe and failed repair keep single ownership and advance only once", { timeout: 10_000 }, async (context) => {
+  context.mock.timers.enable({ apis: ["Date"], now: 0 });
+  const requests: Array<Record<string, unknown>> = [];
+  let heldSocket: import("ws").WebSocket | undefined;
+  let markHeld!: () => void;
+  const held = new Promise<void>((resolve) => { markHeld = resolve; });
+  const upstream = await server((body, _connection, socket) => {
+    requests.push(body);
+    if (body.store === true) { reject(socket, REFERENCE_FAILURES.storeRejected); return; }
+    if (requests.length === 4) { heldSocket = socket; markHeld(); return; }
+    completed(socket, `resp_${requests.length}`, "ok");
+  });
+  const provider = createOpenAIApiProvider();
+  const opts = { ...options("probe-held-failed-repair"), maxRetries: 0 };
+  const ask = () => provider.streamSimple(model(upstream.baseUrl),
+    { messages: [{ role: "user", content: "one", timestamp: 1 }] }, opts).result();
+  await ask();
+  context.mock.timers.tick(120_000);
+  const probe = ask(); await held;
+  assert.equal(requests[2]?.store, true);
+  assert.equal(requests[3]?.store, undefined);
+  context.mock.timers.tick(240_000); // renewed deadline elapsed, repair still owns probe
+  await ask();
+  assert.equal(requests.at(-1)?.store, undefined, "repair cannot release owner before it settles");
+  heldSocket!.send(JSON.stringify({ type: "error", status: 500, error: { type: "server_error", message: "repair failed" } }));
+  assert.equal((await probe).stopReason, "error");
+  assert.equal(requests.length, 5, "no replay after failed full-history repair");
+  context.mock.timers.tick(179_999);
+  await ask(); assert.equal(requests.at(-1)?.store, undefined);
+  context.mock.timers.tick(1);
+  await ask(); assert.equal(requests.at(-2)?.store, true, "repair failure renews three minutes, not four");
+});
+
+test("unsent handshake, abort and SSE-only requests leave checkpoint probe immediately available", { timeout: 10_000 }, async (context) => {
+  context.mock.timers.enable({ apis: ["Date"], now: 0 });
+  const requests: Array<Record<string, unknown>> = [];
+  const upstream = await server((body, _connection, socket) => {
+    requests.push(body);
+    if (body.store === true && requests.length === 1) { reject(socket, REFERENCE_FAILURES.storeRejected); return; }
+    completed(socket, `resp_${requests.length}`, "ok");
+  });
+  const wss = servers.at(-1) as WebSocketServer;
+  const provider = createOpenAIApiProvider();
+  const opts = { ...options("probe-unsent"), maxRetries: 0 };
+  const ask = (extra: Record<string, unknown> = {}) => provider.streamSimple(model(upstream.baseUrl),
+    { messages: [{ role: "user", content: "one", timestamp: 1 }] }, { ...opts, ...extra }).result();
+  await ask(); context.mock.timers.tick(120_000);
+  await Promise.all([...wss.clients].map((socket) => new Promise<void>((resolve) => {
+    socket.once("close", () => resolve()); socket.close(1000, "force handshake probe");
+  })));
+  wss.options.verifyClient = (_info, done) => done(false, 503);
+  assert.equal((await ask()).stopReason, "error");
+  assert.equal(requests.length, 2, "failed handshake transmits no frame");
+  wss.options.verifyClient = undefined;
+  const controller = new AbortController(); controller.abort();
+  assert.equal((await ask({ signal: controller.signal })).stopReason, "aborted");
+  const sse = responseEvents("resp_sse_only", "ok").map((event) => `data: ${JSON.stringify(event)}\n\n`).join("") + "data: [DONE]\n\n";
+  assert.equal((await ask({ transport: "sse", fetch: async () => new Response(sse, { headers: { "content-type": "text/event-stream" } }) })).stopReason, "stop");
+  const success: any = await ask();
+  assert.equal(requests.at(-1)?.store, true, "unsent/abort/SSE neither renew nor consume progression");
+  assert.ok(success.responseCheckpoint, success.errorMessage);
+});
+
+test("transport SSE cooldown never consumes expired checkpoint probe; WS recovery can own both", { timeout: 10_000 }, async (context) => {
+  context.mock.timers.enable({ apis: ["Date"], now: 0 });
+  const requests: Array<Record<string, unknown>> = [];
+  const upstream = await server((body, _connection, socket) => {
+    requests.push(body);
+    if (requests.length === 1) { reject(socket, REFERENCE_FAILURES.storeRejected); return; }
+    completed(socket, `resp_${requests.length}`, "ok");
+  });
+  const wss = servers.at(-1) as WebSocketServer;
+  const provider = createOpenAIApiProvider();
+  let sse = 0;
+  const opts = { ...options("independent-probes"), transport: "auto" as const, maxRetries: 0,
+    fetch: async () => {
+      sse++;
+      return new Response(responseEvents(`resp_sse_${sse}`, "ok").map((event) => `data: ${JSON.stringify(event)}\n\n`).join("") + "data: [DONE]\n\n",
+        { headers: { "content-type": "text/event-stream" } });
+    } };
+  const ask = () => provider.streamSimple(model(upstream.baseUrl),
+    { messages: [{ role: "user", content: "one", timestamp: 1 }] }, opts).result();
+  await ask();
+  context.mock.timers.tick(60_000);
+  await Promise.all([...wss.clients].map((socket) => new Promise<void>((resolve) => {
+    socket.once("close", () => resolve()); socket.close(1000, "force handshake");
+  })));
+  wss.options.verifyClient = (_info, done) => done(false, 503);
+  for (let i = 0; i < 3; i++) assert.equal((await ask()).stopReason, "error");
+  assert.equal((await ask()).stopReason, "stop");
+  context.mock.timers.tick(60_000); // checkpoint deadline reached; transport still cooled
+  assert.equal((await ask()).stopReason, "stop");
+  assert.equal(sse, 2);
+  assert.equal(requests.length, 2, "SSE-only attempts cannot transmit/consume checkpoint probe");
+  wss.options.verifyClient = undefined;
+  context.mock.timers.tick(60_000);
+  const recovered: any = await ask();
+  assert.equal(requests.at(-1)?.store, true, "one admitted WS request probes independent storage state too");
+  assert.equal(requests.at(-1)?.previous_response_id, undefined);
+  assert.ok(recovered.responseCheckpoint, recovered.errorMessage);
+});
+
+test("late captured success resets progression but only owner clears checkpoint deadline", { timeout: 10_000 }, async (context) => {
+  context.mock.timers.enable({ apis: ["Date"], now: 0 });
+  const requests: Array<Record<string, unknown>> = [];
+  let oldSocket!: import("ws").WebSocket;
+  let probeSocket!: import("ws").WebSocket;
+  let markOld!: () => void;
+  let markProbe!: () => void;
+  const oldSeen = new Promise<void>((resolve) => { markOld = resolve; });
+  const probeSeen = new Promise<void>((resolve) => { markProbe = resolve; });
+  const upstream = await server((body, _connection, socket) => {
+    requests.push(body);
+    if (requests.length === 1) { oldSocket = socket; markOld(); return; }
+    if (requests.length === 2) { reject(socket, REFERENCE_FAILURES.storeRejected); return; }
+    if (requests.length === 4) { probeSocket = socket; markProbe(); return; }
+    completed(socket, `resp_${requests.length}`, "ok");
+  });
+  const provider = createOpenAIApiProvider();
+  const opts = { ...options("late-checkpoint-owner"), maxRetries: 0 };
+  const ask = () => provider.streamSimple(model(upstream.baseUrl),
+    { messages: [{ role: "user", content: "one", timestamp: 1 }] }, opts).result();
+  const old = ask(); await oldSeen;
+  await ask();
+  context.mock.timers.tick(120_000);
+  const probe = ask(); await probeSeen;
+  completed(oldSocket, "resp_old", "ok");
+  assert.ok((await old as any).responseCheckpoint, "late success captured valid checkpoint");
+  await ask(); assert.equal(requests.at(-1)?.store, undefined, "non-owner success cannot clear active deadline/claim");
+  for (const event of responseEvents("resp_probe", "ok")) {
+    if (event.type === "response.completed") (event as any).response.store = false;
+    probeSocket.send(JSON.stringify(event));
+  }
+  assert.equal((await probe).stopReason, "stop");
+  context.mock.timers.tick(119_999);
+  await ask(); assert.equal(requests.at(-1)?.store, undefined);
+  context.mock.timers.tick(1);
+  const success: any = await ask();
+  assert.equal(requests.at(-1)?.store, true, "late captured success reset next duration to two minutes");
+  assert.ok(success.responseCheckpoint, success.errorMessage);
+  const immediate: any = await ask();
+  assert.equal(requests.at(-1)?.store, true, "owner success cleared cooldown");
+  assert.ok(immediate.responseCheckpoint, immediate.errorMessage);
 });

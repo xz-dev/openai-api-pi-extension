@@ -26,7 +26,9 @@ fork, not a second native WebSocket planner.
 Malformed mode values disable checkpoints. All modes still enforce transport,
 authentication, history and explicit payload exclusions. SSE, uncached
 `websocket`, unsupported Codex/ChatGPT modes and `cacheRetention: "none"` do not
-enable this extension feature.
+enable this extension feature. Absent transport resolves to `auto` for both
+provider stream entry points. The official OpenAI API-key guard checks effective
+Authorization, including model/request header overrides, not an unused `apiKey`.
 
 `responseCheckpointExclude` is an independent per-target opt-out. Absent and
 `[]` allow otherwise eligible targets; `["*"]` excludes all. To opt out in
@@ -95,16 +97,25 @@ changing these storage rules.
 
 ## Verification cooldown
 
-The first proven pre-execution reference failure repairs the turn once with
-full history, without `store` or `previous_response_id`, then starts a
-five-minute per-endpoint/session cooldown. Recognized failures include
+The first proven pre-execution reference failure starts a two-minute
+per-endpoint/session/effective-header-identity cooldown and repairs the turn
+once with full history, without `store` or `previous_response_id`. Recognized failures include
 `previous_response_not_found`, a code-less `previous_response_id is not
 available` rejection, rejection of `store`, and a previous-response capability
 rejection.
 
-During cooldown, send full history without storage. After the deadline, the
-next real request probes once with `store: true` and full history. Success
-clears the state; failure renews it. No background probes or persisted cooldown.
+During cooldown, send full history without storage; an explicit `store: false`
+veto and caller-owned ancestry remain intact. After the deadline, one real
+request probes with `store: true` and full history while overlapping requests
+stay checkpoint-free. Failed admitted/sent probes step to three, four and at
+most five minutes. A rejection and its failed full-history repair count as one
+logical probe: renew the same deadline, never advance twice or release ownership
+while repair runs. A completed probe with no captured checkpoint also renews.
+
+Only a valid captured checkpoint resets progression; only its owning probe can
+clear the active deadline. Aborted or unsent attempts only release their claim;
+SSE-only requests do not claim it. Checkpoint and transport cooldowns progress
+independently. No background probes or persisted cooldown.
 
 ## Reconnect without checkpoint metadata
 

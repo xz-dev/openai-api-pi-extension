@@ -93,7 +93,7 @@ test("complete provider sends Responses request through resolved auth and stream
   const output = await models.complete(
     model,
     { systemPrompt: "Be concise.", messages: [{ role: "user", content: "ping", timestamp: 1 }] },
-    { reasoningEffort: "high", maxRetries: 0 },
+    { transport: "sse", reasoningEffort: "high", maxRetries: 0 },
   );
 
   assert.equal(output.stopReason, "stop", output.errorMessage ?? "Responses request failed");

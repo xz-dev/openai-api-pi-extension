@@ -78,8 +78,9 @@ for (const method of ["stream", "streamSimple"] as const) {
       assert.equal(second.responseId, "resp_2");
       assert.equal(frames.length, 2);
       assert.equal(generations, 2);
-      const usesSse = transport === "sse" || transport === undefined;
-      const cached = transport === "auto" || transport === "websocket-cached";
+      const usesSse = transport === "sse";
+      const cached = transport === undefined || transport === "auto" || transport === "websocket-cached";
+      assert.equal(!!(first as any).responseCheckpoint, cached, "resolved default also enables checkpoint capture");
       assert.equal(httpRequests, usesSse ? 2 : 0);
       assert.equal(wsConnections, usesSse ? 0 : cached ? 1 : 2);
       const firstInput = [{ role: "system", content: "Use tools." },
@@ -177,17 +178,20 @@ test("auto reports actual SSE fallback; rejected observer cannot replay inferenc
     baseUrl: `http://127.0.0.1:${address.port}/v1`, reasoning: false, input: ["text"] as ["text"],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 128000, maxTokens: 1024 };
   const labels: Array<string | undefined> = [];
-  const output = await createOpenAIApiProvider().streamSimple(model,
+  const provider = createOpenAIApiProvider();
+  const ask = () => provider.streamSimple(model,
     { messages: [{ role: "user", content: "one", timestamp: 1 }] },
-    { apiKey: "dummy-fallback-key", transport: "auto", sessionId: "fallback-observer", maxRetries: 2,
+    { apiKey: "dummy-fallback-key", transport: "auto", sessionId: "fallback-observer", maxRetries: 0,
       onTransport: async (label: string | undefined, actualModel: typeof model) => {
         labels.push(label);
         assert.equal(actualModel, model);
         throw new Error("observer unavailable");
       } }).result();
+  for (let i = 0; i < 3; i++) assert.equal((await ask()).stopReason, "error");
+  const output = await ask();
   assert.equal(output.stopReason, "stop", output.errorMessage);
   assert.deepEqual(labels, ["SSE Zstd"]);
-  assert.equal(upgrades, 1);
+  assert.equal(upgrades, 4, "three native WS retries precede fallback");
   assert.equal(generations, 1);
   assert.equal(getActualResponsesTransport(model.baseUrl, "fallback-observer"), "sse");
 });

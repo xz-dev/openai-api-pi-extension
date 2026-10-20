@@ -438,9 +438,10 @@ export function createOpenAIApiProvider(
       }
     },
     stream: (model, context, options) => {
+      options = { ...options, transport: options?.transport ?? "auto" };
       const filteredContext = { ...context, messages: dropEmptyMessages(context.messages) };
       const requestContext = normalizeContext?.(filteredContext) ?? filteredContext;
-      if (!options?.transport || options.transport === "sse") {
+      if (options.transport === "sse") {
         recordActualResponsesTransport(model.baseUrl, "sse", options?.sessionId);
         // Host skips automatic encoding for a custom fetch: opt in at the wire.
         const wireFetch = compressionFetch(options?.fetch ?? globalThis.fetch);
@@ -457,9 +458,10 @@ export function createOpenAIApiProvider(
       );
     },
     streamSimple: (model, context, options) => {
+      options = { ...options, transport: options?.transport ?? "auto" };
       const filteredContext = { ...context, messages: dropEmptyMessages(context.messages) };
       const requestContext = normalizeContext?.(filteredContext) ?? filteredContext;
-      if (!options?.transport || options.transport === "sse") {
+      if (options.transport === "sse") {
         recordActualResponsesTransport(model.baseUrl, "sse", options?.sessionId);
         const wireFetch = compressionFetch(options?.fetch ?? globalThis.fetch);
         return redactAssistantStream(api.streamSimple(model, requestContext, { ...options, transport: "sse", fetch: wireFetch }), options?.apiKey);

@@ -665,7 +665,7 @@ for (const transport of ["auto", "websocket-cached"] as const) {
   }
 }
 
-test("auto falls back on cached failure and recovers with full context on the next request", async () => {
+test("auto cached failure uses native WS retry budget and next request recovers with full context", async () => {
   const requests: Array<{ body: Record<string, unknown>; connection: number }> = [];
   let sseFallbacks = 0;
   const upstream = await server((body, connection, socket) => {
@@ -709,9 +709,8 @@ test("auto falls back on cached failure and recovers with full context on the ne
     { role: "user" as const, content: "two", timestamp: 2 },
   ];
   const fallback = await provider.streamSimple(model(upstream.baseUrl), { messages }, options).result();
-  assert.equal(fallback.stopReason, "stop", fallback.errorMessage);
-  assert.equal(fallback.content[0]?.text, "fallback ok");
-  assert.equal(sseFallbacks, 1);
+  assert.equal(fallback.stopReason, "error", "first transport failure remains within native WS retry budget");
+  assert.equal(sseFallbacks, 0);
   assert.equal(upstream.connections, 1);
   assert.equal(requests.length, 2);
 
@@ -723,14 +722,14 @@ test("auto falls back on cached failure and recovers with full context on the ne
 
   assert.equal(recovered.stopReason, "stop", recovered.errorMessage ?? "Fresh WebSocket recovery failed");
   assert.equal(recovered.content[0]?.text, "fresh recovery");
-  assert.equal(sseFallbacks, 1);
+  assert.equal(sseFallbacks, 0);
   assert.equal(upstream.connections, 2);
   assert.equal(requests.length, 3);
   assert.equal(requests[1]?.connection, 1);
   assert.equal(requests[1]?.body.previous_response_id, "resp_cached");
   assert.deepEqual(requests[1]?.body.input, [{ role: "user", content: [{ type: "input_text", text: "two" }] }]);
   assert.equal(requests[2]?.connection, 2);
-  assert.equal(requests[2]?.body.previous_response_id, undefined);
+  assert.equal(requests[2]?.body.previous_response_id, "caller-provided", "fresh recovery preserves explicit caller ancestry");
   const freshInput = requests[2]?.body.input;
   assert.ok(Array.isArray(freshInput));
   assert.ok(freshInput.length > 1);
@@ -738,7 +737,7 @@ test("auto falls back on cached failure and recovers with full context on the ne
   assert.deepEqual(freshInput.at(-1), { role: "user", content: [{ type: "input_text", text: "three" }] });
 });
 
-test("auto cools down only after the next-request fresh WebSocket also fails", async (context) => {
+test("auto cached and fresh failures exhaust three WS retries before SSE cooldown", async (context) => {
   context.mock.timers.enable({ apis: ["Date"], now: 0 });
   const fallback = await sseServer("fallback ok");
   const wss = new WebSocketServer({ noServer: true });
@@ -786,35 +785,28 @@ test("auto cools down only after the next-request fresh WebSocket also fails", a
     options,
   ).result();
 
-  assert.equal(fallbackOutput.stopReason, "stop", fallbackOutput.errorMessage ?? "SSE fallback failed");
-  assert.equal(fallbackOutput.content[0]?.type, "text");
-  assert.equal(fallbackOutput.content[0]?.text, "fallback ok");
+  assert.equal(fallbackOutput.stopReason, "error");
   assert.equal(upgradeAttempts, 1);
   assert.equal(connections, 1);
   assert.equal(websocketRequests, 2);
+  assert.equal(fallback.requests, 0);
+  const request = () => provider.streamSimple(model(fallback.baseUrl),
+    { messages: [{ role: "user", content: "fresh retry", timestamp: 3 }] }, { ...options, maxRetries: 0 }).result();
+  for (let i = 0; i < 2; i++) assert.equal((await request()).stopReason, "error");
+  assert.equal(upgradeAttempts, 3);
+  assert.equal(fallback.requests, 0);
+  assert.equal((await request()).stopReason, "stop");
+  assert.equal(upgradeAttempts, 4);
+  assert.equal(connections, 4);
+  assert.equal(websocketRequests, 5);
   assert.equal(fallback.requests, 1);
-  assert.equal(getActualResponsesTransport(fallback.baseUrl, options.sessionId), "sse");
-
-  await provider.streamSimple(
-    model(fallback.baseUrl),
-    { messages: [{ role: "user", content: "fresh retry", timestamp: 3 }] },
-    options,
-  ).result();
-  assert.equal(upgradeAttempts, 2);
-  assert.equal(connections, 2);
-  assert.equal(websocketRequests, 3);
+  await request();
+  assert.equal(upgradeAttempts, 4);
   assert.equal(fallback.requests, 2);
-
-  await provider.streamSimple(
-    model(fallback.baseUrl),
-    { messages: [{ role: "user", content: "during cooldown", timestamp: 4 }] },
-    options,
-  ).result();
-  assert.equal(upgradeAttempts, 2);
-  assert.equal(fallback.requests, 3);
 });
 
-test("auto keeps provider retries on SSE and reserves fresh WebSocket recovery for the next request", async () => {
+test("auto keeps provider retries on SSE; only next post-cooldown request probes WS", async (context) => {
+  context.mock.timers.enable({ apis: ["Date"], now: 0 });
   const fallback = await sseServer("fallback ok");
   const wss = new WebSocketServer({ noServer: true });
   servers.push(wss);
@@ -842,24 +834,26 @@ test("auto keeps provider retries on SSE and reserves fresh WebSocket recovery f
       return fetch(input, init);
     },
   };
-  const request = () => provider.streamSimple(
+  const request = (maxRetries = options.maxRetries) => provider.streamSimple(
     model(fallback.baseUrl),
     { messages: [{ role: "user", content: "ping", timestamp: 1 }] },
-    options,
+    { ...options, maxRetries },
   ).result();
 
+  for (let i = 0; i < 3; i++) assert.equal((await request(0)).stopReason, "error");
   const first = await request();
   assert.equal(first.stopReason, "stop", first.errorMessage);
   assert.equal(first.content[0]?.text, "fallback ok");
   assert.equal(fetchAttempts, 2, "Pi still retries a retryable SSE response");
-  assert.equal(upgradeAttempts, 1, "provider retry must remain SSE within the same logical request");
+  assert.equal(upgradeAttempts, 4, "provider retry must remain SSE within the same logical request");
   assert.equal(fallback.requests, 1);
 
   websocketAvailable = true;
+  context.mock.timers.tick(120_000);
   const recovered = await request();
   assert.equal(recovered.stopReason, "stop", recovered.errorMessage);
   assert.equal(recovered.content[0]?.text, "websocket recovered");
-  assert.equal(upgradeAttempts, 2, "only the next real request may probe a fresh WebSocket");
+  assert.equal(upgradeAttempts, 5, "only a post-cooldown real request may probe a fresh WebSocket");
   assert.equal(fetchAttempts, 2);
 });
 
@@ -915,12 +909,252 @@ test("auto does not retry a reused cached WebSocket after an API error event", a
     options,
   ).result();
 
-  assert.equal(output.stopReason, "stop", output.errorMessage ?? "SSE fallback failed");
-  assert.equal(output.content[0]?.type, "text");
-  assert.equal(output.content[0]?.text, "fallback ok");
+  assert.equal(output.stopReason, "error");
   assert.equal(upgradeAttempts, 1);
-  assert.equal(websocketRequests, 2);
-  assert.equal(fallback.requests, 1);
+  assert.equal(websocketRequests, 2, "API error cannot replay this request");
+  assert.equal(fallback.requests, 0);
+});
+
+for (const started of [false, true]) {
+  for (const failure of ["api", "failed", "protocol", "disconnect"] as const) {
+    test(`auto accounts only transport failures: ${failure}, started=${started}`, async () => {
+      const fallback = await sseServer("fallback ok");
+      const wss = new WebSocketServer({ noServer: true });
+      servers.push(wss);
+      let frames = 0;
+      let succeed = false;
+      fallback.server.on("upgrade", (request, socket, head) => {
+        wss.handleUpgrade(request, socket, head, (client) => wss.emit("connection", client, request));
+      });
+      wss.on("connection", (socket) => socket.on("message", () => {
+        frames++;
+        if (succeed) { completed(socket, "resp_recovered", "recovered"); return; }
+        const reject = () => {
+          if (failure === "disconnect") socket.terminate();
+          else if (failure === "protocol") socket.send("not JSON");
+          else {
+            const error = { type: "invalid_request_error", code: "invalid_request", message: "request rejected" };
+            socket.send(JSON.stringify(failure === "api" ? { type: "error", error }
+              : { type: "response.failed", response: { id: "resp_failed", error } }));
+          }
+        };
+        if (started) socket.send(JSON.stringify({ type: "response.created", response: { id: "resp_started" } }), reject);
+        else reject();
+      }));
+      const provider = createOpenAIApiProvider();
+      const request = () => provider.streamSimple(model(fallback.baseUrl),
+        { messages: [{ role: "user", content: "ping", timestamp: 1 }] },
+        { apiKey: "bridge-key", transport: "auto", sessionId: `provenance-${failure}-${started}`,
+          responseCheckpointExclude: ["*"], maxRetries: 0, timeoutMs: 100 }).result();
+      const reasons = [];
+      for (let i = 0; i < 4; i++) reasons.push((await request()).stopReason);
+      assert.equal(frames, 4);
+      if (failure === "disconnect") {
+        assert.deepEqual(reasons, started ? ["error", "error", "error", "error"] : ["error", "error", "error", "stop"]);
+        assert.equal(fallback.requests, started ? 0 : 1, "never replay a started response");
+        assert.equal((await request()).stopReason, "stop");
+        assert.equal(frames, 4, "real disconnects exhaust transport budget");
+      } else {
+        assert.deepEqual(reasons, ["error", "error", "error", "error"]);
+        assert.equal(fallback.requests, 0, "API/protocol failures never open transport cooldown");
+        succeed = true;
+        assert.equal((await request()).stopReason, "stop");
+        assert.equal(frames, 5, "next valid request still uses WS");
+        assert.equal(fallback.requests, 0);
+      }
+    });
+  }
+}
+
+for (const transport of [undefined, "auto", "websocket", "websocket-cached"] as const) {
+  for (const repeated of [false, true]) {
+    test(`connection limit retries once on fresh WS: ${transport ?? "default"}, repeated=${repeated}`, async () => {
+      const requests: Array<{ body: Record<string, unknown>; connection: number }> = [];
+      const upstream = await server((body, connection, socket) => {
+        requests.push({ body, connection });
+        if (requests.length === 1 || repeated) socket.send(JSON.stringify({ type: "error",
+          error: { type: "invalid_request_error", code: "websocket_connection_limit_reached", message: "connection full" } }));
+        else completed(socket, "resp_replacement", "replacement ok");
+      });
+      let sse = 0;
+      const output = await createOpenAIApiProvider().streamSimple(model(upstream.baseUrl),
+        { messages: [{ role: "user", content: "ping", timestamp: 1 }] },
+        { apiKey: "bridge-key", ...(transport ? { transport } : {}), sessionId: "connection-limit",
+          maxRetries: 0, fetch: async () => { sse++; throw new Error("SSE must not replay"); } }).result();
+      assert.equal(requests.length, 2, "one special retry independent of maxRetries:0");
+      assert.deepEqual(requests.map((request) => request.connection), [1, 2]);
+      assert.deepEqual(requests[1]?.body, requests[0]?.body);
+      assert.equal(output.stopReason, repeated ? "error" : "stop", output.errorMessage);
+      assert.equal(sse, 0);
+    });
+  }
+}
+
+for (const envelope of ["nested", "top-level", "response.failed"] as const) {
+  test(`repeated connection limits enter transport cooldown: ${envelope}`, async () => {
+    let frames = 0;
+    let sse = 0;
+    const upstream = await server((_body, _connection, socket) => {
+      frames++;
+      const error = { code: "websocket_connection_limit_reached", message: "connection full" };
+      socket.send(JSON.stringify(envelope === "response.failed" ? { type: envelope, response: { error } }
+        : envelope === "top-level" ? { type: "error", ...error } : { type: "error", error }));
+    });
+    const provider = createOpenAIApiProvider();
+    const request = () => provider.streamSimple(model(upstream.baseUrl),
+      { messages: [{ role: "user", content: "ping", timestamp: 1 }] },
+      { apiKey: "bridge-key", transport: "auto", sessionId: `limit-${envelope}`, maxRetries: 0,
+        fetch: async () => {
+          sse++;
+          return new Response(responseEvents("resp_sse", "fallback ok")
+            .map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""),
+          { headers: { "content-type": "text/event-stream" } });
+        } }).result();
+    for (let i = 0; i < 3; i++) {
+      assert.equal((await request()).stopReason, "error");
+      assert.equal(frames, (i + 1) * 2);
+      assert.equal(sse, 0);
+    }
+    assert.equal((await request()).stopReason, "stop");
+    assert.equal(frames, 8, "one fresh retry per default-durable request at maxRetries:0");
+    assert.equal(upstream.connections, 8);
+    assert.equal(sse, 1, "fourth repeated limit selects SSE");
+    assert.equal((await request()).stopReason, "stop");
+    assert.equal(frames, 8, "following request stays SSE during cooldown");
+    assert.equal(sse, 2);
+  });
+}
+
+test("connection limits keep one fresh retry across provider retries", async () => {
+  let frames = 0;
+  let sse = 0;
+  const upstream = await server((_body, _connection, socket) => {
+    frames++;
+    socket.send(JSON.stringify({ type: "error",
+      error: { code: "websocket_connection_limit_reached", message: "connection full" } }));
+  });
+  const provider = createOpenAIApiProvider();
+  const request = () => provider.streamSimple(model(upstream.baseUrl),
+    { messages: [{ role: "user", content: "ping", timestamp: 1 }] },
+    { apiKey: "bridge-key", transport: "auto", sessionId: "limit-provider-retries", maxRetries: 2,
+      fetch: async () => {
+        sse++;
+        return new Response(responseEvents("resp_sse", "fallback ok")
+          .map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""),
+        { headers: { "content-type": "text/event-stream" } });
+      } }).result();
+  assert.equal((await request()).stopReason, "error");
+  assert.equal(frames, 4, "two initial frames, then one frame per provider retry");
+  assert.equal(sse, 0, "three accounted failures do not select SSE");
+  assert.equal((await request()).stopReason, "stop");
+  assert.equal(frames, 6, "next logical request has its own single fresh retry");
+  assert.equal(sse, 1, "fourth accounted failure selects SSE");
+});
+
+test("connection limit after consumed durable reference repair stays terminal", async () => {
+  let frames = 0;
+  let sse = 0;
+  const upstream = await server((_body, _connection, socket) => {
+    frames++;
+    const code = frames === 1 ? "previous_response_not_found" : "websocket_connection_limit_reached";
+    socket.send(JSON.stringify({ type: "error", error: { code, message: "request rejected" } }));
+  });
+  const output = await createOpenAIApiProvider().streamSimple(model(upstream.baseUrl),
+    { messages: [{ role: "user", content: "ping", timestamp: 1 }] },
+    { apiKey: "bridge-key", transport: "auto", sessionId: "limit-consumed-repair", maxRetries: 2,
+      fetch: async () => { sse++; throw new Error("SSE must not replay"); } }).result();
+  assert.equal(output.stopReason, "error");
+  assert.equal(frames, 2, "consumed repair cannot gain a limit retry or provider replay");
+  assert.equal(sse, 0);
+});
+
+test("sessionless auto falls back after one fresh connection-limit retry", async () => {
+  let frames = 0;
+  let sse = 0;
+  const upstream = await server((_body, _connection, socket) => {
+    frames++;
+    socket.send(JSON.stringify({ type: "error",
+      error: { code: "websocket_connection_limit_reached", message: "connection full" } }));
+  });
+  const output = await createOpenAIApiProvider().streamSimple(model(upstream.baseUrl),
+    { messages: [{ role: "user", content: "ping", timestamp: 1 }] },
+    { apiKey: "bridge-key", transport: "auto", maxRetries: 0, fetch: async () => {
+      sse++;
+      return new Response(responseEvents("resp_sse", "fallback ok")
+        .map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""),
+      { headers: { "content-type": "text/event-stream" } });
+    } }).result();
+  assert.equal(output.stopReason, "stop", output.errorMessage);
+  assert.equal(frames, 2);
+  assert.equal(upstream.connections, 2);
+  assert.equal(sse, 1);
+});
+
+for (const maxRetries of [0, 2]) {
+  test(`connection limit retries checkpoint-excluded caller parent unchanged: maxRetries=${maxRetries}`, async () => {
+    const requests: Array<Record<string, unknown>> = [];
+    let sse = 0;
+    const upstream = await server((body, _connection, socket) => {
+      requests.push(body);
+      if (requests.length === 1) socket.send(JSON.stringify({ type: "error",
+        error: { code: "websocket_connection_limit_reached", message: "connection full" } }));
+      else completed(socket, "resp_replacement", "replacement ok");
+    });
+    const output = await createOpenAIApiProvider().streamSimple(model(upstream.baseUrl),
+      { messages: [{ role: "user", content: "ping", timestamp: 1 }] },
+      { apiKey: "bridge-key", transport: "auto", sessionId: `limit-caller-optout-${maxRetries}`, maxRetries,
+        responseCheckpointExclude: ["*"],
+        onPayload: (payload) => ({ ...payload as object, previous_response_id: "caller-parent" }),
+        fetch: async () => { sse++; throw new Error("SSE must not replay"); } }).result();
+    assert.equal(output.stopReason, "stop", output.errorMessage);
+    assert.equal(requests.length, 2);
+    assert.equal(upstream.connections, 2);
+    assert.equal(requests[0]?.previous_response_id, "caller-parent");
+    assert.deepEqual(requests[1], requests[0], "opt-out preserves original parent and params");
+    assert.equal(sse, 0);
+  });
+}
+
+test("connection limit does not retry a durable caller-owned parent or a started response", async () => {
+  for (const started of [false, true]) {
+    let frames = 0;
+    const upstream = await server((_body, _connection, socket) => {
+      frames++;
+      if (started) socket.send(JSON.stringify({ type: "response.created", response: { id: "resp_started" } }));
+      socket.send(JSON.stringify({ type: "error",
+        error: { code: "websocket_connection_limit_reached", message: "connection full" } }));
+    });
+    const output = await createOpenAIApiProvider().streamSimple(model(upstream.baseUrl),
+      { messages: [{ role: "user", content: "ping", timestamp: 1 }] },
+      { apiKey: "bridge-key", transport: "auto", sessionId: `limit-fenced-${started}`, maxRetries: 0,
+        ...(!started ? { onPayload: (payload) => ({ ...payload as object, previous_response_id: "caller-parent" }) } : {}) }).result();
+    assert.equal(output.stopReason, "error");
+    assert.equal(frames, 1);
+  }
+});
+
+test("connection limit does not replay durable caller-rooted continuation", async () => {
+  const requests: Array<Record<string, unknown>> = [];
+  let sse = 0;
+  const upstream = await server((body, _connection, socket) => {
+    requests.push(body);
+    if (requests.length === 1) completed(socket, "resp_caller", "caller answer");
+    else socket.send(JSON.stringify({ type: "error",
+      error: { code: "websocket_connection_limit_reached", message: "connection full" } }));
+  });
+  const provider = createOpenAIApiProvider();
+  const options = { apiKey: "bridge-key", transport: "auto" as const, sessionId: "limit-caller-lineage", maxRetries: 2,
+    fetch: async () => { sse++; throw new Error("SSE must not replay"); } };
+  const firstUser: Message = { role: "user", content: "one", timestamp: 1 };
+  const first = await provider.streamSimple(model(upstream.baseUrl), { messages: [firstUser] },
+    { ...options, onPayload: (payload) => ({ ...payload as object, previous_response_id: "caller-parent" }) }).result();
+  assert.equal(first.stopReason, "stop", first.errorMessage);
+  const output = await provider.streamSimple(model(upstream.baseUrl),
+    { messages: [firstUser, first, { role: "user", content: "two", timestamp: 2 }] }, options).result();
+  assert.equal(output.stopReason, "error");
+  assert.equal(requests.length, 2, "unknown caller history cannot gain a fresh retry or provider replay");
+  assert.equal(requests[1]?.previous_response_id, "resp_caller");
+  assert.equal(sse, 0);
 });
 
 test("auto never retries or falls back after the first response event", async () => {
@@ -1043,9 +1277,9 @@ test("explicit WebSocket transports fail closed without SSE fallback", async () 
 
 test("model request errors redact an echoed API key", async () => {
   const provider = createOpenAIApiProvider();
-  const requestModel = model("https://gateway.example/v1");
+  const requestModel = model("http://127.0.0.1:1/v1");
   for (const transport of ["sse", "auto"] as const) {
-    const output = await provider.streamSimple(
+    const request = () => provider.streamSimple(
       requestModel,
       { messages: [{ role: "user", content: "ping", timestamp: 1 }] },
       {
@@ -1053,16 +1287,19 @@ test("model request errors redact an echoed API key", async () => {
         fetch: async () => new Response("echo secret-key", { status: 401, headers: { "content-type": "text/plain" } }),
         transport,
         sessionId: `redaction-${transport}`,
+        maxRetries: 0,
         websocketConnectTimeoutMs: 1,
       },
     ).result();
+    if (transport === "auto") for (let i = 0; i < 3; i++) assert.equal((await request()).stopReason, "error");
+    const output = await request();
     assert.equal(output.stopReason, "error");
     assert.doesNotMatch(output.errorMessage ?? "", /secret-key/);
     assert.match(output.errorMessage ?? "", /\[REDACTED\]/);
   }
 });
 
-test("auto retries after each 5-minute cooldown and resets failures after WebSocket success", async (context) => {
+test("auto allows three WS retries, steps 2/3/4/5/5 minutes and resets after WS success", async (context) => {
   context.mock.timers.enable({ apis: ["Date"], now: 0 });
   const fallback = await sseServer("fallback ok");
   const wss = new WebSocketServer({ noServer: true });
@@ -1091,6 +1328,7 @@ test("auto retries after each 5-minute cooldown and resets failures after WebSoc
     apiKey: "bridge-key",
     transport: "auto" as const,
     sessionId: "auto-recovery",
+    maxRetries: 0,
     // Transport-only fixture: default checkpoint mode "always" would fence the
     // post-send replay this test exercises, so durable checkpoints opt out.
     responseCheckpointExclude: ["*"],
@@ -1102,60 +1340,59 @@ test("auto retries after each 5-minute cooldown and resets failures after WebSoc
     options,
   ).result();
 
-  const first = await request("first");
-  assert.equal(first.stopReason, "stop", first.errorMessage ?? "SSE fallback failed");
+  for (let i = 0; i < 3; i++) {
+    assert.equal((await request("initial WS failure")).stopReason, "error");
+    assert.equal(upgradeAttempts, i + 1);
+    assert.equal(fallback.requests, 0, "native retry budget precedes SSE cooldown");
+  }
+  const first = await request("exhaust retries");
+  assert.equal(first.stopReason, "stop", first.errorMessage);
   assert.equal(fallback.requests, 1);
-  assert.equal(upgradeAttempts, 1);
-
-  await request("immediate fresh retry");
-  assert.equal(fallback.requests, 2);
-  assert.equal(upgradeAttempts, 2);
-
-  context.mock.timers.tick(299_999);
-  await request("during cooldown");
-  assert.equal(fallback.requests, 3);
-  assert.equal(upgradeAttempts, 2);
-
-  context.mock.timers.tick(1);
-  await request("failed retry");
-  assert.equal(fallback.requests, 4);
-  assert.equal(upgradeAttempts, 3);
-
+  assert.equal(upgradeAttempts, 4);
+  for (const minutes of [2, 3, 4, 5, 5]) {
+    const before = upgradeAttempts;
+    context.mock.timers.tick(minutes * 60_000 - 1);
+    await request("during cooldown");
+    assert.equal(upgradeAttempts, before, `suppressed before ${minutes}-minute deadline`);
+    context.mock.timers.tick(1);
+    await request("failed recovery");
+    assert.equal(upgradeAttempts, before + 1, `one recovery at ${minutes}-minute deadline`);
+  }
+  assert.equal(fallback.requests, 11);
   websocketAvailable = true;
-  await request("new cooldown");
-  assert.equal(fallback.requests, 5);
-  assert.equal(upgradeAttempts, 3);
-  assert.equal(connections, 0);
-
   context.mock.timers.tick(300_000);
   const recovered = await request("recover");
   assert.equal(recovered.stopReason, "stop", recovered.errorMessage ?? "WebSocket recovery failed");
   assert.equal(recovered.content[0]?.text, "websocket recovered");
-  assert.equal(upgradeAttempts, 4);
+  assert.equal(upgradeAttempts, 10);
   assert.equal(connections, 1);
   assert.equal(getActualResponsesTransport(fallback.baseUrl, options.sessionId), "websocket-cached");
 
   const continued = await request("continue");
   assert.equal(continued.stopReason, "stop", continued.errorMessage ?? "Cached WebSocket continuation failed");
-  assert.equal(upgradeAttempts, 4);
+  assert.equal(upgradeAttempts, 10);
   assert.equal(connections, 1);
 
   websocketAvailable = false;
-  await request("cached connection fails again");
-  assert.equal(fallback.requests, 6);
-  assert.equal(upgradeAttempts, 4);
-  assert.equal(getActualResponsesTransport(fallback.baseUrl, options.sessionId), "sse");
-
+  for (let i = 0; i < 3; i++) assert.equal((await request("failure after reset")).stopReason, "error");
+  assert.equal(fallback.requests, 11);
+  assert.equal((await request("exhaust reset budget")).stopReason, "stop");
+  assert.equal(fallback.requests, 12);
+  const beforeRecovery = upgradeAttempts;
   websocketAvailable = true;
-  const recoveredAgain = await request("recover immediately after reset");
-  assert.equal(recoveredAgain.stopReason, "stop", recoveredAgain.errorMessage ?? "Second WebSocket recovery failed");
-  assert.equal(fallback.requests, 6);
-  assert.equal(upgradeAttempts, 5);
+  context.mock.timers.tick(119_999);
+  await request("reset cooldown");
+  assert.equal(upgradeAttempts, beforeRecovery);
+  context.mock.timers.tick(1);
+  const recoveredAgain = await request("recover after reset two-minute cooldown");
+  assert.equal(recoveredAgain.stopReason, "stop", recoveredAgain.errorMessage);
+  assert.equal(fallback.requests, 13);
+  assert.equal(upgradeAttempts, beforeRecovery + 1);
   assert.equal(connections, 2);
   assert.equal(getActualResponsesTransport(fallback.baseUrl, options.sessionId), "websocket-cached");
 });
 
-for (const failures of [1, 2]) {
+for (const failures of [1, 4]) {
   test(`auto runs one recovery probe after ${failures} failure(s) while concurrent requests stay on SSE`, async (context) => {
     context.mock.timers.enable({ apis: ["Date"], now: 0 });
     const fallback = await sseServer("fallback ok");
@@ -1188,6 +1425,7 @@ for (const failures of [1, 2]) {
       apiKey: "bridge-key",
       transport: "auto" as const,
       sessionId: "auto-concurrent-recovery",
+      maxRetries: 0,
       websocketConnectTimeoutMs: 1_000,
       onResponse: () => { if (websocketAvailable) markProbeStarted(); },
     };
@@ -1198,14 +1436,14 @@ for (const failures of [1, 2]) {
     ).result();
 
     for (let i = 0; i < failures; i++) await request("failure");
-    if (failures === 2) context.mock.timers.tick(300_000);
+    if (failures === 4) context.mock.timers.tick(120_000);
     websocketAvailable = true;
 
     const recovery = request("recover");
     await probeStarted;
     const concurrent = await request("concurrent");
     assert.equal(concurrent.stopReason, "stop", concurrent.errorMessage ?? "Concurrent SSE fallback failed");
-    assert.equal(fallback.requests, failures + 1);
+    assert.equal(fallback.requests, failures === 4 ? 2 : 1);
     assert.equal(upgradeAttempts, failures + 1);
     assert.equal(getActualResponsesTransport(fallback.baseUrl, options.sessionId), "sse");
 
@@ -1230,13 +1468,13 @@ for (const outcome of ["error", "aborted"] as const) {
     let interrupt: (() => void) | undefined;
     fallback.server.on("upgrade", (request, socket, head) => {
       upgradeAttempts++;
-      if (upgradeAttempts === 1) socket.destroy();
+      if (upgradeAttempts <= 4) socket.destroy();
       else wss.handleUpgrade(request, socket, head, (client) => wss.emit("connection", client, request));
     });
     const controller = new AbortController();
     wss.on("connection", (socket) => {
       socket.on("message", () => {
-        if (upgradeAttempts === 2) {
+        if (upgradeAttempts === 5) {
           interrupt = () => outcome === "aborted" ? controller.abort() : socket.terminate();
           socket.send(JSON.stringify({ type: "response.created", response: { id: "resp_partial" } }));
         } else completed(socket, "resp_recovered", "websocket recovered");
@@ -1247,6 +1485,7 @@ for (const outcome of ["error", "aborted"] as const) {
       apiKey: "bridge-key",
       transport: "auto" as const,
       sessionId: `recovery-${outcome}`,
+      maxRetries: 0,
       websocketConnectTimeoutMs: 1_000,
     };
     // Exercise the full stream entry point too, not only streamSimple.
@@ -1255,21 +1494,22 @@ for (const outcome of ["error", "aborted"] as const) {
       { messages: [{ role: "user", content: "ping", timestamp: 1 }] },
       { ...options, ...(recover ? { signal: controller.signal, onResponse: () => interrupt?.() } : {}) },
     ).result();
-    await request();
+    for (let i = 0; i < 4; i++) await request();
+    context.mock.timers.tick(120_000);
     const interrupted = await request(true);
     assert.equal(interrupted.stopReason, outcome, interrupted.errorMessage);
-    assert.equal(upgradeAttempts, 2);
+    assert.equal(upgradeAttempts, 5);
     assert.equal(fallback.requests, 1, "never replay after the first event");
     if (outcome === "error") {
       await request();
-      assert.equal(upgradeAttempts, 2, "partial response must not reset the failure sequence");
+      assert.equal(upgradeAttempts, 5, "partial response must not reset the failure sequence");
       assert.equal(fallback.requests, 2);
-      context.mock.timers.tick(300_000);
+      context.mock.timers.tick(180_000);
     }
     const recovered = await request();
     assert.equal(recovered.stopReason, "stop", recovered.errorMessage);
     assert.equal(recovered.content[0]?.text, "websocket recovered");
-    assert.equal(upgradeAttempts, 3, "aborted probe must release its slot without adding a cooldown");
+    assert.equal(upgradeAttempts, 6, "aborted probe must release its slot without adding a cooldown");
   });
 }
 
@@ -1302,4 +1542,54 @@ test("real provider reconnect uses confirmed memory anchor without persisted che
   assert.equal(requests[1].body.previous_response_id, first.responseId);
   assert.deepEqual(requests[1].body.input, [{ role: "user", content: [{ type: "input_text", text: "two" }] }]);
   assert.deepEqual(labels, ["WS/full", "WS/continuation"]);
+});
+
+test("late WS success resets progression but only transport owner clears active deadline", { timeout: 10_000 }, async (context) => {
+  context.mock.timers.enable({ apis: ["Date"], now: 0 });
+  const fallback = await sseServer("fallback ok");
+  const wss = new WebSocketServer({ noServer: true }); servers.push(wss);
+  let upgrades = 0;
+  let oldSocket!: import("ws").WebSocket;
+  let probeSocket!: import("ws").WebSocket;
+  let markOld!: () => void;
+  let markProbe!: () => void;
+  const oldSeen = new Promise<void>((resolve) => { markOld = resolve; });
+  const probeSeen = new Promise<void>((resolve) => { markProbe = resolve; });
+  fallback.server.on("upgrade", (request, socket, head) => {
+    upgrades++;
+    if (upgrades >= 2 && upgrades <= 5) { socket.destroy(); return; }
+    wss.handleUpgrade(request, socket, head, (client) => wss.emit("connection", client, request));
+  });
+  wss.on("connection", (socket) => socket.on("message", () => {
+    if (upgrades === 1) {
+      oldSocket = socket;
+      socket.send(JSON.stringify(responseEvents("resp_old", "ok")[0])); markOld();
+    } else if (upgrades === 6) {
+      probeSocket = socket;
+      socket.send(JSON.stringify(responseEvents("resp_probe", "ok")[0])); markProbe();
+    } else completed(socket, "resp_recovered", "ok");
+  }));
+  const provider = createOpenAIApiProvider();
+  context.after(() => { for (const socket of wss.clients) socket.terminate(); });
+  const options = { apiKey: "key", transport: "auto" as const, sessionId: "late-transport-owner",
+    responseCheckpointExclude: ["*"], maxRetries: 0, websocketConnectTimeoutMs: 1_000 };
+  const ask = () => provider.streamSimple(model(fallback.baseUrl),
+    { messages: [{ role: "user", content: "one", timestamp: 1 }] }, options).result();
+  const old = ask(); await oldSeen;
+  for (let i = 0; i < 3; i++) assert.equal((await ask()).stopReason, "error");
+  assert.equal((await ask()).stopReason, "stop");
+  context.mock.timers.tick(120_000);
+  const probe = ask(); await probeSeen;
+  for (const event of responseEvents("resp_old", "ok").slice(1)) oldSocket.send(JSON.stringify(event));
+  assert.equal((await old).stopReason, "stop");
+  await ask();
+  assert.equal(upgrades, 6, "non-owner success must not clear in-flight transport recovery");
+  probeSocket.terminate();
+  assert.equal((await probe).stopReason, "error");
+  context.mock.timers.tick(119_999);
+  await ask(); assert.equal(upgrades, 6, "late success reset next duration to two minutes");
+  context.mock.timers.tick(1);
+  assert.equal((await ask()).stopReason, "stop");
+  assert.equal(upgrades, 7);
+  assert.equal(fallback.requests, 3, "started probe was never replayed over HTTP");
 });

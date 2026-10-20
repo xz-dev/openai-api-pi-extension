@@ -18,18 +18,31 @@ const publicAI = piAI as typeof piAI & {
   getDeclaredTools?: (messages: Context["messages"]) => Context["tools"];
 };
 
+/** Merge caller header layers case-insensitively, like the native provider. */
+export function responseHeaders(model: Model<"openai-responses">, options: Pick<CheckpointOptions, "headers">): Headers {
+  const headers = new Headers();
+  for (const source of [model.headers, options.headers]) {
+    for (const [name, value] of Object.entries(source ?? {})) {
+      if (value === null) headers.delete(name);
+      else headers.set(name, value);
+    }
+  }
+  return headers;
+}
+
 /**
  * Plugin policy: [Response checkpoints](README.md#response-checkpoints); absent list defaults to [].
  * Paired native owner: https://github.com/xz-dev/pi/blob/patch/responses-websocket-transport/packages/ai/src/api/openai-responses.ts
  */
 export function checkpointsEnabled(model: Model<"openai-responses">, options: CheckpointOptions, raw: unknown): boolean {
-  if (options.cacheRetention === "none" || !["auto", "websocket-cached"].includes(options.transport ?? "")) return false;
+  if (options.cacheRetention === "none" || !["auto", "websocket-cached"].includes(options.transport ?? "auto")) return false;
   let host = "";
   try { host = new URL(model.baseUrl).hostname.toLowerCase(); } catch { return false; }
   if (model.provider === "openai-codex" || host === "chatgpt.com" || host.endsWith(".chatgpt.com")) return false;
   const official = model.baseUrl === "https://api.openai.com/v1";
-  // The bridge authenticates WS with apiKey, not an HTTP Authorization override.
-  const key = options.apiKey ?? new Headers(options.headers as HeadersInit).get("authorization")?.replace(/^Bearer\s+/i, "");
+  const headers = responseHeaders(model, options);
+  const key = headers.get("authorization")?.replace(/^Bearer\s+/i, "")
+    ?? (headers.has("cf-aig-authorization") ? undefined : options.apiKey);
   if (official && !key?.startsWith("sk-")) return false;
   const mode = checkpointMode(options.responseCheckpointMode);
   const capability = (model.compat as { supportsResponseCheckpoints?: boolean } | undefined)?.supportsResponseCheckpoints;

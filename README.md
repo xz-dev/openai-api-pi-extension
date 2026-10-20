@@ -80,24 +80,34 @@ pi -e git:github.com/xz-dev/openai-api-pi-extension --provider openai-api-extens
 
 ## Transports
 
-Pi's `transport` setting selects behavior:
+Pi's `transport` setting selects behavior. Absent transport defaults to `auto`
+for both `stream` and `streamSimple`, including checkpoint policy/capture:
 
 - `sse`: normal HTTP `POST /v1/responses` stream.
-- `websocket`: one Responses WebSocket per request.
+- `websocket`: a fresh Responses WebSocket per request.
 - `websocket-cached`: reuses a session WebSocket and sends
   `previous_response_id` plus only new input when the conversation prefix still
   matches; otherwise sends full context safely.
-- `auto`: tries cached WebSocket first. Without durable checkpoint eligibility, a failure before the first response event
-  falls back to SSE for that request, without retrying WebSocket in the same
-  request (including Pi's provider-level retries). After the first failure, the
-  next real request tries a fresh WebSocket with full context. Consecutive failures
-  keep that gateway/session on SSE for
-  5 minutes before another request can try WebSocket again. A failed recovery
-  starts a new 5-minute cooldown; a successfully completed WebSocket response
-  resets the failure sequence. Only one recovery request runs at a time;
-  concurrent requests use SSE until it finishes. Cancellation does not count as
-  a failure. Once any response event has arrived, a failure is surfaced without
-  replaying that request over SSE; recovery applies to later requests only.
+- `auto`: tries cached WebSocket first. Transport failures allow three WebSocket
+  retries through Pi's retry owner; the fourth failure starts SSE fallback for
+  two minutes. Failed recovery probes step to three, four and at most five
+  minutes. Retry settings can stop a request before this budget is exhausted.
+  Recovery uses a fresh WebSocket and full local context, preserving an explicit
+  caller parent. Once SSE is selected, provider retries stay on SSE for that
+  request. A completed WebSocket success resets progression; only the recovery
+  owner clears its active deadline. One recovery request runs at a time per
+  endpoint/session/header identity; concurrent requests use SSE until it finishes.
+  Cancellation does not count as a failure. Once any response event has arrived,
+  a failure is surfaced without replaying that request over SSE. Admitted durable
+  requests have stricter no-replay fences, even before the first response event.
+  Ordinary API, protocol and local errors do not consume the transport budget or select SSE.
+
+Before any response starts, a coded `websocket_connection_limit_reached` rejection
+allows one fresh-WebSocket retry, independent of `maxRetries`. Checkpoint-active
+requests still require full local history and no consumed reference repair; with
+checkpoints disabled, caller-owned parents pass through unchanged. Repeated limits
+enter the transport failure budget: auto with a session selects SSE on the fourth
+failure, while sessionless auto can select SSE immediately after its fresh retry.
 
 Explicit `websocket` and `websocket-cached` modes fail without SSE fallback.
 Recovery belongs to this extension's Responses bridge, not Pi's built-in Codex
@@ -109,11 +119,18 @@ public `fetch` injection point; it does not copy Pi's Responses protocol code.
 [Provider entry](index.ts) explicitly selects SSE **inside the SDK**, so newer
 hosts cannot bypass the [bridge](responses-websocket-fetch.ts) with a second
 native WebSocket planner. The bridge keeps the caller's requested transport.
-Explicit SSE and direct calls without a transport retain HTTP behavior.
+Only explicit `sse` keeps the direct HTTP path and hard-disables checkpoints.
 Where the host exposes `onTransport(transport, model)`, bridge requests report
 `WS/full`, `WS/continuation`, or actual fallback `SSE`, never the internal SSE
 parser mode. Continuation labels describe the sent parent reference, not a
 server cache hit. Observer failures do not retry inference.
+
+An explicit `Authorization` header overrides `apiKey`. Request headers override
+model headers case-insensitively. WebSocket authentication, socket/checkpoint
+identity, recovery cooldowns and compression use the effective wire credential:
+changing an unused API key keeps the socket/continuation; changing effective
+Authorization isolates them. Alternate `cf-aig-authorization` authentication
+sends no synthetic bearer header when Authorization is absent.
 
 Optional settings, including `responseCheckpointExclude`, pass through without
 plugin defaults or native `['*']` defaults being inserted. The actual bridge

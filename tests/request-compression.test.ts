@@ -104,12 +104,15 @@ test(`auto SSE fallback labels the final upload encoding: ${acceptedEncoding ?? 
   await new Promise<void>((resolve) => http.listen(0, "127.0.0.1", resolve));
   const address = http.address();
   assert.ok(address && typeof address === "object");
-  const output = await createOpenAIApiProvider().streamSimple(
+  const provider = createOpenAIApiProvider();
+  const ask = () => provider.streamSimple(
     model(`http://127.0.0.1:${address.port}/v1`),
     { messages: [{ role: "user", content: BIG, timestamp: 1 }] },
-    { apiKey: "compress-key", transport: "auto", sessionId: "auto-compress", websocketConnectTimeoutMs: 500,
+    { apiKey: "compress-key", transport: "auto", sessionId: "auto-compress", maxRetries: 0, websocketConnectTimeoutMs: 500,
       onTransport: (label: string | undefined) => { labels.push(label); } },
   ).result();
+  for (let i = 0; i < 3; i++) assert.equal((await ask()).stopReason, "error");
+  const output = await ask();
   assert.equal(output.stopReason, "stop", output.errorMessage);
   assert.deepEqual(encodings, acceptedEncoding === "zstd" ? ["zstd"]
     : acceptedEncoding === "gzip" ? ["zstd", "gzip"] : ["zstd", "gzip", "deflate", "br", undefined]);
@@ -213,4 +216,37 @@ for (const supported of [true, false]) {
     if (supported) assert.match(offers[1] ?? "", /permessage-deflate/);
     else assert.equal(offers[1], undefined);
   });
+}
+
+for (const credentialHeader of ["Authorization", "cf-aig-authorization"]) {
+test(`WS compression identity follows effective ${credentialHeader}, ignoring unused apiKey`, async () => {
+  const seen: Array<{ auth?: string; credential?: string; offer?: string }> = [];
+  const http = createServer();
+  const declined = new WebSocketServer({ noServer: true, perMessageDeflate: false });
+  const accepted = new WebSocketServer({ noServer: true, perMessageDeflate: true });
+  servers.push(http, declined, accepted);
+  http.on("upgrade", (request, socket, head) => {
+    seen.push({ auth: request.headers.authorization, credential: request.headers[credentialHeader.toLowerCase()],
+      offer: request.headers["sec-websocket-extensions"] });
+    const wss = seen.length === 1 ? declined : accepted;
+    wss.handleUpgrade(request, socket, head, (client) => {
+      client.on("message", () => { for (const event of sseEvents(`resp_${seen.length}`)) client.send(JSON.stringify(event)); });
+    });
+  });
+  await new Promise<void>((resolve) => http.listen(0, "127.0.0.1", resolve));
+  const address = http.address(); assert.ok(address && typeof address === "object");
+  const provider = createOpenAIApiProvider();
+  for (const [apiKey, authorization] of [["unused-a", "Bearer actual-a"], ["unused-b", "Bearer actual-a"], ["unused-b", "Bearer actual-b"]]) {
+    const output = await provider.streamSimple(model(`http://127.0.0.1:${address.port}/v1`),
+      { messages: [{ role: "user", content: "one", timestamp: 1 }] },
+      { apiKey, headers: { [credentialHeader]: authorization }, transport: "websocket", maxRetries: 0 }).result();
+    assert.equal(output.stopReason, "stop", output.errorMessage);
+  }
+  assert.deepEqual(seen.map((entry) => entry.credential), ["Bearer actual-a", "Bearer actual-a", "Bearer actual-b"]);
+  assert.deepEqual(seen.map((entry) => entry.auth), credentialHeader === "Authorization"
+    ? ["Bearer actual-a", "Bearer actual-a", "Bearer actual-b"] : [undefined, undefined, undefined]);
+  assert.match(seen[0].offer ?? "", /permessage-deflate/);
+  assert.equal(seen[1].offer, undefined, "same actual credential retains declined floor");
+  assert.match(seen[2].offer ?? "", /permessage-deflate/, "new actual credential gets independent negotiation");
+});
 }
