@@ -21,7 +21,7 @@ import {
   type SourceRecord,
 } from "../model-metadata.ts";
 import { createMetadataResolver, fetchMetadataSources, neededSites, SOURCE_URLS } from "../metadata-sources.ts";
-import { mapCatalog } from "../index.ts";
+import { enrichCatalog, mapCatalog } from "../index.ts";
 
 const cfg = (overrides: Partial<MetadataConfig> = {}): MetadataConfig => ({ warnings: [], ...overrides });
 
@@ -291,6 +291,48 @@ test("resolveSelectorSite: arbitration does not cross access type", () => {
   assert.equal(result.diagnostic?.kind, "ambiguous");
 });
 
+test("resolveSelectorSite: modelparams records are filtered by the selector's access type", () => {
+  // P1-2: an exact modelparams.dev/<provider>/subscription token must never
+  // adopt an api_key record that happens to appear first.
+  const selector = parseSelector("modelparams.dev/openai/subscription");
+  const policy = resolveModelPolicy(cfg(), "m");
+  const mp = (authType: string, context: number): SourceRecord => ({
+    site: "modelparams.dev",
+    provider: "openai",
+    modelId: "m",
+    authType,
+    fields: { context_window: context },
+  });
+  for (const order of [
+    [mp("api_key", 64000), mp("subscription", 128000)],
+    [mp("subscription", 128000), mp("api_key", 64000)],
+  ]) {
+    const result = resolveSelectorSite(selector, "modelparams.dev", "m", policy, {}, order);
+    assert.equal(result.record?.fields.context_window, 128000, "api_key record must not satisfy a subscription selector");
+  }
+});
+
+test("resolveSelectorSite: same provider+model duplicates are ambiguous unless field-identical", () => {
+  // P1-5: modelparams.dev may repeat a provider/model across apiSurfaces;
+  // without a unique identity the group must be skipped, not order-picked.
+  const selector = parseSelector("modelparams.dev/openai/api_key");
+  const policy = resolveModelPolicy(cfg(), "m");
+  const mp = (context: number): SourceRecord => ({
+    site: "modelparams.dev",
+    provider: "openai",
+    modelId: "m",
+    authType: "api_key",
+    fields: { context_window: context },
+  });
+  for (const order of [[mp(1), mp(2)], [mp(2), mp(1)]]) {
+    const result = resolveSelectorSite(selector, "modelparams.dev", "m", policy, {}, order);
+    assert.equal(result.record, undefined);
+    assert.equal(result.diagnostic?.kind, "ambiguous");
+  }
+  const identical = resolveSelectorSite(selector, "modelparams.dev", "m", policy, {}, [mp(7), mp(7)]);
+  assert.equal(identical.record?.fields.context_window, 7, "field-identical duplicates are one product");
+});
+
 test("resolveSelectorSite: modelparams.dev never arbitrates (canonical ignored)", () => {
   const selector = parseSelector("modelparams.dev/*/api_key");
   const policy = resolveModelPolicy(cfg(), "m");
@@ -336,6 +378,33 @@ test("resolveSelectorSite: qualified query keeps vendor namespace without prefix
     dev("other", "m"), // bare "m" under another provider is not "vendor/m"
   ]);
   assert.equal(result.diagnostic?.kind, "missing");
+});
+
+test("resolveMetadataChain: lookup_ids keys match concrete expanded sources, including wildcards", () => {
+  // P2-11: lookup_ids["models.dev/openai"] applies to any selector whose
+  // expansion reaches that concrete source — wildcard and default chains too.
+  const records = [dev("openai", "m-ga", "openai/m-ga", { context_window: 64000 })];
+  const policy = resolveModelPolicy(
+    cfg({ models: { m: { lookupIds: { "models.dev/openai": "m-ga" } } } }),
+    "m",
+  );
+  const result = resolveMetadataChain(policy, "m", "m", {}, records);
+  assert.equal(result.fields.context_window, 64000, "default-chain wildcard must honor the concrete-source lookup id");
+
+  // Same for modelparams.dev: the key includes the access segment.
+  const mpRecords: SourceRecord[] = [{
+    site: "modelparams.dev",
+    provider: "zai",
+    modelId: "m-ga",
+    authType: "api_key",
+    fields: { context_window: 32000 },
+  }];
+  const mpPolicy = resolveModelPolicy(
+    cfg({ models: { m: { lookupIds: { "modelparams.dev/zai/api_key": "m-ga" } } } }),
+    "m",
+  );
+  const mpResult = resolveMetadataChain(mpPolicy, "m", "m", {}, mpRecords);
+  assert.equal(mpResult.fields.context_window, 32000);
 });
 
 test("mergeProviderPrefixMaps: channel overrides same-name global", () => {
@@ -451,6 +520,70 @@ test("normalizeFields: aliases collapse to canonical names", () => {
   assert.equal(out.name, "X");
 });
 
+test("normalizeFields: invalid values drop and the first valid alias wins", () => {
+  // P2-10/P1-4: an invalid preferred alias must not shadow a valid fallback,
+  // and invalid values must never enter merged metadata at all.
+  const out = normalizeFields({ context_window: "oops", context_length: 96000, max_tokens: 0 });
+  assert.equal(out.context_window, 96000);
+  assert.equal(out.max_output_tokens, undefined);
+});
+
+test("mergeMetadata overwrite: invalid external values never overwrite valid upstream", () => {
+  // P1-4: an out-of-range external limit must behave as absent, not win.
+  const merged = mergeMetadata({ context_window: 96000 }, { context_window: 0 }, false);
+  assert.equal(merged.context_window, 96000);
+  const viaCatalog = mapCatalog(
+    [{ id: "m", context_window: 96000 }],
+    "https://gw",
+    createMetadataResolver(cfg({ sourcePriority: ["models.dev/openai"] }), [
+      dev("openai", "m", "openai/m", { context_window: 0 }),
+    ]).resolve,
+  );
+  assert.equal(viaCatalog[0]?.contextWindow, 96000);
+});
+
+test("mergeMetadata fill-only: upstream capabilities.effort_tiers counts as declared reasoning levels", () => {
+  // P2-8: upstream effort_tiers: [] means "no tiers"; fill must not conjure any.
+  const merged = mergeMetadata(
+    { capabilities: { effort_tiers: [] } },
+    { supported_reasoning_levels: [{ effort: "high" }] },
+    true,
+  );
+  assert.deepEqual(merged.supported_reasoning_levels, []);
+  const viaCatalog = mapCatalog(
+    [{ id: "m", capabilities: { effort_tiers: [] } }],
+    "https://gw",
+    createMetadataResolver(cfg({ sourcePriority: ["models.dev/openai"], fillMissingOnly: true }), [
+      dev("openai", "m", "openai/m", { supported_reasoning_levels: [{ effort: "high" }] }),
+    ]).resolve,
+  );
+  assert.equal(viaCatalog[0]?.reasoning, false);
+});
+
+test("mergeMetadata fill-only: invalid upstream values count as missing", () => {
+  // P2-9: a field-validation-failing upstream value is missing for fill mode.
+  const merged = mergeMetadata(
+    { input_modalities: 42 },
+    { input_modalities: ["text", "image"] },
+    true,
+  );
+  assert.deepEqual(merged.input_modalities, ["text", "image"]);
+  const viaCatalog = mapCatalog(
+    [{ id: "m", input_modalities: 42 }],
+    "https://gw",
+    createMetadataResolver(cfg({ sourcePriority: ["models.dev/openai"], fillMissingOnly: true }), [
+      dev("openai", "m", "openai/m", { input_modalities: ["text", "image"] }),
+    ]).resolve,
+  );
+  assert.deepEqual(viaCatalog[0]?.input, ["text", "image"]);
+});
+
+test("applyOverrides: override keys are alias-normalized before applying", () => {
+  // P2-7: context_length must hit the canonical context_window field.
+  const out = applyOverrides({ context_window: 128000 }, { context_length: 64000 });
+  assert.equal(out.context_window, 64000);
+});
+
 test("resolveModelPolicy overrides order: global model < channel legacy < channel model", () => {
   const config = cfg({
     models: { "proxy/m": { overrides: { context_window: 1, a: "g" } } },
@@ -462,7 +595,7 @@ test("resolveModelPolicy overrides order: global model < channel legacy < channe
     },
   });
   const resolver = createMetadataResolver(config, []);
-  const fields = resolver("proxy/m", {});
+  const fields = resolver.resolve("proxy/m", {});
   assert.equal(fields.context_window, 3);
   assert.equal(fields.a, "g");
   assert.equal(fields.b, "l");
@@ -478,13 +611,13 @@ test("createMetadataResolver + mapCatalog: fill-only sees real missing values be
   });
   const records = [dev("openai", "m", "openai/m", { context_window: 64000 })];
   const resolver = createMetadataResolver(config, records);
-  const [model] = mapCatalog([{ id: "m" }], "https://gw.example", resolver);
+  const [model] = mapCatalog([{ id: "m" }], "https://gw.example", resolver.resolve);
   assert.equal(model?.contextWindow, 64000);
   // And with an upstream value present, fill-only keeps it.
   const [kept] = mapCatalog(
     [{ id: "m", context_window: 96000 }],
     "https://gw.example",
-    resolver,
+    resolver.resolve,
   );
   assert.equal(kept?.contextWindow, 96000);
 });
@@ -492,10 +625,10 @@ test("createMetadataResolver + mapCatalog: fill-only sees real missing values be
 test("createMetadataResolver: default overwrite mode lets external win; source_priority: [] disables lookups", () => {
   const records = [dev("openai", "m", "openai/m", { context_window: 1000000 })];
   const full = createMetadataResolver(cfg({ sourcePriority: ["models.dev/openai"] }), records);
-  const [over] = mapCatalog([{ id: "m", context_window: 128000 }], "https://gw", full);
+  const [over] = mapCatalog([{ id: "m", context_window: 128000 }], "https://gw", full.resolve);
   assert.equal(over?.contextWindow, 1000000);
   const off = createMetadataResolver(cfg({ sourcePriority: [] }), records);
-  const [untouched] = mapCatalog([{ id: "m", context_window: 128000 }], "https://gw", off);
+  const [untouched] = mapCatalog([{ id: "m", context_window: 128000 }], "https://gw", off.resolve);
   assert.equal(untouched?.contextWindow, 128000);
   assert.equal(neededSites(cfg({ sourcePriority: [] }), ["m"]).size, 0);
 });
@@ -539,6 +672,93 @@ test("fetchMetadataSources: no Authorization or custom headers sent to sources",
   try {
     await fetchMetadataSources(new Set(["models.dev"]), undefined, { ...SOURCE_URLS, modelsDevFlat: "https://x/404" });
     assert.equal(seenHeaders, undefined);
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+test("fetchMetadataSources: 16 MiB cap counts bytes and cancels oversized streams early", async () => {
+  // P1-3: the cap is on bytes, not characters, and the reader stops as soon
+  // as the cap is exceeded instead of draining the stream.
+  const original = globalThis.fetch;
+  try {
+    const big = "é".repeat(9_500_000); // ~19 MiB of UTF-8 in ~9.5M chars
+    globalThis.fetch = async (input) =>
+      String(input) === SOURCE_URLS.modelsDevApi
+        ? new Response(JSON.stringify({ p: { models: { x: { name: big } } } }))
+        : Response.json({});
+    let result = await fetchMetadataSources(new Set(["models.dev"]));
+    assert.equal(result.failed.has("models.dev"), true, "multi-byte payload over 16 MiB must fail");
+    assert.equal(result.records.length, 0);
+
+    let consumed = 0;
+    const chunk = new Uint8Array(1024 * 1024).fill(32);
+    globalThis.fetch = async (input) =>
+      String(input) === SOURCE_URLS.modelsDevApi
+        ? new Response(
+            new ReadableStream({
+              pull(controller) {
+                if (consumed === 20) {
+                  controller.close();
+                  return;
+                }
+                consumed++;
+                controller.enqueue(chunk);
+              },
+            }),
+          )
+        : Response.json({});
+    result = await fetchMetadataSources(new Set(["models.dev"]));
+    assert.equal(result.failed.has("models.dev"), true);
+    assert.ok(consumed <= 18, `stream must stop at the cap, consumed ${consumed} MiB`);
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+test("fetchMetadataSources: caller abort propagates instead of degrading to a source failure", async () => {
+  // P1-1: an aborted caller signal must not be reported as a failed source.
+  const original = globalThis.fetch;
+  const controller = new AbortController();
+  globalThis.fetch = async (_input, init) =>
+    new Promise<Response>((_resolve, reject) => {
+      const signal = init?.signal as AbortSignal;
+      if (signal.aborted) reject(signal.reason);
+      else signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+    });
+  try {
+    const pending = fetchMetadataSources(new Set(["models.dev", "modelparams.dev"]), controller.signal);
+    controller.abort();
+    await assert.rejects(pending);
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+test("enrichCatalog: malformed source payloads and ambiguity skips are reported in notes", async () => {
+  // P2-6: degradation must be visible, not silent.
+  const original = globalThis.fetch;
+  try {
+    globalThis.fetch = async () => Response.json({ unexpected: "not a source schema" });
+    let result = await enrichCatalog([{ id: "m" }], "https://gw", undefined, {
+      configPath: () => "/definitely-not-present/openai-api-extension.yaml",
+    });
+    assert.ok(
+      result.notes.some((note) => /models\.dev/.test(note) && /unavailable|no usable|invalid/i.test(note)),
+      `expected a degradation note, got ${JSON.stringify(result.notes)}`,
+    );
+
+    globalThis.fetch = async (input) =>
+      String(input) === SOURCE_URLS.modelsDevApi
+        ? Response.json({ a: { models: { m: { limit: { context: 1 } } } }, b: { models: { m: { limit: { context: 2 } } } } })
+        : Response.json({});
+    result = await enrichCatalog([{ id: "m" }], "https://gw", undefined, {
+      configPath: () => "/definitely-not-present/openai-api-extension.yaml",
+    });
+    assert.ok(
+      result.notes.some((note) => /ambig/i.test(note)),
+      `expected an ambiguity note, got ${JSON.stringify(result.notes)}`,
+    );
   } finally {
     globalThis.fetch = original;
   }

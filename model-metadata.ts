@@ -535,7 +535,10 @@ export function mergeProviderPrefixMaps(
 /**
  * Candidate query identities for one selector group.
  *
- * - An explicit lookup_ids entry for the selector token fixes the query id.
+ * - An explicit lookup_ids entry for the concrete expanded source
+ *   (`<site>/<provider>` for models.dev, `<site>/<provider>/<access>` for
+ *   modelparams.dev) fixes the query id — also under wildcard selectors; the
+ *   literal selector token is accepted as a fallback key for compatibility.
  * - A qualified query id's first segment may be remapped through
  *   provider_prefix_map (metadata query identity only; public id unchanged).
  * - Bare names ask the selector-matched providers; qualified names keep their
@@ -549,7 +552,6 @@ export function* candidateIdentities(
   prefixMap: Readonly<Record<string, readonly string[]>>,
   records: readonly SourceRecord[],
 ): Generator<{ provider: string; queryId: string }> {
-  const override = policy.lookupIds[selector.token];
   const slash = queryId.indexOf("/");
   const qualified = slash > 0;
   const providerSegment = qualified ? queryId.slice(0, slash).toLowerCase() : "";
@@ -560,6 +562,10 @@ export function* candidateIdentities(
   for (const record of records) {
     if (record.site !== site || !recordMatchesSelector(selector, record)) continue;
     if (targets !== undefined && !targets.some((t) => t === record.provider)) continue;
+    const access = classifyAccess(record.site, record.provider, record.authType);
+    const concreteKey =
+      site === "modelparams.dev" && access ? `${site}/${record.provider}/${access}` : `${site}/${record.provider}`;
+    const override = policy.lookupIds[concreteKey] ?? policy.lookupIds[selector.token];
     const id = override ?? (qualified ? bareId : queryId);
     const key = `${record.provider}${id}`;
     if (!seen.has(key)) {
@@ -569,37 +575,47 @@ export function* candidateIdentities(
   }
 }
 
+/** Two records of the same identity are interchangeable only when every field agrees. */
+function fieldsIdentical(a: SourceRecord, b: SourceRecord): boolean {
+  const keys = new Set([...Object.keys(a.fields), ...Object.keys(b.fields)]);
+  for (const key of keys) {
+    const va = a.fields[key];
+    const vb = b.fields[key];
+    if (va === vb) continue;
+    if (JSON.stringify(va) !== JSON.stringify(vb)) return false;
+  }
+  return true;
+}
+
 /**
- * Finds the record for one query id inside one provider's table.
- * Exact id wins; then a unique case-folded match; then, for bare query names
- * only, records whose last `/` segment equals the name (provider-side vendor
- * namespaces like `openai/gpt-5` still identify the same product). Multiple
- * distinct records matching any tier are ambiguous, never a silent pick.
+ * Finds the records for one query id inside one provider's table, restricted
+ * to the selector's access group. Exact id matches win; then a unique
+ * case-folded match; then, for bare query names only, records whose last `/`
+ * segment equals the name (provider-side vendor namespaces like `openai/gpt-5`
+ * still identify the same product). Returns every matching record — same
+ * provider+model duplicates are kept so the caller can judge ambiguity.
  */
-function lookupRecord(
+function lookupRecords(
   records: readonly SourceRecord[],
   site: MetadataSite,
   provider: string,
   queryId: string,
-): SourceRecord | undefined {
-  let folded: SourceRecord | undefined;
-  let foldedCount = 0;
-  const bareMatches: SourceRecord[] = [];
+  selector: Selector,
+): SourceRecord[] {
+  const exact: SourceRecord[] = [];
+  const folded: SourceRecord[] = [];
+  const bare: SourceRecord[] = [];
   const isBare = !queryId.includes("/");
   for (const record of records) {
     if (record.site !== site || record.provider !== provider) continue;
-    if (record.modelId === queryId) return record;
-    if (record.modelId.toLowerCase() === queryId.toLowerCase()) {
-      folded = record;
-      foldedCount++;
-    } else if (isBare && record.modelId.toLowerCase().endsWith(`/${queryId.toLowerCase()}`)) {
-      if (!bareMatches.includes(record)) bareMatches.push(record);
-    }
+    if (!recordMatchesSelector(selector, record)) continue;
+    if (record.modelId === queryId) exact.push(record);
+    else if (record.modelId.toLowerCase() === queryId.toLowerCase()) folded.push(record);
+    else if (isBare && record.modelId.toLowerCase().endsWith(`/${queryId.toLowerCase()}`)) bare.push(record);
   }
-  if (foldedCount > 1) return undefined;
-  if (folded) return folded;
-  if (bareMatches.length === 1) return bareMatches[0];
-  return undefined; // 0 or >1 bare matches
+  if (exact.length > 0) return exact;
+  if (folded.length > 0) return folded;
+  return bare;
 }
 
 /**
@@ -621,14 +637,29 @@ export function resolveSelectorSite(
 ): { record?: SourceRecord; diagnostic?: ResolutionDiagnostic } {
   const candidates: SourceRecord[] = [];
   const seen = new Set<string>();
+  let ambiguousDuplicates = false;
   for (const identity of candidateIdentities(selector, site, queryId, policy, prefixMap, records)) {
-    const hit = lookupRecord(records, site, identity.provider, identity.queryId);
-    if (hit && !seen.has(hit.provider + "" + hit.modelId)) {
-      seen.add(hit.provider + "" + hit.modelId);
-      candidates.push(hit);
+    const hits = lookupRecords(records, site, identity.provider, identity.queryId, selector);
+    if (hits.length === 0) continue;
+    const first = hits[0];
+    if (hits.length > 1 && !hits.every((hit) => fieldsIdentical(hit, first))) {
+      // Same provider+model with disagreeing fields (e.g. modelparams.dev
+      // apiSurface variants) cannot be uniquely located: skip this identity.
+      ambiguousDuplicates = true;
+      continue;
+    }
+    if (!seen.has(first.provider + "" + first.modelId)) {
+      seen.add(first.provider + "" + first.modelId);
+      candidates.push(first);
     }
   }
-  if (candidates.length === 0) return { diagnostic: { kind: "missing", token: selector.token, modelId: queryId, detail: `no ${site} candidate` } };
+  if (candidates.length === 0) {
+    return {
+      diagnostic: ambiguousDuplicates
+        ? { kind: "ambiguous", token: selector.token, modelId: queryId, detail: `${site} has conflicting duplicate records for ${queryId}` }
+        : { kind: "missing", token: selector.token, modelId: queryId, detail: `no ${site} candidate` },
+    };
+  }
   if (candidates.length === 1) return { record: candidates[0] };
   if (site === "models.dev") {
     const canonical = candidates[0].canonicalModelId;
@@ -727,17 +758,52 @@ const FIELD_ALIASES: Readonly<Record<string, readonly string[]>> = {
 const PROTECTED_FIELDS = new Set(["id", "slug", "provider", "baseUrl", "api", "key", "headers"]);
 
 /**
- * Copies known metadata fields onto canonical names. Earlier aliases win
- * (context_window before context_length); unknown/protected fields drop.
+ * Whether one raw field value passes the field validation mapModel applies.
+ * Invalid values count as missing for both merge modes: they never overwrite
+ * a valid lower-priority value and they never block a fill.
+ */
+export function fieldIsValid(canonical: string, value: unknown): boolean {
+  if (value === undefined || value === null) return false;
+  switch (canonical) {
+    case "context_window":
+    case "max_output_tokens":
+    case "max_input_tokens":
+      return typeof value === "number" && Number.isFinite(value) && value > 0;
+    case "input_modalities":
+    case "output_modalities":
+    case "supported_reasoning_levels":
+      return Array.isArray(value);
+    case "default_reasoning_level":
+    case "name":
+      return typeof value === "string" && value.trim() !== "";
+    default:
+      return true;
+  }
+}
+
+/**
+ * Copies known metadata fields onto canonical names. The first alias carrying
+ * a VALID value wins (an invalid preferred alias never shadows a valid
+ * fallback); unknown/protected fields drop. Upstream
+ * `capabilities.effort_tiers` normalizes onto supported_reasoning_levels.
  */
 export function normalizeFields(input: Readonly<Record<string, unknown>>): MetadataFields {
   const out: MetadataFields = {};
+  const capabilities = input.capabilities;
+  const effortTiers =
+    capabilities && typeof capabilities === "object" && !Array.isArray(capabilities)
+      ? (capabilities as Record<string, unknown>).effort_tiers
+      : undefined;
   for (const [canonical, aliases] of Object.entries(FIELD_ALIASES)) {
     for (const alias of aliases) {
-      if (input[alias] !== undefined && input[alias] !== null) {
-        out[canonical] = input[alias];
+      const value = input[alias];
+      if (fieldIsValid(canonical, value)) {
+        out[canonical] = value;
         break;
       }
+    }
+    if (out[canonical] === undefined && canonical === "supported_reasoning_levels" && Array.isArray(effortTiers)) {
+      out[canonical] = effortTiers;
     }
   }
   return out;
@@ -746,10 +812,9 @@ export function normalizeFields(input: Readonly<Record<string, unknown>>): Metad
 /** A field counts as "missing" for fill-only when absent, null, or invalid. */
 export function fieldIsMissing(canonical: string, value: unknown): boolean {
   if (value === undefined || value === null) return true;
-  if (canonical === "context_window" || canonical === "max_output_tokens" || canonical === "max_input_tokens") {
-    return !(typeof value === "number" && Number.isFinite(value) && value > 0);
-  }
-  return false;
+  // An explicit [] of reasoning levels means "no tiers", never missing.
+  if (canonical === "supported_reasoning_levels" && Array.isArray(value)) return false;
+  return !fieldIsValid(canonical, value);
 }
 
 /** Recursive object merge; arrays/scalars replace; null never erases. */
@@ -790,23 +855,28 @@ export function mergeMetadata(
   for (const [key, value] of Object.entries(base)) {
     if (!fieldIsMissing(key, value)) {
       out[key] = value;
-    } else if (key === "supported_reasoning_levels" && Array.isArray(value)) {
-      // An explicit [] means "no levels", not "missing".
-      out[key] = value;
     }
   }
   return out;
 }
 
-/** Applies manual overrides on top of the merged metadata (null never erases). */
+/**
+ * Applies manual overrides on top of the merged metadata (null never erases).
+ * Known-field keys are alias-normalized first so `context_length` lands on
+ * the same canonical field the sources use; invalid override values drop.
+ */
 export function applyOverrides(
   merged: MetadataFields,
   overrides: Readonly<Record<string, unknown>>,
 ): MetadataFields {
   const out = { ...merged };
+  const aliases = new Set(Object.values(FIELD_ALIASES).flat());
   for (const [key, value] of Object.entries(overrides)) {
-    if (PROTECTED_FIELDS.has(key)) continue;
+    if (PROTECTED_FIELDS.has(key) || aliases.has(key) || key === "capabilities") continue;
     if (value === null || value === undefined) continue;
+    out[key] = value;
+  }
+  for (const [key, value] of Object.entries(normalizeFields(overrides))) {
     out[key] = value;
   }
   return out;

@@ -286,9 +286,11 @@ missing. `null` never erases a lower-priority value; an explicit empty
 `supported_reasoning_levels: []` means "no tiers" rather than "missing".
 Manual `overrides` (model rule, then legacy channel `overrides.<model>`)
 apply after source merging; Pi's `models.json` `modelOverrides` always
-applies last. `lookup_ids` map a source selector key to the exact query ID
-for that source; `provider_prefix_map` only changes the query identity,
-never the public ID.
+applies last. `lookup_ids` keys are exact concrete sources
+(`models.dev/<provider>` or `modelparams.dev/<provider>/<access>`) and map
+that source to a fixed query ID whenever any selector — including wildcards
+and the built-in default chain — expands to it; `provider_prefix_map` only
+changes the query identity, never the public ID.
 
 **Opt out** of all external enrichment with a root `source_priority: []`
 (and no local chains), then refresh. Offline restore and `allowNetwork:

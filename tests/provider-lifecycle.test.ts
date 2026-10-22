@@ -556,6 +556,79 @@ test("login saves the validated key and reports a metadata config error, not an 
   assert.doesNotMatch(note, /not usable|invalid api key/i);
 });
 
+test("cancelled login during enrichment never publishes or persists its catalog", async () => {
+  // P1-1: caller abort inside the metadata source fetch must abort the whole
+  // login; a later refresh keeps the previously stored catalog.
+  const gatewayServer = await gateway("cancelled-model", "test-key");
+  const credentials = new InMemoryCredentialStore();
+  const modelsStore = new InMemoryModelsStore();
+  await credentials.modify(PROVIDER, async () => ({
+    type: "api_key",
+    key: "test-key",
+    env: { [BASE_URL_ENV]: gatewayServer.baseUrl },
+  }));
+  await modelsStore.write(PROVIDER, { models: [{
+    id: "old-model", name: "old-model", provider: PROVIDER, api: "openai-responses",
+    baseUrl: gatewayServer.baseUrl, reasoning: false, input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 64000, maxTokens: 8192,
+  }] });
+
+  // Metadata sources hang until the caller signal aborts.
+  const dir = await mkdtemp(join(tmpdir(), "openai-api-metadata-"));
+  metadataDirs.push(dir);
+  const hanging = createServer((request, _response) => {
+    request.socket.on("close", () => undefined); // never respond
+  });
+  servers.push(hanging);
+  await new Promise<void>((resolve) => hanging.listen(0, "127.0.0.1", resolve));
+  const address = hanging.address();
+  assert.ok(address && typeof address === "object");
+  const deadUrl = `http://127.0.0.1:${address.port}`;
+  const hooks: MetadataHooks = {
+    configPath: () => join(dir, "openai-api-extension.yaml"),
+    sourceUrls: { modelsDevApi: deadUrl, modelsDevFlat: deadUrl, modelparams: deadUrl },
+  };
+
+  const models = createModels({ credentials, modelsStore, authContext: authContext() });
+  models.setProvider(createOpenAIApiProvider([], undefined, undefined, undefined, hooks));
+
+  // Prime the restored catalog so a later offline refresh publishes "old-model".
+  await models.refresh({ allowNetwork: false });
+  assert.deepEqual(models.getModels(PROVIDER).map((model) => model.id), ["old-model"]);
+
+  const controller = new AbortController();
+  let prompts = 0;
+  const login = models
+    .login(PROVIDER, "api_key", {
+      signal: controller.signal,
+      prompt: async () => (prompts++ === 0 ? gatewayServer.baseUrl : "test-key"),
+      notify: () => undefined,
+    })
+    .then(
+      () => "resolved",
+      (error: unknown) => (error instanceof Error ? error.name : "unknown"),
+    );
+  // Wait until the gateway catalog was read and enrichment is waiting on the
+  // hanging source endpoints, then cancel.
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  controller.abort();
+  assert.equal(await login, "AbortError");
+
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  const result = await models.refresh({ allowNetwork: false });
+  assert.equal(result.errors.size, 0);
+  assert.deepEqual(
+    models.getModels(PROVIDER).map((model) => model.id),
+    ["old-model"],
+    "cancelled login's catalog must not be published",
+  );
+  assert.deepEqual(
+    (await modelsStore.read(PROVIDER))?.models.map((model) => model.id),
+    ["old-model"],
+    "cancelled login's catalog must not persist",
+  );
+});
+
 test("source_priority: [] opts out of all metadata network reads", async () => {
   const gatewayServer = await gateway("optout-model", "test-key", false);
   const { hooks, hits } = await metadataHooks("source_priority: []");

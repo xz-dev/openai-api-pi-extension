@@ -377,8 +377,15 @@ export async function enrichCatalog(
     const result = await fetchMetadataSources(needed, signal, hooks.sourceUrls ?? SOURCE_URLS);
     records = result.records;
     for (const site of result.failed) notes.push(`metadata source ${site} unavailable; using upstream values`);
+    for (const site of result.malformed) {
+      if (!result.failed.has(site)) notes.push(`metadata source ${site} returned no usable records; using upstream values`);
+    }
   }
-  const models = mapCatalog(entries, baseUrl, createMetadataResolver(config, records));
+  const resolver = createMetadataResolver(config, records);
+  const models = mapCatalog(entries, baseUrl, resolver.resolve);
+  for (const diagnostic of resolver.diagnostics) {
+    notes.push(`metadata ambiguity: ${diagnostic.detail} (selector ${diagnostic.token}); source skipped`);
+  }
   return { models, notes };
 }
 
@@ -443,10 +450,14 @@ function apiKeyAuth(
       const entries = await fetchCatalog(baseUrl, apiKey, interaction.signal);
       try {
         const { models, notes } = await enrichCatalog(entries, baseUrl, interaction.signal, metadataHooks);
+        // A cancelled login must not publish the catalogue it fetched.
+        interaction.signal.throwIfAborted();
         onValidated(baseUrl, apiKey, models);
         for (const note of notes) interaction.notify({ type: "info", message: `Metadata: ${note}` });
         interaction.notify({ type: "info", message: `Found ${models.length} models.` });
       } catch (error) {
+        // Caller cancel is not a catalog problem: propagate, never degrade.
+        interaction.signal.throwIfAborted();
         const reason = errorMessage(error);
         // Config failures must not look like an invalid API key or an unusable catalog.
         const message =
