@@ -8,11 +8,12 @@ import {
   type AssistantMessage,
   type AssistantMessageEventStream,
   createAssistantMessageEventStream,
+  appendAssistantMessageDiagnostic,
   type Model,
   registerSessionResourceCleanup,
   type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
-import { responseHeaders } from "./checkpoint-adapter.ts";
+import { permitsFullHistory, recordResponseAncestry, responseHeaders, type ResponseAncestryState } from "./checkpoint-adapter.ts";
 import { compressionFetch, getRequestCompressionEncoding, getWebSocketCompressionEncoding,
   getWebSocketCompressionPolicy, transportLabel } from "./request-compression.ts";
 
@@ -35,7 +36,11 @@ type Continuation = {
   responseId: string;
   // Caller-owned roots can leave history only on the server.
   hasFullHistory: boolean;
+  ancestry: ResponseAncestryState;
   encodedOutput?: unknown[];
+  // Non-wire caller identity bound to this continuation's verified wire request.
+  preparationScope?: string;
+  requestUrl?: string;
   // Present only on a server-confirmed anchor carried across sockets.
   expiresAt?: number;
 };
@@ -45,6 +50,7 @@ type Connection = {
   busy: boolean;
   timer?: ReturnType<typeof setTimeout>;
   continuation?: Continuation;
+  anchorGeneration: object;
 };
 type Pending = {
   connection: Connection;
@@ -53,6 +59,10 @@ type Pending = {
   keep: boolean;
   request: RequestBody;
   hasFullHistory: boolean;
+  ancestry: ResponseAncestryState;
+  anchorGeneration: object;
+  preparationScope?: string;
+  requestUrl: string;
   iterator: AsyncIterator<ResponsesStreamMessage>;
   scopeHash?: string;
   // Whether the wire body actually carried the policy-owned store:true.
@@ -67,9 +77,10 @@ type Pending = {
 
 type BridgeOptions = Pick<
   SimpleStreamOptions,
-  "apiKey" | "cacheRetention" | "fetch" | "sessionId" | "timeoutMs" | "transport" | "websocketConnectTimeoutMs"
+  "apiKey" | "cacheRetention" | "fetch" | "sessionId" | "signal" | "timeoutMs" | "transport" | "websocketConnectTimeoutMs"
 > & {
   headers?: SimpleStreamOptions["headers"];
+  responseAncestry?: ResponseAncestryState;
   checkpoints?: {
     enabled: boolean;
     candidate?: CheckpointCandidate;
@@ -113,6 +124,24 @@ function cacheEnabled(options: BridgeOptions): boolean {
   return options.cacheRetention !== "none" && (options.transport === "auto" || options.transport === "websocket-cached");
 }
 
+function effectiveResponseHeaders(model: Model<"openai-responses">, options: BridgeOptions, source?: Headers): Headers {
+  const supplied = responseHeaders(model, options);
+  const headers = new Headers(source ?? supplied);
+  if (supplied.has("authorization")) headers.set("authorization", supplied.get("authorization")!);
+  else if (supplied.has("cf-aig-authorization")) headers.delete("authorization");
+  else if (!headers.has("authorization") && !headers.has("cf-aig-authorization") && options.apiKey) headers.set("authorization", `Bearer ${options.apiKey}`);
+  if (supplied.has("cf-aig-authorization")) headers.set("cf-aig-authorization", supplied.get("cf-aig-authorization")!);
+  return headers;
+}
+
+function preparationScopeKey(model: Model<"openai-responses">, options: BridgeOptions, wire?: Headers): string | undefined {
+  if (!cacheEnabled(options) || !options.sessionId) return undefined;
+  const headers = effectiveResponseHeaders(model, options);
+  if (!headers.has("authorization") && !headers.has("cf-aig-authorization")) return undefined;
+  if (wire && [...headers].some(([name, value]) => wire.get(name) !== value)) return undefined;
+  return `${transportKey(model.baseUrl, options.sessionId)}\0${createHash("sha256").update(JSON.stringify({ model: [model.provider, model.api, model.id], headers: [...headers] })).digest("hex")}`;
+}
+
 function connectionKey(model: Model<"openai-responses">, options: BridgeOptions, headers: Headers): string | undefined {
   if (!cacheEnabled(options) || !options.sessionId) return undefined;
   const identity = createHash("sha256").update(JSON.stringify([...headers])).digest("hex");
@@ -147,7 +176,7 @@ function websocketHeaders(headers: Headers): Record<string, string> {
 
 type CompressionPolicy = Awaited<ReturnType<typeof getWebSocketCompressionPolicy>>;
 
-function createConnection(model: Model<"openai-responses">, options: BridgeOptions, headers: Headers, compression: CompressionPolicy): Connection {
+function createConnection(model: Model<"openai-responses">, options: BridgeOptions, headers: Headers, compression: CompressionPolicy, key: string | undefined): Connection {
   const apiKey = headers.get("authorization")?.replace(/^Bearer\s+/i, "")
     ?? (headers.has("cf-aig-authorization") ? "" : options.apiKey);
   const client = new OpenAI({ apiKey: apiKey || "unused", baseURL: model.baseUrl, maxRetries: 0 });
@@ -167,7 +196,10 @@ function createConnection(model: Model<"openai-responses">, options: BridgeOptio
     catch (error) { transportCauses.add(error); throw error; }
   };
   ws.socket.once("open", () => compression.recordNegotiated((ws.socket as NodeWebSocket).platformSocket.extensions));
-  return { ws, transportCauses, busy: true };
+  const connection: Connection = { ws, transportCauses, busy: true, anchorGeneration: {} };
+  // The request iterator drops its error listener on cleanup; the connection must still own late errors.
+  ws.on("error", () => closeConnection(key, connection, "socket error"));
+  return connection;
 }
 
 function acquire(
@@ -186,7 +218,7 @@ function acquire(
   }
   if (existing && !existing.busy) closeConnection(key, existing, "reconnect");
 
-  const connection = createConnection(model, options, headers, compression);
+  const connection = createConnection(model, options, headers, compression, key);
   const anchor = key ? anchors.get(key) : undefined;
   if (anchor && anchor.expiresAt! <= Date.now()) anchors.delete(key!);
   else if (!forceFresh) connection.continuation = anchor;
@@ -330,7 +362,7 @@ function isAssistantResponseItem(item: ResponseInputItem): boolean {
   );
 }
 
-function cachedBody(connection: Connection, body: RequestBody): RequestBody {
+function cachedBody(connection: Pick<Connection, "continuation">, body: RequestBody): RequestBody {
   const previous = connection.continuation;
   if (!previous || (previous.expiresAt !== undefined && (previous.expiresAt <= Date.now() || body.previous_response_id != null))
     || JSON.stringify(withoutInput(body)) !== JSON.stringify(withoutInput(previous.request))) return body;
@@ -348,6 +380,18 @@ function cachedBody(connection: Connection, body: RequestBody): RequestBody {
   while (deltaStart < input.length && isAssistantResponseItem(input[deltaStart]!)) deltaStart++;
   if (deltaStart >= input.length) return body;
   return { ...body, previous_response_id: previous.responseId, input: input.slice(deltaStart) } as RequestBody;
+}
+
+function lineageBody(previous: Continuation | undefined, body: RequestBody, options: BridgeOptions,
+  ancestry: ResponseAncestryState): RequestBody | undefined {
+  const latest = options.checkpoints?.candidate;
+  if (!previous || !cacheEnabled(options)
+    || (Object.hasOwn(options.checkpoints ?? {}, "candidate") && latest?.responseId !== previous.responseId)
+    || (!permitsFullHistory(ancestry) && previous.encodedOutput === undefined)) return undefined;
+  const { store: _previousStore, ...previousRequest } = previous.request;
+  const { store: _requestStore, ...unstored } = body;
+  const chained = cachedBody({ continuation: { ...previous, request: previousRequest } }, unstored);
+  return chained.previous_response_id == null ? undefined : chained;
 }
 
 async function nextItem(pending: Pending) {
@@ -444,6 +488,9 @@ function streamResponse(pending: Pending, first: ResponseStreamEvent, signal: Ab
 }
 
 export type ResponsesWebSocketBridge = {
+  /** Internal public-payload-hook preparation; no I/O or host guard exemption. */
+  prepare(payload: unknown): unknown;
+  observeProviderEvent(event: unknown): void;
   fetch: typeof globalThis.fetch;
   finish(output: AssistantMessage): Promise<void>;
 };
@@ -458,8 +505,13 @@ export function createResponsesWebSocketBridge(
   options: BridgeOptions,
 ): ResponsesWebSocketBridge {
   let pending: Pending | undefined;
+  let wireAncestry = options.responseAncestry ?? "legacy";
   // Provider retries reuse this bridge; a failed repair must stay terminal.
   let terminalRepairFailure: { error: unknown } | undefined;
+  let referenceRepairAttempted = false;
+  let referenceRepairStarted = false;
+  let prepared: { full: RequestBody; payload: RequestBody; chain: RequestBody; key: string; scope: string; previous: Continuation;
+    connection?: Connection; generation?: object } | undefined;
   let connectionLimitRetried = false;
   // Compression applies only at the real HTTP send; WS/JSON bridge input stays raw.
   const fallbackFetch = compressionFetch(options.fetch ?? globalThis.fetch);
@@ -467,15 +519,19 @@ export function createResponsesWebSocketBridge(
   // Both recovery policies bind to effective wire identity, never an unused API key.
   let checkpointKey = statusKey;
   let anchorKey: string | undefined;
-  const clearAnchor = () => {
+  const clearAnchor = (retireLineage = false) => {
     if (!anchorKey) return;
     anchors.delete(anchorKey);
     const connection = connections.get(anchorKey);
-    if (connection?.continuation?.expiresAt !== undefined) connection.continuation = undefined;
+    if (connection) {
+      connection.anchorGeneration = {};
+      if (retireLineage || connection.continuation?.expiresAt !== undefined) connection.continuation = undefined;
+    }
   };
   const bindCheckpointKey = (headers: Headers) => {
-    anchorKey = connectionKey(model, options, headers);
     checkpointKey = `${statusKey}\0${createHash("sha256").update(JSON.stringify([...headers])).digest("hex")}`;
+    // Invalidation follows identity even when SSE/uncached policy forbids reuse.
+    anchorKey = options.sessionId ? checkpointKey : undefined;
   };
   const notifyTransport = async (transport: string) => {
     try { await options.onTransport?.(transport, model); } catch { /* observation must not cause inference replay */ }
@@ -540,36 +596,97 @@ export function createResponsesWebSocketBridge(
 
   // SSE is a hard checkpoint gate: drop the policy-owned store:true (a hook's
   // explicit store:false and a caller parent pass through unchanged).
-  const sseFetch = async (fallbackRequest: Request) => {
-    let wireRequest = fallbackRequest;
-    if (options.checkpoints?.enabled === true) {
-      const body = JSON.parse(await fallbackRequest.text()) as RequestBody;
-      if (body.store === true) delete body.store;
-      wireRequest = new Request(fallbackRequest, { body: JSON.stringify(body) });
+  const sseFetch = async (fallbackRequest: Request, input?: RequestInfo | URL, init?: RequestInit) => {
+    const body = JSON.parse(await fallbackRequest.text()) as RequestBody;
+    wireAncestry = body.previous_response_id != null ? "server-dependent" : options.responseAncestry ?? "legacy";
+    if (body.previous_response_id != null) clearAnchor(true);
+    else if (!permitsFullHistory(wireAncestry)) {
+      const error = new Error("Cannot continue server-dependent or unknown response ancestry without a validated parent");
+      terminalRepairFailure = { error };
+      throw error;
     }
-    const response = await fallbackFetch(wireRequest);
+    if (options.checkpoints?.enabled === true && body.store === true) delete body.store;
+    const wireRequest = new Request(fallbackRequest, { body: JSON.stringify(body) });
+    // Preserve the SDK's URL/init send shape for caller fetch and shared compression.
+    const response = input === undefined ? await fallbackFetch(wireRequest)
+      : await fallbackFetch(input, { ...init, headers: wireRequest.headers, body: JSON.stringify(body) });
     await notifyTransport(transportLabel("SSE", getRequestCompressionEncoding(response)));
     return response;
   };
 
   return {
+    prepare(payload) {
+      if (terminalRepairFailure) throw terminalRepairFailure.error;
+      if (prepared) {
+        if (JSON.stringify(payload) === JSON.stringify(prepared.payload)) return payload;
+        if (JSON.stringify(payload) !== JSON.stringify(prepared.full)) {
+          const error = new Error("Prepared continuation changed before transport");
+          terminalRepairFailure = { error };
+          throw error;
+        }
+      }
+      if (!payload || typeof payload !== "object" || Array.isArray(payload)
+        || permitsFullHistory(options.responseAncestry ?? "legacy") || options.transport === "sse"
+        || !options.checkpoints?.candidate || (payload as RequestBody).previous_response_id != null) return payload;
+      const scope = preparationScopeKey(model, options);
+      if (!scope) return payload;
+      const full = JSON.parse(JSON.stringify(payload)) as RequestBody;
+      let selected: typeof prepared;
+      const keys = new Set([...connections.keys(), ...anchors.keys()]);
+      for (const key of keys) {
+        if (!key.startsWith(`${statusKey}\0`) || (options.transport === "auto" && autoSseFallback.has(key))) continue;
+        const connection = connections.get(key);
+        const live = connection && !connection.busy && connection.ws.socket.readyState === 1 && connection.continuation;
+        const previous = live ? connection.continuation : anchors.get(key);
+        if (!previous || !previous.requestUrl || previous.preparationScope !== scope
+          || (previous.expiresAt !== undefined && previous.expiresAt <= Date.now())
+          || (previous.expiresAt !== undefined && options.checkpoints.enabled && checkpointCooldown.has(key))) continue;
+        const chain = lineageBody(previous, full, options, options.responseAncestry ?? "legacy");
+        if (!chain) continue;
+        if (selected) return payload; // Different complete wire identities are not interchangeable.
+        selected = { full, payload: { ...full, previous_response_id: chain.previous_response_id },
+          chain: JSON.parse(JSON.stringify(chain)), key, scope, previous,
+          ...(live ? { connection, generation: connection.anchorGeneration } : {}) };
+      }
+      if (!selected) return payload;
+      prepared = selected;
+      // Retain independent snapshots: later payload hooks cannot mutate validation evidence.
+      return JSON.parse(JSON.stringify(selected.payload));
+    },
     fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
       let request = new Request(input, init);
-      const headers = new Headers(request.headers);
-      const supplied = responseHeaders(model, options);
-      if (supplied.has("authorization")) headers.set("authorization", supplied.get("authorization")!);
-      else if (supplied.has("cf-aig-authorization")) headers.delete("authorization");
-      else if (!headers.has("authorization") && !headers.has("cf-aig-authorization") && options.apiKey) {
-        headers.set("authorization", `Bearer ${options.apiKey}`);
-      }
-      if (supplied.has("cf-aig-authorization")) headers.set("cf-aig-authorization", supplied.get("cf-aig-authorization")!);
+      const headers = effectiveResponseHeaders(model, options, request.headers);
       request = new Request(request, { headers });
-      const fallbackRequest = request.clone();
-      if (request.method !== "POST" || !new URL(request.url).pathname.replace(/\/+$/, "").endsWith("/responses")) {
-        return fallbackFetch(fallbackRequest);
-      }
+      const responseRequest = request.method === "POST" && new URL(request.url).pathname.replace(/\/+$/, "").endsWith("/responses");
+      if (!responseRequest && !prepared) return fallbackFetch(request.clone());
       if (terminalRepairFailure) throw terminalRepairFailure.error;
+      if (prepared) {
+        try {
+          if (!responseRequest) throw new Error("Prepared continuation changed before transport");
+          const received = JSON.parse(await request.clone().text()) as RequestBody;
+          const originValid = prepared.connection
+            ? connections.get(prepared.key) === prepared.connection && !prepared.connection.busy
+              && prepared.connection.ws.socket.readyState === 1 && prepared.connection.continuation === prepared.previous
+              && prepared.connection.anchorGeneration === prepared.generation
+            : anchors.get(prepared.key) === prepared.previous && prepared.previous.expiresAt! > Date.now();
+          const chain = lineageBody(prepared.previous, prepared.full, options, options.responseAncestry ?? "legacy");
+          if (!originValid || request.url !== prepared.previous.requestUrl || connectionKey(model, options, headers) !== prepared.key
+            || preparationScopeKey(model, options, headers) !== prepared.scope
+            || JSON.stringify(received) !== JSON.stringify(prepared.payload)
+            || JSON.stringify(chain) !== JSON.stringify(prepared.chain)) throw new Error("Prepared continuation changed before transport");
+          // The SDK saw a real validated parent; bridge planning still owns the original full request.
+          request = new Request(request, { body: JSON.stringify(prepared.full) });
+        } catch (error) {
+          terminalRepairFailure = { error };
+          throw error;
+        }
+      }
+      const fallbackRequest = request.clone();
       bindCheckpointKey(request.headers);
+      if (options.transport === "sse") {
+        actualTransports.set(statusKey, "sse");
+        return sseFetch(fallbackRequest, input, init);
+      }
       if (options.transport === "auto") {
         const state = autoSseFallback.get(checkpointKey);
         if (useSse || (state?.recovering && state !== recoveryState) || (state && Date.now() < state.retryAt)) {
@@ -583,7 +700,6 @@ export function createResponsesWebSocketBridge(
         if (state) state.recovering = true;
       }
 
-      let referenceRepairAttempted = false;
       let connectionLimitFailure = false;
       // Stored reconnects allow only the explicit reference repair, never HTTP replay.
       let storedAnchorAttempted = false;
@@ -602,6 +718,7 @@ export function createResponsesWebSocketBridge(
       let cooldownSuppressed = false;
       try {
         const requestBody = JSON.parse(await request.text()) as RequestBody;
+        wireAncestry = options.responseAncestry ?? "legacy";
         const { previous_response_id: _previousResponseId, store: _policyStore, ...strippedBody } = requestBody;
         // Keep a hook's explicit store:false (privacy veto); only policy store:true is dropped.
         const bareBody: RequestBody = requestBody.store === false ? { ...strippedBody, store: false } : strippedBody;
@@ -644,10 +761,15 @@ export function createResponsesWebSocketBridge(
             ...acquired,
             idleTimeoutMs: options.timeoutMs,
             request: requestBody,
-            hasFullHistory: requestBody.previous_response_id == null,
+            hasFullHistory: permitsFullHistory(wireAncestry),
+            ancestry: wireAncestry,
+            anchorGeneration: acquired.connection.anchorGeneration,
+            preparationScope: preparationScopeKey(model, options, request.headers),
+            requestUrl: request.url,
             iterator,
             scopeHash,
-            onStreamError: durable ? (error) => { terminalRepairFailure = { error }; } : undefined,
+            // Every accepted attempt belongs to this logical request, including a replacement repair.
+            onStreamError: (error) => { terminalRepairFailure = { error }; },
             onSent: () => { if (checkpointProbe && pending?.sentStore) checkpointProbe.attempted = true; },
           };
           // Recovery must not reference state from the discarded connection,
@@ -674,25 +796,24 @@ export function createResponsesWebSocketBridge(
           // A caller-rooted connection lineage (unknown server history) under cooldown
           // or probe keeps chaining it, whatever the store value; replacing it with
           // local input would silently drop history, so an unchainable request fails closed.
-          const callerRooted = (cooldownSuppressed || checkpointProbe) && requestBody.previous_response_id == null
-            && acquired.connection.continuation?.hasFullHistory === false && cacheEnabled(options);
+          const callerRooted = requestBody.previous_response_id == null
+            && (!permitsFullHistory(wireAncestry) || ((cooldownSuppressed || checkpointProbe)
+              && acquired.connection.continuation?.hasFullHistory === false && cacheEnabled(options)));
           let lineageChain: RequestBody | undefined;
           if (callerRooted) {
-            const previous = acquired.connection.continuation!;
-            const { store: _previousStore, ...previousRequest } = previous.request;
-            const { store: _requestStore, ...unstored } = requestBody;
-            const chained = cachedBody({ ...acquired.connection, continuation: { ...previous, request: previousRequest } }, unstored);
-            if (chained.previous_response_id == null) {
-              // shortcut: fails closed instead of reconstructing caller-owned history; revisit if callers need it.
-              // Nothing was sent: keep the pooled connection and its provenance; terminal for
-              // this request (no SSE fallback, no provider retry with partial history).
+            const chained = lineageBody(acquired.connection.continuation, requestBody, options, wireAncestry);
+            if (chained?.previous_response_id == null && !plan) {
+              // Nothing sent: retain same-socket lineage, but never escape through SSE or provider retry.
               release(pending);
               pending = undefined;
-              const failure = new Error("Cannot continue a caller-rooted conversation during checkpoint cooldown");
+              const failure = new Error("Cannot continue server-dependent or unknown response ancestry without a validated parent");
               terminalRepairFailure = { error: failure };
               throw Object.assign(failure, { checkpointLineageUnavailable: true });
             }
-            lineageChain = requestBody.store === false ? { ...chained, store: false } : chained;
+            lineageChain = chained?.previous_response_id != null ? chained : plan!.request as RequestBody;
+            if (cooldownSuppressed) delete lineageChain.store;
+            if (requestBody.store === false) lineageChain = { ...lineageChain, store: false };
+            else if (!cooldownSuppressed) lineageChain = { ...lineageChain, store: requestBody.store };
           }
           const body = stripRejectedParent ? repairBody
             : lineageChain ? lineageChain
@@ -702,16 +823,23 @@ export function createResponsesWebSocketBridge(
           // A parent is bridge-owned only when cachedBody rewrote the request
           // into a delta; a caller-supplied previous_response_id is never a
           // bridge-owned baseline.
-          const bridgeOwnedParent = delta !== undefined && delta !== requestBody
+          const bridgeOwnedParent = lineageChain?.previous_response_id ?? (delta !== undefined && delta !== requestBody
             ? delta.previous_response_id
-            : undefined;
+            : undefined);
           const storedAnchorSent = acquired.connection.continuation?.expiresAt !== undefined
             && bridgeOwnedParent === acquired.connection.continuation.responseId && body.previous_response_id === bridgeOwnedParent;
+          if (body.previous_response_id != null && body.previous_response_id !== bridgeOwnedParent) {
+            clearAnchor(true);
+            pending.anchorGeneration = acquired.connection.anchorGeneration;
+            pending.hasFullHistory = false;
+          }
           storedAnchorAttempted ||= storedAnchorSent;
-          if (storedAnchorSent) pending.onStreamError = (error) => { terminalRepairFailure = { error }; };
           pending.hasFullHistory &&= bridgeOwnedParent === undefined || (durable && delta === plan?.request)
             || acquired.connection.continuation?.hasFullHistory === true;
           if (lineageChain) pending.hasFullHistory = false;
+          if (!pending.hasFullHistory) pending.ancestry = "server-dependent";
+          else if (bridgeOwnedParent !== undefined && acquired.connection.continuation?.ancestry === "legacy") pending.ancestry = "legacy";
+          wireAncestry = pending.ancestry;
           checkpointIntentSent ||= body.store === true || bridgeOwnedParent !== undefined;
           pending.sentStore = body.store === true;
           pending.connection.ws.send({ type: "response.create", ...body } as ResponsesClientEvent);
@@ -744,7 +872,7 @@ export function createResponsesWebSocketBridge(
             // checkpoint intent: repair once (full history, fields omitted)
             // and open the cooldown. Auth/ambiguous failures never qualify.
             if (durable && checkpointIntentSent && !request.signal.aborted && !stripRejectedParent && isCheckpointReferenceFailure(error)
-              && (hasFullHistory || !cacheEnabled(options))) {
+              && hasFullHistory) {
               checkpointFailedSignal = error;
               openCheckpointCooldown(); // first signal: cooldown opens now,
               // whether the repair below succeeds, fails or is fenced.
@@ -801,11 +929,23 @@ export function createResponsesWebSocketBridge(
         return sseFetch(fallbackRequest);
       }
     },
+    observeProviderEvent(event) {
+      if (referenceRepairAttempted && event && typeof event === "object" && "type" in event
+        && typeof event.type === "string" && event.type.length > 0 && event.type !== "error" && event.type !== "response.failed") {
+        referenceRepairStarted = true;
+      }
+    },
     async finish(output) {
+      if (output.api === "openai-responses" && output.stopReason === "error"
+        && referenceRepairStarted && !options.signal?.aborted) {
+        // Classification only: raw errors can carry credentials outside top-level redaction.
+        appendAssistantMessageDiagnostic(output, { type: "provider_reference_repair_terminal", timestamp: Date.now() });
+      }
+      recordResponseAncestry(output, pending?.ancestry ?? wireAncestry);
       if (!pending) { releaseProbes(); return; }
       const completed = responseEventOutput(pending.completion ?? {});
       let encodedOutput: unknown[] | undefined;
-      if (options.checkpoints && (options.checkpoints.enabled || (pending.sentStore && completed?.store === true))
+      if (options.checkpoints && (options.checkpoints.enabled || !pending.hasFullHistory || (pending.sentStore && completed?.store === true))
         && completed && completed.id === output.responseId) {
         try { encodedOutput = await options.checkpoints.encodeOutput(output); }
         catch { /* Unsupported host codec: no locally proven continuation. */ }
@@ -823,11 +963,17 @@ export function createResponsesWebSocketBridge(
           }
         } catch { /* Unsupported host codec: full history stays canonical, no attestation. */ }
       }
-      if (output.stopReason !== "error" && output.stopReason !== "aborted" && output.responseId && cacheEnabled(options)) {
+      const currentGeneration = pending.anchorGeneration === pending.connection.anchorGeneration
+        && (!pending.key || connections.get(pending.key) === pending.connection);
+      if (!currentGeneration) pending.keep = false;
+      if (currentGeneration && output.stopReason !== "error" && output.stopReason !== "aborted" && output.responseId && cacheEnabled(options)) {
         pending.connection.continuation = {
           request: pending.request,
           responseId: output.responseId,
           hasFullHistory: pending.hasFullHistory,
+          ancestry: pending.ancestry,
+          preparationScope: pending.preparationScope,
+          requestUrl: pending.requestUrl,
           ...(outputComplete ? { encodedOutput } : {}),
         };
       }
@@ -851,7 +997,8 @@ export function createResponsesWebSocketBridge(
         if (current && current === checkpointProbe?.state) checkpointCooldown.delete(checkpointKey);
       } else if (checkpointProbe?.attempted && output.stopReason !== "aborted") openCheckpointCooldown();
       const continuation = pending.connection.continuation;
-      if (continuation && pending.key && pending.hasFullHistory && pending.sentStore === true && completed?.store === true
+      if (continuation && pending.key && connections.get(pending.key) === pending.connection
+        && pending.anchorGeneration === pending.connection.anchorGeneration && pending.sentStore === true && completed?.store === true
         && completed.id === output.responseId && outputComplete
         && (output.stopReason === "stop" || output.stopReason === "toolUse")
         && !recoveryProbe && !checkpointCooldown.has(checkpointKey) && !rejectedContinuationKeys.has(pending.key)) {

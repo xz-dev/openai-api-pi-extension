@@ -87,7 +87,8 @@ for both `stream` and `streamSimple`, including checkpoint policy/capture:
 - `websocket`: a fresh Responses WebSocket per request.
 - `websocket-cached`: reuses a session WebSocket and sends
   `previous_response_id` plus only new input when the conversation prefix still
-  matches; otherwise sends full context safely.
+  matches; otherwise sends full local context or fails if known server ancestry
+  cannot be preserved.
 - `auto`: tries cached WebSocket first. Transport failures allow three WebSocket
   retries through Pi's retry owner; the fourth failure starts SSE fallback for
   two minutes. Failed recovery probes step to three, four and at most five
@@ -136,13 +137,19 @@ Optional settings, including `responseCheckpointExclude`, pass through without
 plugin defaults or native `['*']` defaults being inserted. The actual bridge
 owner applies [checkpoint policy and storage](#response-checkpoints); eligible
 durable requests have stricter replay limits than ordinary auto fallback.
+Stopping the host's ordinary retries after a started reference repair requires
+Pi's matching shared retry consumer; automatic overflow compaction remains a
+[separate recovery exception](docs/response-checkpoints.md#reference-repair-retry-fence).
 Public context normalization is used only when available on the host, preserving
 system prompts and tool declarations; compression itself requires the updated host exports.
 
 Because message conversion runs inside Pi's shared `transformMessages` step,
-the extension itself drops empty-content user/assistant messages (for example
-watchdog inquiry fold markers) before delegating, so requests stay clean on any
-host pi version.
+the extension itself resolves ancestry, then drops empty-content user/assistant
+messages (for example watchdog inquiry fold markers) before delegating, so
+filtering cannot erase an applicable ancestry fact. On hosts with native ancestry
+guards, the existing payload hook exposes only a validated bridge-owned parent
+before that guard. The bridge revalidates the final payload and wire identity;
+this does not turn its parent into caller authority or permit parent-free replay.
 
 ## Request compression
 

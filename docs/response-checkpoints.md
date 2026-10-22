@@ -2,7 +2,9 @@
 
 A checkpoint can resume stored Responses state after a reconnect or session
 restart: send an existing response ID and new input instead of the whole
-conversation. Full local JSONL history remains authoritative.
+conversation. Local JSONL history remains authoritative when it contains the
+whole lineage, or when Pi explicitly adopts a summary plus retained messages.
+Caller-owned parents can include history that exists only on the server.
 
 **Privacy:** eligible `auto` and `websocket-cached` requests ask for remote
 `store: true` by default, including on third-party gateways. Confirm the
@@ -126,13 +128,29 @@ has no persisted checkpoint metadata. The envelope and encoded history prefix
 must still match; the transport label reports `WS/continuation`.
 
 An in-memory anchor requires sent `store: true`, a successful completion explicitly
-acknowledging `store: true`, and complete local history with verified encoded
-output. Omitted or false storage acknowledgement cannot create this anchor.
-Failed or partial turns never replace it. The cache holds at most 32 identities,
-expires anchors after ten minutes without extending their age on use, and clears
-them on session shutdown, cooldown, recovery probes and reference rejection.
-These are client bounds, not a server-retention guarantee. A cache miss sends full
-history; durable message checkpoints below remain a separate restore path.
+acknowledging `store: true`, and verified encoded output. Omitted or false storage
+acknowledgement cannot create this anchor. A caller-owned parent retires any older
+local anchor. Its latest confirmed stored descendant may chain under the same
+identity, envelope and exact-prefix checks, but cannot certify complete local
+history or authorize parent-free repair. Failed or partial turns never replace
+an anchor. Delayed completion cannot restore an invalidated or superseded anchor.
+The cache holds at most 32 identities, expires anchors after ten minutes without
+extending their age on use, and clears them on session shutdown, cooldown,
+recovery probes and reference rejection. These are client bounds, not a
+server-retention guarantee. Cache loss removes reuse permission, not ancestry:
+local history may send full input; known-dependent history must find a validated
+latest chain or fail. Durable message checkpoints below remain a separate restore
+path.
+
+On hosts with native ancestry guards, the extension uses the existing `onPayload`
+hook after the caller's hook to prepare only an independently validated live
+connection or stored-anchor continuation. Preparation performs no network I/O,
+keeps the full logical input, and creates no checkpoint or host exemption. The
+bridge revalidates final payload, endpoint, model/session, effective credential
+and header identity, exact prefix, source lifetime and storage proof before
+transport. Later mutation, expiration or invalidation fails closed. The generated
+parent stays bridge-owned; it cannot authorize caller takeover, parent-free repair
+or SSE fallback. An actual caller-supplied parent remains caller-owned.
 
 ## Restore and safe failure
 
@@ -146,14 +164,86 @@ The latest assistant on the active branch is the only candidate. Restore or
 rollback uses it only when actual endpoint/account/header scope, the request
 envelope and the exact encoded history prefix still match, including tools and
 opaque reasoning. Invalid/expired metadata, edited history, changed scope or
-envelope, unknown versions, incomplete output and unsafe suffixes send full
-history. A caller-owned parent is not replaced or declared full history.
+envelope, unknown versions, incomplete output and unsafe suffixes disable reuse.
+Only local or legacy-compatible history may then send full input. A caller-owned
+parent is not replaced or declared full history by durable planning.
 
-At most one WS repair is allowed for a proven pre-execution reference rejection
-with genuine complete local history. The existing strict message-ID repair
-includes the exact WS 1008 signature, not arbitrary policy closes. There is no
-replay after output, auth failure, unknown execution or caller-dependent
-ancestry; no hidden provider retry or HTTP/SSE replay after a failed repair.
+## Ancestry and summary boundaries
+
+New assistant messages carry optional `responseAncestry`: exact `local` or
+`server-dependent`. This fact survives ordinary host JSONL/export/fork persistence,
+independent of checkpoint settings, remote storage and socket lifetime. It stays
+out of provider JSON, headers, transport labels and conversation text. Both
+`stream` and `streamSimple` resolve it before empty-message filtering, including
+explicit SSE (which opens no WebSocket for bookkeeping) and auto fallback.
+
+- `local`: independently local input; losing an optimization permits full-input
+  fallback. Completion, storage and output-reconstruction gates still govern
+  checkpoint capture and repair.
+- `server-dependent`: actual caller-owned wire parent or inherited dependent
+  ancestry. Use only the latest independently validated chain; otherwise fail
+  before a parent-free WS/HTTP request. No complete-history checkpoint or repair.
+- Genuinely absent: preserve legacy fallback and capture eligibility. This is
+  compatibility trust, not independently verified local history; descendants
+  remain unmarked until a real new local baseline.
+- Present but malformed (including `null`, own `undefined`, wrong type or unknown
+  value): unknown, not absent. An independently validated chain can still work,
+  but malformed data grants no complete-history privilege. Subsequent output
+  remains conservatively server-dependent.
+
+**Accepted legacy risk:** old unmarked local and caller-rooted histories can be
+indistinguishable. Compatibility fallback can omit server-only ancestry in old
+caller-rooted conversations. This does not guarantee universally safe legacy
+continuation.
+
+Actual structured compaction or branch-summary projection adopts summary plus
+retained messages as new local input. The host projects pre-boundary retained
+assistants as local copies and conveys the baseline through the same non-wire
+fact on its converted user summary. Adopted assistant copies, not a user/local
+field, establish that baseline. Ordinary user metadata cannot clear preceding
+dependent, malformed or legacy ancestry. Stored history is not rewritten. Old
+checkpoints still need exact-prefix validation. A later caller takeover remains
+dependent even while that old summary stays in context. Plain edits, empty
+filtering, forks, rollback, identity changes and cache loss are not rebases.
+
+The extension consumes this typed `Context` seam; summary text is never inspected.
+When the host exposes its public context event and session projection, the
+extension associates the complete ordered cloned input with the canonical
+projection, raw source-entry IDs and active branch positions. Only genuine
+structured compaction/branch-summary entries adopt copied assistants. Unmatched,
+ambiguous, reordered or replaced third-party input is not adopted. Already
+corrected native projection is a no-op. An old host's ordinary omission of an
+unsafe or legacy assistant retains its fact or genuine absence in an empty copy;
+omission is not local-history proof. Event input, raw entries and JSONL stay
+unchanged. A later dependent output remains negative, including across a model
+switch. Actual supported-host projection and persistence propagation require
+paired host integration validation; component fixtures alone do not establish
+that gate.
+
+## Reference-repair retry fence
+
+At most one provider-local WS repair is allowed for a proven pre-execution
+reference rejection with genuine complete local history. The existing strict
+message-ID repair includes the exact WS 1008 signature, not arbitrary policy
+closes. Auth failure, unknown execution and caller-dependent ancestry do not
+permit this repair. A failed repair cannot trigger another provider-local retry
+or HTTP/SSE replay, including when checkpoints are disabled.
+
+If the repair starts yielding mapped response events and then fails without an
+abort, its current error output carries a `provider_reference_repair_terminal`
+diagnostic containing only `type` and `timestamp`. A Pi host with the matching
+shared retry consumer blocks ordinary automatic retries of that output. Older
+hosts can still load the plugin, but do not provide this outer-retry guarantee.
+Later unrelated requests are not poisoned.
+
+Automatic overflow recovery remains a separate exception: when enabled, the
+host may omit the failed attempt from active context, compact history and
+continue the interrupted turn with a smaller request. The original partial
+output remains in append-only session JSONL; it need not remain in active model
+context. A response-start event or overflow error text alone does not prove that
+nothing was generated before failure. This exception is not an exactly-once
+execution guarantee.
+
 Explicit SSE and allowed auto WS-to-SSE fallback never carry policy
 `store: true`; a hook's `store: false` is kept.
 

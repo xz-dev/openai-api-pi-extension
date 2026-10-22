@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
 import { afterEach, test } from "node:test";
+import { once } from "node:events";
+import { WebSocketError } from "openai/resources/responses/internal-base";
 import { createServer, type Server } from "node:http";
 import { WebSocketServer } from "ws";
 import type { Message } from "@earendil-works/pi-ai";
 import { createOpenAIApiProvider } from "../index.ts";
-import { closeResponsesWebSockets, getActualResponsesTransport } from "../responses-websocket-fetch.ts";
+import { closeResponsesWebSockets, createResponsesWebSocketBridge, getActualResponsesTransport } from "../responses-websocket-fetch.ts";
 
 const servers: Array<Server | WebSocketServer> = [];
 
@@ -95,6 +97,81 @@ async function sseServer(text: string) {
     get requests() { return requests; },
   };
 }
+
+test("SDK connection lifetime closes an idle connection on a late API error", { timeout: 5_000 }, async () => {
+  let idleSocket: import("ws").WebSocket;
+  const upstream = await server((_body, _connection, socket) => {
+    idleSocket = socket;
+    completed(socket, "resp_idle", "ok");
+  });
+  const provider = createOpenAIApiProvider();
+  const options = { apiKey: "bridge-key", transport: "websocket-cached" as const, sessionId: "sdk-idle-error" };
+  const context = { messages: [{ role: "user" as const, content: "ping", timestamp: 1 }] };
+  assert.equal((await provider.streamSimple(model(upstream.baseUrl), context, options).result()).stopReason, "stop");
+
+  const closed = once(idleSocket!, "close");
+  idleSocket!.send(JSON.stringify({ type: "error", error: { code: "server_error", message: "late idle failure" } }));
+  await closed;
+
+  const later = await provider.streamSimple(model(upstream.baseUrl), context, options).result();
+  assert.equal(later.stopReason, "stop", later.errorMessage);
+  assert.equal(upstream.connections, 2, "failed idle socket must not be reused");
+});
+
+test("SDK connection lifetime preserves the active iterator API error", { timeout: 5_000 }, async () => {
+  const fault = { type: "error", error: { code: "server_error", message: "active SDK failure", status: 500 } };
+  let requests = 0;
+  let httpRequests = 0;
+  const upstream = await server((_body, _connection, socket) => {
+    requests++;
+    socket.send(JSON.stringify({ type: "response.created", response: { id: "resp_active" } }));
+    socket.send(JSON.stringify(fault));
+  });
+  const bridge = createResponsesWebSocketBridge(model(upstream.baseUrl), {
+    apiKey: "bridge-key", transport: "auto", sessionId: "sdk-active-error",
+    fetch: async () => { httpRequests++; throw new Error("unexpected HTTP replay"); },
+  });
+  const response = await bridge.fetch(`${upstream.baseUrl}/responses`, {
+    method: "POST", body: JSON.stringify({ model: "mock-gpt", input: [], stream: true }),
+  });
+  await assert.rejects(response.text(), (error) => {
+    assert.ok(error instanceof WebSocketError);
+    assert.deepEqual(error.error, fault);
+    assert.equal(error.message, JSON.stringify(fault));
+    return true;
+  });
+  assert.equal(requests, 1);
+  assert.equal(httpRequests, 0);
+});
+
+test("SDK connection lifetime keeps a replacement pooled after a displaced connection error", { timeout: 5_000 }, async () => {
+  let displacedSocket: import("ws").WebSocket;
+  let started!: () => void;
+  const firstStarted = new Promise<void>((resolve) => { started = resolve; });
+  const usedConnections: number[] = [];
+  const upstream = await server((_body, connection, socket) => {
+    usedConnections.push(connection);
+    if (connection === 1) {
+      displacedSocket = socket;
+      socket.send(JSON.stringify({ type: "response.created", response: { id: "resp_displaced" } }));
+      started();
+    } else completed(socket, `resp_replacement_${usedConnections.length}`, "replacement ok");
+  });
+  const provider = createOpenAIApiProvider();
+  const options = { apiKey: "bridge-key", transport: "websocket-cached" as const, sessionId: "sdk-displaced-error" };
+  const context = { messages: [{ role: "user" as const, content: "ping", timestamp: 1 }] };
+  const first = provider.streamSimple(model(upstream.baseUrl), context, options).result();
+  await firstStarted;
+  assert.equal((await provider.streamSimple(model(upstream.baseUrl), context, options).result()).stopReason, "stop");
+
+  displacedSocket!.send(JSON.stringify({ type: "error", error: { code: "server_error", message: "displaced failure" } }));
+  const failed = await first;
+  assert.equal(failed.stopReason, "error");
+  assert.match(failed.errorMessage ?? "", /displaced failure/);
+  const later = await provider.streamSimple(model(upstream.baseUrl), context, options).result();
+  assert.equal(later.stopReason, "stop", later.errorMessage);
+  assert.deepEqual(usedConnections, [1, 2, 2], "old error must not evict replacement");
+});
 
 test("websocket transport reuses Pi request building, parser, auth, and headers", async () => {
   let request: Record<string, unknown> | undefined;

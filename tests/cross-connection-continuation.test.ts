@@ -20,6 +20,7 @@ async function harness(t: TestContext, perMessageDeflate = false) {
   const frames: Array<{ body: any; connection: number }> = [];
   const sockets: WebSocket[] = [];
   const labels: string[] = [];
+  const received: any[] = [];
   let behavior: ((socket: WebSocket, frame: any) => boolean) | undefined;
   let store: boolean | undefined = true;
   let httpRequests = 0;
@@ -46,14 +47,22 @@ async function harness(t: TestContext, perMessageDeflate = false) {
     checkpoints: { enabled: false, encodeOutput: async (output: any) => [assistant(output.responseId)] },
     onTransport: (label: string) => { labels.push(label); },
     fetch: async () => { httpRequests++; throw new Error("unexpected HTTP replay"); } };
-  async function turn(request = body(), overrides: any = {}, headers: Record<string, string> = {}) {
+  async function turn(request = body(), overrides: any = {}, headers: Record<string, string> = {},
+    beforeFetch?: (bridge: ReturnType<typeof createResponsesWebSocketBridge>, request: any) => unknown) {
     const bridge = createResponsesWebSocketBridge(model, { ...options, ...overrides });
     lastBridge = bridge;
     try {
+      const payload = beforeFetch ? await beforeFetch(bridge, request) : request;
       const response = await bridge.fetch(`${model.baseUrl}/responses`, {
-        method: "POST", headers: { "content-type": "application/json", ...headers }, body: JSON.stringify(request),
+        method: "POST", headers: { "content-type": "application/json", ...headers }, body: JSON.stringify(payload),
       });
-      const events = (await response.text()).split("\n").filter((line) => line.startsWith("data: {")).map((line) => JSON.parse(line.slice(6)));
+      let text = "";
+      try {
+        for await (const chunk of response.body!) text += new TextDecoder().decode(chunk);
+      } finally {
+        received.push(...text.split("\n").filter((line) => line.startsWith("data: {")).map((line) => JSON.parse(line.slice(6))));
+      }
+      const events = text.split("\n").filter((line) => line.startsWith("data: {")).map((line) => JSON.parse(line.slice(6)));
       const completed = events.find((event) => event.type === "response.completed");
       if (!completed) throw new Error("turn did not complete");
       const output: any = { stopReason: "stop", responseId: completed.response.id };
@@ -68,7 +77,7 @@ async function harness(t: TestContext, perMessageDeflate = false) {
     const socket = sockets.at(-1)!;
     const closed = once(socket, "close"); socket.close(1000, "server idle timeout"); await closed;
   }
-  return { frames, sockets, labels, model, options, turn, disconnect,
+  return { frames, sockets, labels, received, model, options, turn, disconnect,
     retryLast: (request = body()) => lastBridge.fetch(`${model.baseUrl}/responses`, {
       method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(request),
     }),
@@ -125,6 +134,95 @@ for (const changed of ["input", "output", "envelope", "caller-parent"] as const)
   if (changed === "caller-parent") request.previous_response_id = "caller-owned";
   await h.turn(request);
   assert.deepEqual(h.frames[1].body, { type: "response.create", ...request });
+});
+
+test("caller takeover retires old local anchor; reconnect uses only validated dependent chain, never repair", async (t) => {
+  const h = await harness(t); h.options.checkpoints.enabled = true; h.options.responseAncestry = "local";
+  const first = await h.turn();
+  const caller = await h.turn({ ...extended(first.responseId), previous_response_id: "external-root" });
+  assert.equal(caller.responseAncestry, "server-dependent");
+  assert.equal(caller.responseCheckpoint, undefined);
+  await h.disconnect();
+  const request = body([...extended(first.responseId).input, assistant(caller.responseId), user("three")]);
+  const descendant = await h.turn(request, { responseAncestry: "server-dependent" });
+  assert.equal(h.frames[2].body.previous_response_id, caller.responseId, "old resp_1 cannot resurrect");
+  assert.deepEqual(h.frames[2].body.input, [user("three")]);
+  assert.equal(descendant.responseAncestry, "server-dependent");
+  assert.equal(descendant.responseCheckpoint, undefined, "stored dependent chain is not complete-history proof");
+  await h.disconnect();
+  h.behavior = (socket) => { socket.send(JSON.stringify(missing)); return true; };
+  const next = body([...request.input, assistant(descendant.responseId), user("four")]);
+  await assert.rejects(h.turn(next, { responseAncestry: "server-dependent", transport: "auto" }));
+  assert.equal(h.frames[3].body.previous_response_id, descendant.responseId);
+  assert.equal(h.frames.length, 4, "dependent rejection cannot repair parent-free");
+  await assert.rejects(h.retryLast(next));
+  assert.equal(h.frames.length, 4);
+  assert.equal(h.httpRequests, 0);
+});
+
+test("caller takeover retires old local anchor even when new output cannot seed a stored chain", async (t) => {
+  const h = await harness(t); h.options.checkpoints.enabled = true; const first = await h.turn();
+  h.store = false;
+  const caller = await h.turn({ ...extended(first.responseId), previous_response_id: "external-root" });
+  await h.disconnect();
+  const next = body([...extended(first.responseId).input, assistant(caller.responseId), user("three")]);
+  await assert.rejects(h.turn(next, { responseAncestry: "server-dependent", transport: "auto" }));
+  assert.equal(h.frames.length, 2, "no older anchor or parent-free WS escape");
+  assert.equal(h.httpRequests, 0);
+});
+
+test("explicit SSE caller takeover retires cached lineage without opening a bookkeeping socket", async (t) => {
+  const h = await harness(t); const first = await h.turn();
+  const caller = await h.turn({ ...body([user("delta")]), previous_response_id: "external-root" }, {
+    transport: "sse", fetch: async () => new Response(`data: ${JSON.stringify({ type: "response.completed",
+      response: { id: "resp_sse", status: "completed", output: [assistant("resp_sse")] } })}\n\ndata: [DONE]\n\n`,
+    { headers: { "content-type": "text/event-stream" } }),
+  });
+  assert.equal(caller.responseAncestry, "server-dependent");
+  assert.equal(h.sockets.length, 1);
+  await h.disconnect();
+  await h.turn(extended(first.responseId));
+  assert.equal(h.frames[1].body.previous_response_id, undefined, "selected old local branch cannot resurrect retired memory anchor");
+});
+
+for (const invalidation of ["shutdown", "caller-takeover", "sse-takeover"] as const) test(`late completion cannot resurrect an anchor after ${invalidation}`, { timeout: 10_000 }, async (t) => {
+  const h = await harness(t); h.options.checkpoints.enabled = true;
+  const first = await h.turn();
+  let unblock!: () => void;
+  const held = new Promise<void>((resolve) => { unblock = resolve; });
+  let encoding!: () => void;
+  const started = new Promise<void>((resolve) => { encoding = resolve; });
+  h.options.checkpoints.encodeOutput = async (output: any) => {
+    if (output.responseId === "resp_2") { encoding(); await held; }
+    return [assistant(output.responseId)];
+  };
+  const late = h.turn(body([user("late local request")]));
+  await started;
+  let caller: any;
+  if (invalidation === "shutdown") closeResponsesWebSockets("cross-socket");
+  else if (invalidation === "sse-takeover") {
+    await h.turn({ ...body([user("delta")]), previous_response_id: "external-root" }, {
+      transport: "sse", fetch: async () => new Response(`data: ${JSON.stringify({ type: "response.completed",
+        response: { id: "resp_sse", status: "completed", output: [assistant("resp_sse")] } })}\n\ndata: [DONE]\n\n`,
+      { headers: { "content-type": "text/event-stream" } }),
+    });
+  } else {
+    h.store = false;
+    caller = await h.turn({ ...extended(first.responseId), previous_response_id: "external-root" });
+    await h.disconnect();
+  }
+  unblock(); await late;
+  const request = invalidation !== "caller-takeover"
+    ? body([user("late local request"), assistant("resp_2"), user("next")])
+    : body([...extended(first.responseId).input, assistant(caller.responseId), user("next")]);
+  if (invalidation !== "caller-takeover") {
+    await h.turn(request);
+    assert.equal(h.frames.at(-1)!.body.previous_response_id, undefined, "invalidation rejects delayed anchor registration");
+  } else {
+    const before = h.frames.length;
+    await assert.rejects(h.turn(request, { responseAncestry: "server-dependent" }));
+    assert.equal(h.frames.length, before, "delayed local completion cannot replace dependent takeover");
+  }
 });
 
 test("anchor expires after ten minutes without refreshing its age on reconnect", async (t) => {
@@ -188,6 +286,31 @@ for (const rejection of ["missing", "missing-failed-frame", "legacy"] as const) 
   assert.equal(h.httpRequests, 0);
   await h.disconnect(); await h.turn(request);
   assert.equal(h.frames[3].body.previous_response_id, undefined, "rejected anchor removed");
+});
+
+for (const terminal of ["error", "response.failed"] as const) test(`accepted non-durable repair retains partial text and fences ${terminal} for the logical request`, async (t) => {
+  const h = await harness(t); const first = await h.turn(); await h.disconnect();
+  h.behavior = (socket, frame) => {
+    if (frame.previous_response_id) socket.send(JSON.stringify(missing));
+    else {
+      socket.send(JSON.stringify({ type: "response.created", response: { id: "resp_partial" } }));
+      socket.send(JSON.stringify({ type: "response.output_text.delta", delta: "partial repair text" }));
+      setImmediate(() => socket.send(JSON.stringify(terminal === "error"
+        ? { type: "error", error: { type: "server_error", code: "server_error", message: "repair failed" } }
+        : { type: "response.failed", response: { status: "failed", error: { type: "server_error", message: "repair failed" } } })));
+    }
+    return true;
+  };
+  const request = extended(first.responseId);
+  await assert.rejects(h.turn(request, { transport: "auto" }));
+  assert.equal(h.frames.length, 3);
+  assert.equal(h.received.find((event) => event.type === "response.output_text.delta")?.delta, "partial repair text");
+  await assert.rejects(h.retryLast(request), "accepted repair failure stays terminal across pending replacement");
+  assert.equal(h.frames.length, 3, "same logical request sends no fourth frame");
+  assert.equal(h.httpRequests, 0);
+  h.behavior = undefined;
+  const later = await h.turn(body([user("unrelated")]), { transport: "auto" });
+  assert.equal(later.responseId, "resp_4", "later unrelated request is not poisoned");
 });
 
 test("second repair rejection stays terminal for provider retries", async (t) => {
@@ -315,4 +438,120 @@ for (const status of [401, 503]) test(`stored reconnect handshake ${status} neve
   assert.equal(h.httpRequests, 0);
   await assert.rejects(h.retryLast(extended(first.responseId)));
   assert.equal(h.httpRequests, 0);
+});
+
+for (const store of [true, false]) test(`payload preparation exposes validated parent but bridge keeps ownership/store=${store}`, async (t) => {
+  const h = await harness(t); h.options.checkpoints.enabled = true;
+  const caller = await h.turn({ ...body(), previous_response_id: "external-root" }); await h.disconnect();
+  const request = { ...extended(caller.responseId), store };
+  const original = structuredClone(request);
+  const output = await h.turn(request, { responseAncestry: "server-dependent",
+    checkpoints: { ...h.options.checkpoints, candidate: { responseId: caller.responseId } } }, {}, (bridge, full) => {
+    const prepared: any = bridge.prepare(full);
+    assert.equal(prepared.previous_response_id, caller.responseId);
+    assert.deepEqual(prepared.input, full.input, "preparation retains full logical input for final validation");
+    assert.equal(h.frames.length, 1, "preparation performs no network I/O");
+    assert.deepEqual(full, original);
+    return prepared;
+  });
+  assert.equal(output.responseAncestry, "server-dependent"); assert.equal(output.responseCheckpoint, undefined);
+  assert.equal(h.frames[1].body.previous_response_id, caller.responseId);
+  assert.deepEqual(h.frames[1].body.input, [user("two")]); assert.equal(h.frames[1].body.store, store);
+  assert.equal(h.httpRequests, 0);
+});
+
+for (const mutation of ["nested-input", "store", "headers", "request-url", "non-response-route", "invalid-json", "expiry", "invalidation"] as const) {
+  test(`payload preparation revalidates ${mutation} without stale parent or replay`, async (t) => {
+    let now = Date.now(); t.mock.method(Date, "now", () => now);
+    const h = await harness(t); h.options.checkpoints.enabled = true;
+    const caller = await h.turn({ ...body(), previous_response_id: "external-root" }); await h.disconnect();
+    const headers: Record<string, string> = {};
+    const request = extended(caller.responseId);
+    await assert.rejects(h.turn(request, { responseAncestry: "server-dependent",
+      checkpoints: { ...h.options.checkpoints, candidate: { responseId: caller.responseId } } }, headers, (bridge, full) => {
+      const prepared: any = bridge.prepare(full); assert.equal(prepared.previous_response_id, caller.responseId);
+      if (mutation === "nested-input") prepared.input[0].content = "edited after preparation";
+      if (mutation === "store") prepared.store = false;
+      if (mutation === "headers") headers["x-tenant"] = "changed after preparation";
+      if (mutation === "request-url" || mutation === "non-response-route" || mutation === "invalid-json") {
+        const fetch = bridge.fetch;
+        bridge.fetch = (input, init) => mutation === "invalid-json" ? fetch(input, { ...init, body: "{" })
+          : fetch(new URL(mutation === "request-url" ? "/other/responses" : "/chat/completions", String(input)), init);
+      }
+      if (mutation === "expiry") now += 10 * 60_000;
+      if (mutation === "invalidation") closeResponsesWebSockets("cross-socket");
+      return prepared;
+    }), mutation === "invalid-json" ? SyntaxError : /Prepared continuation changed before transport/);
+    assert.equal(h.frames.length, 1); assert.equal(h.httpRequests, 0);
+    await assert.rejects(h.retryLast(request)); assert.equal(h.frames.length, 1, "same request cannot retry a stale plan");
+    const later = await h.turn(body([user("unrelated")])); assert.equal(later.stopReason, "stop");
+  });
+}
+
+test("prepared dependent missing reference stays bridge-owned and cannot repair parent-free", async (t) => {
+  const h = await harness(t); h.options.checkpoints.enabled = true;
+  const caller = await h.turn({ ...body(), previous_response_id: "external-root" }); await h.disconnect();
+  h.behavior = (socket) => { socket.send(JSON.stringify(missing)); return true; };
+  const request = extended(caller.responseId);
+  await assert.rejects(h.turn(request, { responseAncestry: "server-dependent", transport: "auto",
+    checkpoints: { ...h.options.checkpoints, candidate: { responseId: caller.responseId } } }, {}, (bridge, full) => bridge.prepare(full)));
+  assert.equal(h.frames.length, 2); assert.equal(h.frames[1].body.previous_response_id, caller.responseId);
+  await assert.rejects(h.retryLast(request)); assert.equal(h.frames.length, 2); assert.equal(h.httpRequests, 0);
+});
+
+test("payload preparation never claims actual caller parent or cold unvalidated lineage", async (t) => {
+  const h = await harness(t); h.options.checkpoints.enabled = true;
+  const caller = await h.turn({ ...body(), previous_response_id: "external-root" }); await h.disconnect();
+  const explicit = { ...extended(caller.responseId), previous_response_id: "new-caller-root" };
+  const output = await h.turn(explicit, { responseAncestry: "server-dependent",
+    checkpoints: { ...h.options.checkpoints, candidate: { responseId: caller.responseId } } }, {}, (bridge, full) => {
+    assert.equal(bridge.prepare(full), full, "caller payload passes through unchanged"); return full;
+  });
+  assert.equal(h.frames[1].body.previous_response_id, "new-caller-root"); assert.equal(output.responseAncestry, "server-dependent");
+  closeResponsesWebSockets();
+  const request = body([...explicit.input, assistant(output.responseId), user("three")]);
+  await assert.rejects(h.turn(request, { responseAncestry: "server-dependent",
+    checkpoints: { ...h.options.checkpoints, candidate: { responseId: output.responseId } } }, {}, (bridge, full) => {
+    assert.equal(bridge.prepare(full), full, "no invented parent on cold cache miss"); return full;
+  }));
+  assert.equal(h.frames.length, 2); assert.equal(h.httpRequests, 0);
+});
+
+for (const change of ["credential", "tenant", "model", "session", "envelope", "prefix", "latest"] as const) {
+  test(`payload preparation declines unvalidated ${change} identity before exposing parent`, async (t) => {
+    const h = await harness(t); h.options.checkpoints.enabled = true;
+    const caller = await h.turn({ ...body(), previous_response_id: "external-root" }); await h.disconnect();
+    const request: any = extended(caller.responseId);
+    const options = { ...h.options, responseAncestry: "server-dependent",
+      checkpoints: { ...h.options.checkpoints, candidate: { responseId: caller.responseId } } };
+    if (change === "credential") options.apiKey = "different-credential";
+    if (change === "tenant") options.headers = { "x-tenant": "different-tenant" };
+    if (change === "model") h.model.id = "different-model";
+    if (change === "session") options.sessionId = "different-session";
+    if (change === "envelope") request.instructions = "different instructions";
+    if (change === "prefix") request.input[0].content = "different prefix";
+    if (change === "latest") options.checkpoints.candidate.responseId = "different-latest";
+    const bridge = createResponsesWebSocketBridge(h.model, options);
+    assert.equal(bridge.prepare(request), request);
+    assert.equal(request.previous_response_id, undefined); assert.equal(h.frames.length, 1); assert.equal(h.httpRequests, 0);
+  });
+}
+
+test("prepared nonstored lineage stays connection-local through cooldown and fails cold", async (t) => {
+  const h = await harness(t); h.options.checkpoints.enabled = true; h.store = false;
+  const caller = await h.turn({ ...body(), previous_response_id: "external-root" });
+  const second = await h.turn({ ...extended(caller.responseId), store: false }, { responseAncestry: "server-dependent",
+    checkpoints: { ...h.options.checkpoints, candidate: { responseId: caller.responseId } } }, {}, (bridge, full) => {
+    const prepared: any = bridge.prepare(full); assert.equal(prepared.previous_response_id, caller.responseId); return prepared;
+  });
+  assert.equal(h.frames[1].connection, h.frames[0].connection);
+  assert.equal(h.frames[1].body.store, false); assert.deepEqual(h.frames[1].body.input, [user("two")]);
+  assert.equal(second.responseAncestry, "server-dependent"); assert.equal(second.responseCheckpoint, undefined);
+  await h.disconnect();
+  const third = { ...body([...extended(caller.responseId).input, assistant(second.responseId), user("three")]), store: false };
+  await assert.rejects(h.turn(third, { responseAncestry: "server-dependent",
+    checkpoints: { ...h.options.checkpoints, candidate: { responseId: second.responseId } } }, {}, (bridge, full) => {
+    assert.equal(bridge.prepare(full), full, "unacknowledged storage cannot become a reconnect anchor"); return full;
+  }));
+  assert.equal(h.frames.length, 2); assert.equal(h.httpRequests, 0);
 });

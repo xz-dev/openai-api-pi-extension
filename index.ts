@@ -19,13 +19,13 @@ import {
   type RefreshModelsContext,
 } from "@earendil-works/pi-ai";
 import { openAIResponsesApi } from "@earendil-works/pi-ai/compat";
-import { checkpointCandidate, checkpointsEnabled, encodeCheckpointOutput, type CheckpointOptions } from "./checkpoint-adapter.ts";
-import { compressionFetch } from "./request-compression.ts";
+import { adoptResponseAncestry, checkpointCandidate, checkpointsEnabled, encodeCheckpointOutput, responseAncestry, type CheckpointOptions,
+  type ResponseAncestryState } from "./checkpoint-adapter.ts";
 import {
   createResponsesWebSocketBridge,
   getActualResponsesTransport,
-  recordActualResponsesTransport,
   redactAssistantStream,
+  type ResponsesWebSocketBridge,
   wrapResponsesWebSocketStream,
 } from "./responses-websocket-fetch.ts";
 
@@ -362,20 +362,28 @@ export function createOpenAIApiProvider(
     | { baseUrl: string; apiKey: string; models: readonly GatewayModel[]; checkedAt: number }
     | undefined;
   const api = openAIResponsesApi();
-  const bridgeOptions = (model: GatewayModel, context: Context, options: CheckpointOptions) => {
+  const bridgeOptions = (model: GatewayModel, context: Context, options: CheckpointOptions, ancestry: ResponseAncestryState) => {
     const raw = Object.hasOwn(options, "responseCheckpointExclude") ? options.responseCheckpointExclude : getRawCheckpointExclude();
     const mode = Object.hasOwn(options, "responseCheckpointMode") ? options.responseCheckpointMode : getRawCheckpointMode();
-    return { ...options, checkpoints: {
+    return { ...options, responseAncestry: ancestry, checkpoints: {
       enabled: checkpointsEnabled(model, { ...options, responseCheckpointMode: mode }, raw),
       candidate: checkpointCandidate(context),
       encodeOutput: (output: piAI.AssistantMessage) => encodeCheckpointOutput(api, model, context, output),
     } };
   };
-  const payloadHook = (enabled: boolean, original: CheckpointOptions["onPayload"]) =>
+  const payloadHook = (bridge: ResponsesWebSocketBridge, enabled: boolean, original: CheckpointOptions["onPayload"]) =>
     async (payload: unknown, model: GatewayModel) => {
       if (enabled && payload && typeof payload === "object") (payload as { store?: boolean }).store = true;
-      return original?.(payload, model);
+      const next = await original?.(payload, model);
+      return bridge.prepare(next === undefined ? payload : next);
     };
+  const providerEventHook = (bridge: ResponsesWebSocketBridge, options: CheckpointOptions & {
+    onProviderStreamEvent?: (event: unknown, model: GatewayModel) => void | Promise<void>;
+  }) => async (event: unknown, model: GatewayModel) => {
+    await options.onProviderStreamEvent?.(event, model);
+    // SDK SSE start precedes decoding; only an accepted mapped provider event proves repair start.
+    bridge.observeProviderEvent(event);
+  };
   const provider: Provider<"openai-responses"> = {
     id: PROVIDER,
     name: PROVIDER_NAME,
@@ -439,19 +447,15 @@ export function createOpenAIApiProvider(
     },
     stream: (model, context, options) => {
       options = { ...options, transport: options?.transport ?? "auto" };
+      const ancestry = responseAncestry(context);
       const filteredContext = { ...context, messages: dropEmptyMessages(context.messages) };
       const requestContext = normalizeContext?.(filteredContext) ?? filteredContext;
-      if (options.transport === "sse") {
-        recordActualResponsesTransport(model.baseUrl, "sse", options?.sessionId);
-        // Host skips automatic encoding for a custom fetch: opt in at the wire.
-        const wireFetch = compressionFetch(options?.fetch ?? globalThis.fetch);
-        return redactAssistantStream(api.stream(model, requestContext, { ...options, transport: "sse", fetch: wireFetch }), options?.apiKey);
-      }
-      // The bridge owns transport and continuation; see README.md#transports.
-      const owned = bridgeOptions(model, requestContext, options);
+      // The bridge owns transport and ancestry, including explicit SSE without opening WS.
+      const owned = bridgeOptions(model, context, options, ancestry);
       const bridge = createResponsesWebSocketBridge(model, owned);
       const sdkOptions = { ...options, transport: "sse" as const, onTransport: undefined, fetch: bridge.fetch,
-        onPayload: payloadHook(owned.checkpoints.enabled, options.onPayload) };
+        onPayload: payloadHook(bridge, owned.checkpoints.enabled, options.onPayload),
+        onProviderStreamEvent: providerEventHook(bridge, options) };
       return redactAssistantStream(
         wrapResponsesWebSocketStream(api.stream(model, requestContext, sdkOptions), bridge),
         options.apiKey,
@@ -459,17 +463,14 @@ export function createOpenAIApiProvider(
     },
     streamSimple: (model, context, options) => {
       options = { ...options, transport: options?.transport ?? "auto" };
+      const ancestry = responseAncestry(context);
       const filteredContext = { ...context, messages: dropEmptyMessages(context.messages) };
       const requestContext = normalizeContext?.(filteredContext) ?? filteredContext;
-      if (options.transport === "sse") {
-        recordActualResponsesTransport(model.baseUrl, "sse", options?.sessionId);
-        const wireFetch = compressionFetch(options?.fetch ?? globalThis.fetch);
-        return redactAssistantStream(api.streamSimple(model, requestContext, { ...options, transport: "sse", fetch: wireFetch }), options?.apiKey);
-      }
-      const owned = bridgeOptions(model, requestContext, options);
+      const owned = bridgeOptions(model, context, options, ancestry);
       const bridge = createResponsesWebSocketBridge(model, owned);
       const sdkOptions = { ...options, transport: "sse" as const, onTransport: undefined, fetch: bridge.fetch,
-        onPayload: payloadHook(owned.checkpoints.enabled, options.onPayload) };
+        onPayload: payloadHook(bridge, owned.checkpoints.enabled, options.onPayload),
+        onProviderStreamEvent: providerEventHook(bridge, options) };
       return redactAssistantStream(
         wrapResponsesWebSocketStream(api.streamSimple(model, requestContext, sdkOptions), bridge),
         options.apiKey,
@@ -480,6 +481,10 @@ export function createOpenAIApiProvider(
 }
 
 export default async function (pi: ExtensionAPI): Promise<void> {
+  pi.on("context", (event, ctx) => {
+    const messages = adoptResponseAncestry(event.messages, ctx.sessionManager);
+    return messages ? { messages } : undefined;
+  });
   pi.registerEntryRenderer(ERROR_ENTRY, (entry, _options, theme) => {
     const message =
       typeof (entry.data as { message?: unknown } | undefined)?.message === "string"

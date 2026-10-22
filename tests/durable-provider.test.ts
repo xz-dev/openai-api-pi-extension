@@ -42,7 +42,9 @@ async function harness(t: any) {
     for (const event of events(`opaque_${++generations}`)) response.write(`data: ${JSON.stringify(event)}\n\n`);
     response.end("data: [DONE]\n\n");
   });
-  const wss = new WebSocketServer({ server: http });
+  let handshakeStatus: number | undefined;
+  const wss = new WebSocketServer({ server: http,
+    verifyClient: (_info, done) => done(handshakeStatus === undefined, handshakeStatus) });
   await new Promise<void>((resolve) => http.listen(0, "127.0.0.1", resolve));
   const address = http.address();
   assert.ok(address && typeof address === "object");
@@ -98,7 +100,8 @@ async function harness(t: any) {
     const models = createModels({ credentials });
     models.setProvider(createOpenAIApiProvider([], undefined, getRawCheckpointExclude)); return models;
   };
-  return { dir, frames, httpFrames, headers, urls, model, options, stored, makeModels,
+  return { dir, frames, httpFrames, headers, urls, model, options, stored, wss, makeModels,
+    set handshakeStatus(value: number | undefined) { handshakeStatus = value; },
     set accountHeader(value: string) { accountHeader = value; },
     recordGeneration: () => `opaque_${++generations}`,
     get generations() { return generations; },
@@ -107,6 +110,52 @@ async function harness(t: any) {
     set outputItems(value: typeof outputItems) { outputItems = value; },
     set mutateEvent(value: typeof mutateEvent) { mutateEvent = value; } };
 }
+
+for (const method of ["stream", "streamSimple"] as const) for (const transport of ["sse", "auto", "websocket", "websocket-cached"] as const) {
+  test(`${method}/${transport}: local ancestry persists with checkpoints off and stays off provider wire`, async (t) => {
+    const h = await harness(t);
+    const session = SessionManager.create(h.dir, h.dir);
+    session.appendMessage(user("one"));
+    const options = { ...h.options, transport, responseCheckpointExclude: ["*"] };
+    const first: any = await h.makeModels()[method](h.model, { messages: session.buildSessionContext().messages }, options).result();
+    assert.equal(first.stopReason, "stop", first.errorMessage);
+    assert.equal(first.responseAncestry, "local");
+    assert.equal(first.responseCheckpoint, undefined);
+    const leaf = session.appendMessage(first);
+    const jsonl = await readFile(session.getSessionFile()!, "utf8");
+    assert.ok(jsonl.includes('"responseAncestry":"local"'));
+    const forkFile = session.createBranchedSession(leaf);
+    assert.ok(forkFile);
+    assert.equal((SessionManager.open(forkFile).buildSessionContext().messages.at(-1) as any).responseAncestry, "local");
+    closeResponsesWebSockets();
+    const reopened = SessionManager.open(session.getSessionFile()!);
+    reopened.appendMessage(user("two"));
+    const second: any = await h.makeModels()[method](h.model, { messages: reopened.buildSessionContext().messages }, options).result();
+    assert.equal(second.stopReason, "stop", second.errorMessage);
+    assert.equal(second.responseAncestry, "local");
+    const frames = transport === "sse" ? h.httpFrames : h.frames;
+    assert.equal(frames.length, 2);
+    assert.equal(frames[1].previous_response_id, undefined);
+    assert.deepEqual(frames[1].input, [input("one"), message(first.responseId), input("two")]);
+    assert.equal(JSON.stringify(frames).includes("responseAncestry"), false);
+    assert.equal(h.headers.length, transport === "sse" ? 0 : 2, "SSE never opens WS for ancestry");
+  });
+}
+
+for (const method of ["stream", "streamSimple"] as const) test(`${method}: genuine legacy absence keeps cold full fallback without laundering local proof`, async (t) => {
+  const h = await harness(t);
+  const first: any = await h.makeModels()[method](h.model, { messages: [user("one")] }, h.options).result();
+  const legacy = structuredClone(first);
+  delete legacy.responseAncestry;
+  delete legacy.responseCheckpoint;
+  closeResponsesWebSockets();
+  const second: any = await h.makeModels()[method](h.model, { messages: [user("one"), legacy, user("two")] }, h.options).result();
+  assert.equal(second.stopReason, "stop", second.errorMessage);
+  assert.equal(Object.hasOwn(second, "responseAncestry"), false, "compatibility trust is not independently local");
+  assert.ok(second.responseCheckpoint, "legacy capture eligibility preserved");
+  assert.equal(h.frames[1].previous_response_id, undefined);
+  assert.deepEqual(h.frames[1].input, [input("one"), message(first.responseId), input("two")]);
+});
 
 for (const method of ["stream", "streamSimple"] as const) test(`${method}: JSONL reload/new provider/socket and old active branch send exact delta`, async (t) => {
   const h = await harness(t);
@@ -262,6 +311,7 @@ test("real provider raw policy and incoming override precedence never materializ
     const output: any = await h.makeModels(() => { reads++; return entry.raw; }).streamSimple(h.model,
       { messages: [user(entry.label)] }, { ...options, onPayload: (body: any) => { payload = wireBody(body); } }).result();
     assert.equal(output.stopReason, "stop", output.errorMessage);
+    assert.equal(output.responseAncestry, "local", "checkpoint policy never controls persisted ancestry");
     assert.equal(reads, entry.incoming ? 0 : 1, entry.label);
     assert.deepEqual(options, before, "raw options unchanged, including own undefined/absence");
     assert.equal(Object.hasOwn(options, "responseCheckpointExclude"), !!entry.incoming);
@@ -292,6 +342,7 @@ test("unknown/false capability and SSE/uncached WS retain non-storage behavior",
         ...(entry.mode ? { responseCheckpointMode: entry.mode } : {}),
         onPayload: (body: any) => { payload = wireBody(body); } }).result();
     assert.equal(output.stopReason, "stop", output.errorMessage);
+    assert.equal(output.responseAncestry, "local");
     assert.equal(output.responseCheckpoint, undefined); assert.equal(payload.store, false);
     assert.equal(payload.previous_response_id, undefined);
     assert.deepEqual(payload.input, [input("one")]);
@@ -589,10 +640,291 @@ for (const rejection of ["missing", "strict-message"]) test(`caller-supplied rej
     ...h.options, maxRetries: 2, onPayload: (payload: any) => ({ ...payload, previous_response_id: "external-root", input: [input("caller delta")] }),
   }).result();
   assert.equal(failed.stopReason, "error");
+  assert.equal(failed.responseAncestry, "server-dependent", "actual caller parent persists even when pending attempt is discarded");
   assert.equal(failed.responseCheckpoint, undefined);
   assert.deepEqual(h.frames[1], { ...h.frames[0], previous_response_id: "external-root", input: [input("caller delta")] });
   assert.equal(h.frames.length, 2);
   assert.equal(h.generations, 1);
+  assert.equal(h.httpFrames.length, 0);
+});
+
+for (const method of ["stream", "streamSimple"] as const) test(`${method}: R1 ordinary user/local cannot erase caller-owned dependence`, async (t) => {
+  const h = await harness(t);
+  const models = h.makeModels();
+  const first: any = await models[method](h.model, { messages: [user("one")] }, h.options).result();
+  h.stored.set("external", { account: "Bearer dummy-durable-key/", full: [input("hidden server ancestor")] });
+  const caller: any = await models[method](h.model, { messages: [user("one"), first, user("two")] }, {
+    ...h.options, onPayload: (payload: any) => ({ ...payload, previous_response_id: "external" }),
+  }).result();
+  assert.equal(caller.stopReason, "stop", caller.errorMessage);
+  assert.equal(caller.responseAncestry, "server-dependent");
+  assert.equal(caller.responseCheckpoint, undefined);
+  for (const empty of [false, true]) {
+    closeResponsesWebSockets();
+    const messages = [user("one"), first, user("two"), empty ? { ...caller, content: [] } : caller,
+      { ...user("ordinary follow-up, not summary"), responseAncestry: "local" }];
+    const before = structuredClone(messages);
+    const count = h.frames.length;
+    const output: any = await models[method](h.model, { messages }, h.options).result();
+    assert.deepEqual({ stop: output.stopReason, checkpoint: !!output.responseCheckpoint,
+      newFrames: h.frames.length - count, http: h.httpFrames.length },
+    { stop: "error", checkpoint: false, newFrames: 0, http: 0 }, `empty dependent=${empty}`);
+    assert.equal(output.responseAncestry, "server-dependent");
+    assert.deepEqual(messages, before, "ordinary user/local cannot rewrite raw history, including filtered negative output");
+  }
+});
+
+for (const method of ["stream", "streamSimple"] as const) test(`${method}: R1 ordinary user/local cannot erase malformed ancestry`, async (t) => {
+  const h = await harness(t);
+  const first: any = await h.makeModels()[method](h.model, { messages: [user("one")] }, h.options).result();
+  for (const value of [null, undefined, "", "LOCAL", 1, {}, ["local"]]) {
+    closeResponsesWebSockets();
+    const malformed = { ...first, responseAncestry: value };
+    delete malformed.responseCheckpoint;
+    const messages = [user("one"), malformed, { ...user("ordinary follow-up"), responseAncestry: "local" }];
+    const before = structuredClone(messages);
+    const count = h.frames.length;
+    const output: any = await h.makeModels()[method](h.model, { messages }, h.options).result();
+    assert.deepEqual({ stop: output.stopReason, checkpoint: !!output.responseCheckpoint,
+      newFrames: h.frames.length - count, http: h.httpFrames.length },
+    { stop: "error", checkpoint: false, newFrames: 0, http: 0 }, `malformed=${JSON.stringify(value)}`);
+    assert.equal(output.responseAncestry, "server-dependent");
+    assert.deepEqual(messages, before, "malformed presence must survive without normalization to absence");
+  }
+});
+
+for (const method of ["stream", "streamSimple"] as const) test(`${method}: R1 ordinary user/local cannot launder genuinely absent legacy ancestry`, async (t) => {
+  const h = await harness(t);
+  const first: any = await h.makeModels()[method](h.model, { messages: [user("one")] }, h.options).result();
+  const legacy = structuredClone(first);
+  delete legacy.responseAncestry;
+  delete legacy.responseCheckpoint;
+  assert.equal(Object.hasOwn(legacy, "responseAncestry"), false);
+  closeResponsesWebSockets();
+  const baseline: any = await h.makeModels()[method](h.model, { messages: [user("one"), legacy, user("ordinary follow-up")] }, h.options).result();
+  assert.equal(baseline.stopReason, "stop", baseline.errorMessage);
+  assert.equal(Object.hasOwn(baseline, "responseAncestry"), false);
+  assert.ok(baseline.responseCheckpoint, "approved legacy compatibility keeps existing capture eligibility");
+  closeResponsesWebSockets();
+  const messages = [user("one"), legacy, { ...user("ordinary follow-up"), responseAncestry: "local" }];
+  const before = structuredClone(messages);
+  const output: any = await h.makeModels()[method](h.model, { messages }, h.options).result();
+  assert.equal(output.stopReason, "stop", output.errorMessage);
+  assert.equal(Object.hasOwn(output, "responseAncestry"), false, "user/local cannot upgrade compatibility trust to independently local");
+  assert.equal(!!output.responseCheckpoint, !!baseline.responseCheckpoint, "no new capture privilege beyond approved legacy behavior");
+  assert.deepEqual(h.frames[2], h.frames[1], "legacy cold full-input behavior unchanged by ordinary user metadata");
+  assert.equal(h.frames.length, 3);
+  assert.equal(h.httpFrames.length, 0);
+  assert.deepEqual(messages, before, "legacy absence remains absent in raw history");
+});
+
+test("empty malformed latest assistant cannot reuse an older dependent checkpoint after filtering", async (t) => {
+  const h = await harness(t);
+  h.stored.set("external-root", { account: "Bearer dummy-durable-key/", full: [input("server-only")] });
+  const caller: any = await h.makeModels().stream(h.model, { messages: [user("delta")] }, {
+    ...h.options, onPayload: (payload: any) => ({ ...payload, previous_response_id: "external-root" }),
+  }).result();
+  assert.equal(caller.stopReason, "stop", caller.errorMessage);
+  const empty = { ...caller, content: [], responseId: "unconfirmed-latest", responseAncestry: null };
+  const next: any = await h.makeModels().streamSimple(h.model, { messages: [user("delta"), caller, empty, user("two")] }, h.options).result();
+  assert.equal(next.stopReason, "error", "filtering must not restore an older active-branch candidate");
+  assert.equal(next.responseAncestry, "server-dependent");
+  assert.equal(next.responseCheckpoint, undefined);
+  assert.equal(h.frames.length, 1);
+  assert.equal(h.httpFrames.length, 0);
+});
+
+for (const method of ["stream", "streamSimple"] as const) for (const transport of ["sse", "auto", "websocket", "websocket-cached"] as const) {
+  test(`${method}/${transport}: present malformed ancestry never enters legacy fallback`, async (t) => {
+    const h = await harness(t);
+    const first: any = await h.makeModels()[method](h.model, { messages: [user("one")] }, h.options).result();
+    closeResponsesWebSockets();
+    for (const value of [null, undefined, "", "LOCAL", 1, {}, ["local"]]) {
+      const malformed = { ...first, responseAncestry: value };
+      delete malformed.responseCheckpoint;
+      const next: any = await h.makeModels()[method](h.model, { messages: [user("one"), malformed, user("two")] }, {
+        ...h.options, transport, maxRetries: 0, responseCheckpointExclude: ["*"],
+      }).result();
+      assert.equal(next.stopReason, "error", JSON.stringify(value));
+      assert.equal(next.responseAncestry, "server-dependent");
+      assert.equal(next.responseCheckpoint, undefined);
+    }
+    assert.equal(h.frames.length, 1);
+    assert.equal(h.httpFrames.length, 0);
+  });
+}
+
+for (const reject of [false, true]) test(`malformed latest fact uses independently valid cold chain without capture or repair, rejected=${reject}`, async (t) => {
+  const h = await harness(t);
+  const first: any = await h.makeModels().stream(h.model, { messages: [user("one")] }, h.options).result();
+  assert.ok(first.responseCheckpoint);
+  const malformed = { ...first, responseAncestry: null };
+  closeResponsesWebSockets();
+  if (reject) h.behavior = (socket) => { rejectMissing(socket); return true; };
+  const next: any = await h.makeModels().streamSimple(h.model, { messages: [user("one"), malformed, user("two")] }, h.options).result();
+  assert.equal(next.stopReason, reject ? "error" : "stop", next.errorMessage);
+  assert.equal(next.responseAncestry, "server-dependent");
+  assert.equal(next.responseCheckpoint, undefined);
+  assert.equal(h.frames[1].previous_response_id, first.responseId);
+  assert.deepEqual(h.frames[1].input, [input("two")]);
+  assert.equal(h.frames.length, 2, "unknown history cannot use parent-free repair");
+  assert.equal(h.httpFrames.length, 0);
+});
+
+for (const method of ["stream", "streamSimple"] as const) test(`${method}: SSE caller dependence survives switching to WS and auto cooldown`, async (t) => {
+  const h = await harness(t);
+  h.handshakeStatus = 503;
+  const options = { ...h.options, maxRetries: 0, responseCheckpointExclude: ["*"] };
+  for (let i = 0; i < 4; i++) {
+    const output: any = await h.makeModels()[method](h.model, { messages: [user(`auto ${i}`)] }, options).result();
+    assert.equal(output.stopReason, i === 3 ? "stop" : "error");
+    assert.equal(output.responseAncestry, "local");
+  }
+  assert.equal(h.httpFrames.length, 1, "ordinary local auto request keeps allowed SSE fallback");
+  const caller: any = await h.makeModels()[method](h.model, { messages: [user("delta")] }, {
+    ...options, transport: "sse", onPayload: (payload: any) => ({ ...payload, previous_response_id: "external-root", store: false }),
+  }).result();
+  assert.equal(caller.stopReason, "stop", caller.errorMessage);
+  assert.equal(caller.responseAncestry, "server-dependent");
+  assert.equal(caller.responseCheckpoint, undefined);
+  assert.equal(h.httpFrames[1].previous_response_id, "external-root");
+  assert.equal(h.httpFrames[1].store, false);
+  h.handshakeStatus = undefined;
+  const context = { messages: [user("delta"), caller, user("next")] };
+  for (const transport of ["websocket", "websocket-cached", "auto", "sse"] as const) {
+    const next: any = await h.makeModels()[method](h.model, context, { ...options, transport }).result();
+    assert.equal(next.stopReason, "error", transport);
+    assert.equal(next.responseAncestry, "server-dependent");
+    assert.equal(next.responseCheckpoint, undefined);
+  }
+  assert.equal(h.frames.length, 0);
+  assert.equal(h.httpFrames.length, 2, "cooldown cannot turn known dependence into parent-free HTTP");
+  assert.equal(JSON.stringify([...h.frames, ...h.httpFrames, ...h.headers]).includes("responseAncestry"), false);
+});
+
+for (const boundary of ["compaction", "branch-summary"] as const) test(`${boundary} projected Context adopts retained old dependent output; later takeover survives same summary and reload`, async (t) => {
+  const h = await harness(t);
+  const old: any = await h.makeModels().stream(h.model, { messages: [user("old")] }, h.options).result();
+  const stored = { ...old, responseAncestry: "server-dependent" };
+  const before = structuredClone(stored);
+  // Expected typed host projection: user baseline fact plus local copies of retained pre-boundary messages.
+  // Actual supported-host summary projection/loader propagation is a separate integration gate.
+  const summary = { ...user(`${boundary} summary`), responseAncestry: "local" };
+  const retained = { ...stored, responseAncestry: "local" };
+  const projected = [summary, user("retained user"), retained, user("next")];
+  closeResponsesWebSockets();
+  const adopted: any = await h.makeModels().streamSimple(h.model, { messages: projected }, h.options).result();
+  assert.equal(adopted.stopReason, "stop", adopted.errorMessage);
+  assert.equal(adopted.responseAncestry, "local");
+  assert.ok(adopted.responseCheckpoint);
+  assert.equal(h.frames[1].previous_response_id, undefined, "pre-rebase checkpoint gets no validation exemption");
+  assert.deepEqual(h.frames[1].input, [input(`${boundary} summary`), input("retained user"), message(old.responseId), input("next")]);
+  assert.deepEqual(stored, before, "projection never rewrites stored dependent assistant");
+  h.stored.set("external-root", { account: "Bearer dummy-durable-key/", full: [input("new hidden ancestry")] });
+  const caller: any = await h.makeModels().stream(h.model, { messages: [...projected, adopted, user("takeover")] }, {
+    ...h.options, onPayload: (payload: any) => ({ ...payload, previous_response_id: "external-root", input: [input("takeover")] }),
+  }).result();
+  assert.equal(caller.responseAncestry, "server-dependent");
+  assert.equal(caller.responseCheckpoint, undefined);
+  const session = SessionManager.create(h.dir, h.dir);
+  for (const entry of [...projected, adopted, user("takeover"), caller]) session.appendMessage(entry);
+  closeResponsesWebSockets();
+  const reopened = SessionManager.open(session.getSessionFile()!);
+  reopened.appendMessage(user("after reload"));
+  const next: any = await h.makeModels().streamSimple(h.model, { messages: reopened.buildSessionContext().messages }, h.options).result();
+  assert.equal(next.stopReason, "error", "old summary is not a perpetual reset of later caller dependence");
+  assert.equal(next.responseAncestry, "server-dependent");
+  assert.equal(h.frames.length, 3);
+  assert.equal(h.httpFrames.length, 0);
+});
+
+for (const change of ["edit", "empty", "fork", "rollback", "credential", "headers", "session", "endpoint", "shutdown", "expiry", "eviction"] as const) {
+  test(`${change} never rebases new dependent history or resurrects older local anchor`, async (t) => {
+    let now = Date.now(); t.mock.method(Date, "now", () => now);
+    const h = await harness(t);
+    h.mutateEvent = (event) => event.type === "response.completed" ? { ...event, response: { ...event.response, store: true } } : event;
+    const first: any = await h.makeModels().stream(h.model, { messages: [user("one")] }, h.options).result();
+    h.stored.set("external-root", { account: "Bearer dummy-durable-key/", full: [input("hidden ancestry")] });
+    const caller: any = await h.makeModels().streamSimple(h.model, { messages: [user("one"), first, user("delta")] }, {
+      ...h.options, onPayload: (payload: any) => ({ ...payload, previous_response_id: "external-root" }),
+    }).result();
+    assert.equal(caller.responseAncestry, "server-dependent");
+    assert.equal(caller.responseCheckpoint, undefined);
+    let messages = [user("one"), first, user("delta"), caller, user("two")];
+    let model = h.model;
+    const options = { ...h.options, maxRetries: 0 };
+    if (change === "edit") messages[0] = user("edited");
+    if (change === "empty") messages[3] = { ...caller, content: [] };
+    if (change === "fork") {
+      const session = SessionManager.create(h.dir, h.dir);
+      let leaf: string | undefined;
+      for (const entry of messages) leaf = session.appendMessage(entry);
+      const forkFile = session.createBranchedSession(leaf!);
+      assert.ok(forkFile);
+      messages = SessionManager.open(forkFile).buildSessionContext().messages;
+      assert.equal((messages.find((entry: any) => entry.responseId === caller.responseId) as any).responseAncestry, "server-dependent");
+      closeResponsesWebSockets();
+    }
+    if (change === "rollback") {
+      const session = SessionManager.create(h.dir, h.dir);
+      let dependentLeaf: string | undefined;
+      for (const entry of messages.slice(0, -1)) dependentLeaf = session.appendMessage(entry);
+      session.appendMessage({ ...first, responseId: "unselected-local" });
+      session.branch(dependentLeaf!);
+      session.appendMessage(user("two"));
+      messages = session.buildSessionContext().messages;
+      assert.equal((messages.at(-2) as any).responseAncestry, "server-dependent");
+      assert.equal(messages.some((entry: any) => entry.responseId === "unselected-local"), false);
+      closeResponsesWebSockets();
+    }
+    if (change === "credential") options.apiKey = "different-account";
+    if (change === "headers") options.headers = { "x-tenant": "changed" };
+    if (change === "session") options.sessionId = "different-session";
+    if (change === "endpoint") {
+      model = { ...model, baseUrl: `${model.baseUrl}/changed` };
+      options.env = { OPENAI_API_EXTENSION_BASE_URL: model.baseUrl };
+    }
+    if (change === "shutdown") closeResponsesWebSockets(h.options.sessionId);
+    if (change === "expiry" || change === "eviction") {
+      const closed = [...h.wss.clients].map((socket) => new Promise<void>((resolve) => socket.once("close", () => resolve())));
+      for (const socket of h.wss.clients) socket.close(1000, "idle");
+      await Promise.all(closed);
+      if (change === "expiry") now += 10 * 60_000;
+      else for (let i = 0; i < 32; i++) await h.makeModels().stream(h.model, { messages: [user(`other ${i}`)] }, { ...h.options, sessionId: `other-${i}` }).result();
+    }
+    const before = h.frames.length;
+    const next: any = await h.makeModels().streamSimple(model, { messages }, options).result();
+    assert.equal(next.stopReason, "error", change);
+    assert.equal(next.responseAncestry, "server-dependent");
+    assert.equal(next.responseCheckpoint, undefined);
+    assert.equal(h.frames.length, before, "no unsafe WS send");
+    assert.equal(h.httpFrames.length, 0, "no unsafe SSE escape");
+  });
+}
+
+for (const method of ["stream", "streamSimple"] as const) test(`${method}: new dependent JSONL survives shutdown and cold reload without checkpoint or unsafe fallback`, async (t) => {
+  const h = await harness(t);
+  const session = SessionManager.create(h.dir, h.dir);
+  session.appendMessage(user("delta"));
+  h.stored.set("external-root", { account: "Bearer dummy-durable-key/", full: [input("hidden server history")] });
+  const caller: any = await h.makeModels()[method](h.model, { messages: session.buildSessionContext().messages }, {
+    ...h.options, responseCheckpointExclude: ["*"],
+    onPayload: (payload: any) => ({ ...payload, store: true, previous_response_id: "external-root" }),
+  }).result();
+  assert.equal(caller.stopReason, "stop", caller.errorMessage);
+  assert.equal(caller.responseAncestry, "server-dependent");
+  assert.equal(caller.responseCheckpoint, undefined);
+  session.appendMessage(caller);
+  const raw = await readFile(session.getSessionFile()!, "utf8");
+  assert.ok(raw.includes('"responseAncestry":"server-dependent"'));
+  closeResponsesWebSockets();
+  const reopened = SessionManager.open(session.getSessionFile()!);
+  reopened.appendMessage(user("two"));
+  const next: any = await h.makeModels()[method](h.model, { messages: reopened.buildSessionContext().messages }, { ...h.options, maxRetries: 2, maxRetryDelayMs: 1 }).result();
+  assert.equal(next.stopReason, "error", "cold dependent history cannot become full local input");
+  assert.equal(next.responseAncestry, "server-dependent");
+  assert.equal(next.responseCheckpoint, undefined);
+  assert.equal(h.frames.length, 1);
   assert.equal(h.httpFrames.length, 0);
 });
 
@@ -605,10 +937,12 @@ for (const rejection of ["missing", "strict-message"]) test(`caller-owned lineag
     ...h.options, onPayload: (payload: any) => ({ ...payload, previous_response_id: "external-root", input: [input("delta")] }),
   }).result();
   assert.equal(caller.stopReason, "stop", caller.errorMessage);
+  assert.equal(caller.responseAncestry, "server-dependent");
   assert.equal(caller.responseCheckpoint, undefined);
   assert.deepEqual(h.frames[1], { ...h.frames[0], previous_response_id: "external-root", input: [input("delta")] });
   const descendant: any = await h.makeModels().stream(h.model, { messages: [user("delta"), caller, user("two")] }, h.options).result();
   assert.equal(descendant.stopReason, "stop", descendant.errorMessage);
+  assert.equal(descendant.responseAncestry, "server-dependent");
   assert.equal(descendant.responseCheckpoint, undefined, "server-only ancestry cannot be certified");
   assert.deepEqual(h.frames[2], { ...h.frames[0], previous_response_id: caller.responseId, input: [input("two")] });
   assert.equal(h.headers.length, 1);
@@ -678,6 +1012,7 @@ for (const mode of ["incomplete", "failed", "aborted", "missing-output", "hook-s
   if (mode === "aborted") for await (const event of stream) if (event.type === "text_delta") controller.abort();
   const output: any = await stream.result();
   assert.equal(output.responseCheckpoint, undefined);
+  assert.equal(output.responseAncestry, "local", "storage, completion and cancellation do not erase local request ancestry");
   if (mode === "aborted") assert.equal(output.stopReason, "aborted");
   assert.equal(output.content.find((block: any) => block.type === "text")?.text, "ok");
   assert.equal(h.frames[0].store, mode !== "hook-store-false");
