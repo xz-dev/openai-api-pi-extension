@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { afterEach, test } from "node:test";
 import { once } from "node:events";
+import OpenAI from "openai";
 import { WebSocketError } from "openai/resources/responses/internal-base";
 import { createServer, type Server } from "node:http";
 import { WebSocketServer } from "ws";
@@ -143,6 +144,99 @@ test("SDK connection lifetime preserves the active iterator API error", { timeou
   assert.equal(requests, 1);
   assert.equal(httpRequests, 0);
 });
+
+for (const status of [400, 401, 429, 503]) {
+  for (const location of ["frame", "detail"] as const) {
+    test(`pre-output application status ${status} at ${location} survives SDK fetch and retries`, { timeout: 5_000 }, async () => {
+      const fault = { type: "error", ...(location === "frame" ? { status } : {}), error: {
+        type: status === 400 ? "invalid_request_error" : "server_error",
+        code: status === 400 ? "context_length_exceeded" : "fixture_application_error",
+        message: "structured application rejection",
+        ...(location === "detail" ? { status } : {}),
+      } };
+      let requests = 0;
+      let httpRequests = 0;
+      const upstream = await server((_body, _connection, socket) => {
+        requests++;
+        socket.send(JSON.stringify(fault));
+      });
+      const bridge = createResponsesWebSocketBridge(model(upstream.baseUrl), {
+        apiKey: "bridge-key", transport: "auto", sessionId: `application-${status}-${location}`,
+        fetch: async () => { httpRequests++; throw new Error("unexpected HTTP replay"); },
+      });
+      const responses: Array<{ status: number; body: unknown }> = [];
+      const client = new OpenAI({ apiKey: "bridge-key", baseURL: upstream.baseUrl, maxRetries: 1,
+        fetch: async (input, init) => {
+          const response = await bridge.fetch(input, init);
+          responses.push({ status: response.status, body: await response.clone().json() });
+          return response;
+        },
+      });
+      await assert.rejects(client.responses.create({ model: "mock-gpt", input: [], stream: true }), (error) => {
+        assert.ok(error instanceof OpenAI.APIError);
+        assert.ok(!(error instanceof OpenAI.APIConnectionError));
+        assert.equal(error.status, status);
+        assert.deepEqual(error.error, fault.error);
+        return true;
+      });
+      assert.equal(responses.length, status === 429 || status >= 500 ? 2 : 1);
+      for (const response of responses) {
+        assert.equal(response.status, status);
+        assert.deepEqual(response.body, fault, "original application envelope survives fetch");
+      }
+      assert.equal(requests, 1, "same logical failure never resends a WS frame");
+      assert.equal(httpRequests, 0);
+    });
+  }
+}
+
+for (const transport of ["auto", "websocket", "websocket-cached"] as const) {
+  test(`pre-output application status 429 preserves ${transport} connection-limit recovery`, { timeout: 5_000 }, async () => {
+    const requests: Array<Record<string, unknown>> = [];
+    let httpRequests = 0;
+    const upstream = await server((body, _connection, socket) => {
+      requests.push(body);
+      if (requests.length <= 2) socket.send(JSON.stringify({ type: "error", status: 429,
+        error: { code: "websocket_connection_limit_reached", message: "connection full" } }));
+      else completed(socket, "resp_after_limit", "recovered");
+    });
+    const output = await createOpenAIApiProvider().streamSimple(model(upstream.baseUrl),
+      { messages: [{ role: "user", content: "ping", timestamp: 1 }] },
+      { apiKey: "bridge-key", transport, sessionId: `application-limit-${transport}`, maxRetries: 1,
+        fetch: async () => { httpRequests++; throw new Error("unexpected HTTP replay"); } }).result();
+    assert.equal(output.stopReason, "stop", output.errorMessage);
+    assert.equal(requests.length, 3, "one special fresh retry, then one genuine provider retry");
+    assert.equal(upstream.connections, 3);
+    assert.deepEqual(requests[1], requests[0]);
+    assert.deepEqual(requests[2], requests[0]);
+    assert.equal(httpRequests, 0);
+  });
+}
+
+for (const status of [undefined, null, "400", 399, 600, 400.5]) {
+  test(`pre-output application status ${String(status)} never invents an HTTP status`, { timeout: 5_000 }, async () => {
+    const fault = { type: "error", status, error: { code: "fixture_application_error", message: "original failure" } };
+    let requests = 0;
+    let httpRequests = 0;
+    const upstream = await server((_body, _connection, socket) => {
+      requests++;
+      socket.send(JSON.stringify(fault));
+    });
+    const bridge = createResponsesWebSocketBridge(model(upstream.baseUrl), {
+      apiKey: "bridge-key", transport: "auto", sessionId: "application-invalid-status",
+      fetch: async () => { httpRequests++; throw new Error("unexpected HTTP replay"); },
+    });
+    await assert.rejects(bridge.fetch(`${upstream.baseUrl}/responses`, {
+      method: "POST", body: JSON.stringify({ model: "mock-gpt", input: [], stream: true }),
+    }), (error) => {
+      assert.ok(error instanceof WebSocketError);
+      assert.deepEqual(error.error, JSON.parse(JSON.stringify(fault)));
+      return true;
+    });
+    assert.equal(requests, 1);
+    assert.equal(httpRequests, 0);
+  });
+}
 
 test("SDK connection lifetime keeps a replacement pooled after a displaced connection error", { timeout: 5_000 }, async () => {
   let displacedSocket: import("ws").WebSocket;

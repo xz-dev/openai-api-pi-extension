@@ -337,7 +337,13 @@ for (const frame of [
   await assert.rejects(h.turn(extended(first.responseId), { transport: "auto" }));
   assert.equal(h.frames.length, 2);
   assert.equal(h.httpRequests, 0);
-  await assert.rejects(h.retryLast(extended(first.responseId)));
+  const status = "status" in frame ? frame.status : "status" in frame.error ? frame.error.status : undefined;
+  if (status === undefined) await assert.rejects(h.retryLast(extended(first.responseId)));
+  else {
+    const response = await h.retryLast(extended(first.responseId));
+    assert.equal(response.status, status);
+    assert.deepEqual(await response.json(), frame, "fetch preserves the original rejection without resending");
+  }
   assert.equal(h.frames.length, 2);
 });
 

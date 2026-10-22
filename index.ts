@@ -372,10 +372,10 @@ export function createOpenAIApiProvider(
     } };
   };
   const payloadHook = (bridge: ResponsesWebSocketBridge, enabled: boolean, original: CheckpointOptions["onPayload"]) =>
-    async (payload: unknown, model: GatewayModel) => {
+    async (payload: unknown, model: GatewayModel, prepareRequest?: (payload: unknown) => Promise<Request>) => {
       if (enabled && payload && typeof payload === "object") (payload as { store?: boolean }).store = true;
-      const next = await original?.(payload, model);
-      return bridge.prepare(next === undefined ? payload : next);
+      const next = await original?.(payload, model, prepareRequest);
+      return bridge.prepare(next === undefined ? payload : next, prepareRequest);
     };
   const providerEventHook = (bridge: ResponsesWebSocketBridge, options: CheckpointOptions & {
     onProviderStreamEvent?: (event: unknown, model: GatewayModel) => void | Promise<void>;
