@@ -5,6 +5,8 @@
  * - /login openai-api-extension
  * - OPENAI_API_EXTENSION_BASE_URL / OPENAI_API_EXTENSION_API_KEY
  */
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 import { getAgentDir, type ExtensionAPI, SettingsManager, VERSION } from "@earendil-works/pi-coding-agent";
 import * as piAI from "@earendil-works/pi-ai";
 import {
@@ -21,6 +23,13 @@ import {
 import { openAIResponsesApi } from "@earendil-works/pi-ai/compat";
 import { adoptResponseAncestry, checkpointCandidate, checkpointsEnabled, encodeCheckpointOutput, responseAncestry, type CheckpointOptions,
   type ResponseAncestryState } from "./checkpoint-adapter.ts";
+import {
+  createMetadataResolver,
+  fetchMetadataSources,
+  neededSites,
+  SOURCE_URLS,
+} from "./metadata-sources.ts";
+import { MetadataConfigError, parseMetadataConfig } from "./model-metadata.ts";
 import {
   createResponsesWebSocketBridge,
   getActualResponsesTransport,
@@ -312,6 +321,76 @@ export async function fetchModels(
   return mapCatalog(await fetchCatalog(baseUrl, apiKey, signal), baseUrl, resolveMetadata);
 }
 
+const METADATA_CONFIG_FILE = "openai-api-extension.yaml";
+
+/** Test seam for the metadata config path and source endpoints (production uses the defaults). */
+export type MetadataHooks = {
+  configPath?: () => string;
+  sourceUrls?: typeof SOURCE_URLS;
+};
+
+export type CatalogEnrichment = {
+  models: GatewayModel[];
+  /** Human-readable one-line notes: ignored config fields and degraded sources. */
+  notes: string[];
+};
+
+/**
+ * The single enriched-catalog path shared by startup prefetch, login
+ * validation, refreshModels, and /provider-info. Reads the YAML config once
+ * per call, fetches only the sites the resolved chains need (shared per
+ * refresh), then maps the upstream catalog.
+ * - Missing config file = empty config (built-in default chain applies).
+ * - MetadataConfigError (invalid known values / bad YAML) propagates: callers
+ *   keep the previous catalog and must not surface it as an auth failure.
+ * - Failed sources degrade to upstream-mapped models with a note.
+ */
+export async function enrichCatalog(
+  entries: readonly unknown[],
+  baseUrl: string,
+  signal: AbortSignal | undefined,
+  hooks: MetadataHooks = {},
+): Promise<CatalogEnrichment> {
+  let text: string | undefined;
+  try {
+    text = await readFile(hooks.configPath?.() ?? join(getAgentDir(), METADATA_CONFIG_FILE), "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      throw new MetadataConfigError(METADATA_CONFIG_FILE, errorMessage(error));
+    }
+  }
+  const config = parseMetadataConfig(text);
+  // One aggregated warning per refresh listing every ignored field path.
+  const notes = config.warnings.length > 0
+    ? [`ignored unsupported fields: ${config.warnings.join(", ")}`]
+    : [];
+  const publicIds = entries.flatMap((entry) => {
+    const id =
+      typeof entry === "object" && entry !== null && !Array.isArray(entry)
+        ? entryIdentity(entry as UpstreamModel)?.id
+        : undefined;
+    return id ? [id] : [];
+  });
+  const needed = neededSites(config, publicIds);
+  let records: Awaited<ReturnType<typeof fetchMetadataSources>>["records"] = [];
+  if (needed.size > 0 && !signal?.aborted) {
+    const result = await fetchMetadataSources(needed, signal, hooks.sourceUrls ?? SOURCE_URLS);
+    records = result.records;
+    for (const site of result.failed) notes.push(`metadata source ${site} unavailable; using upstream values`);
+  }
+  const models = mapCatalog(entries, baseUrl, createMetadataResolver(config, records));
+  return { models, notes };
+}
+
+export async function fetchEnrichedCatalog(
+  baseUrl: string,
+  apiKey: string,
+  signal: AbortSignal | undefined,
+  hooks: MetadataHooks = {},
+): Promise<CatalogEnrichment> {
+  return enrichCatalog(await fetchCatalog(baseUrl, apiKey, signal), baseUrl, signal, hooks);
+}
+
 function credentialBaseUrl(credential: ApiKeyCredential | undefined): string | undefined {
   return normalizeBaseUrl(credential?.env?.[ENV_BASE_URL]);
 }
@@ -340,6 +419,7 @@ async function resolveConnection(
 
 function apiKeyAuth(
   onValidated: (baseUrl: string, apiKey: string, models: readonly GatewayModel[]) => void,
+  metadataHooks: MetadataHooks,
 ): ApiKeyAuth {
   return {
     name: `${PROVIDER_NAME} connection`,
@@ -362,15 +442,18 @@ function apiKeyAuth(
       interaction.notify({ type: "progress", message: "Validating connection..." });
       const entries = await fetchCatalog(baseUrl, apiKey, interaction.signal);
       try {
-        const models = mapCatalog(entries, baseUrl);
+        const { models, notes } = await enrichCatalog(entries, baseUrl, interaction.signal, metadataHooks);
         onValidated(baseUrl, apiKey, models);
+        for (const note of notes) interaction.notify({ type: "info", message: `Metadata: ${note}` });
         interaction.notify({ type: "info", message: `Found ${models.length} models.` });
       } catch (error) {
-        const reason = error instanceof Error ? error.message : String(error);
-        interaction.notify({
-          type: "info",
-          message: `Connected, but the model catalog is not usable: ${reason} API key saved; models were not updated.`,
-        });
+        const reason = errorMessage(error);
+        // Config failures must not look like an invalid API key or an unusable catalog.
+        const message =
+          error instanceof MetadataConfigError
+            ? `Connected, but the metadata config is invalid: ${reason} API key saved; models were not updated.`
+            : `Connected, but the model catalog is not usable: ${reason} API key saved; models were not updated.`;
+        interaction.notify({ type: "info", message });
       }
       return { type: "api_key", key: apiKey, env: { [ENV_BASE_URL]: baseUrl } };
     },
@@ -395,6 +478,7 @@ export function createOpenAIApiProvider(
   onCatalogError?: (message: string) => void,
   getRawCheckpointExclude: () => unknown = () => undefined,
   getRawCheckpointMode: () => unknown = () => undefined,
+  metadataHooks: MetadataHooks = {},
 ): Provider<"openai-responses"> {
   let models = initialModels;
   let initialModelsPublished = false;
@@ -430,7 +514,7 @@ export function createOpenAIApiProvider(
     auth: {
       apiKey: apiKeyAuth((baseUrl, apiKey, validatedModels) => {
         validatedLogin = { baseUrl, apiKey, models: validatedModels, checkedAt: Date.now() };
-      }),
+      }, metadataHooks),
     },
     getModels: () => models,
     refreshModels: async (context: RefreshModelsContext) => {
@@ -468,8 +552,15 @@ export function createOpenAIApiProvider(
       const apiKey = context.credential.key;
       if (!baseUrl || !apiKey) return;
       try {
-        const refreshed = await fetchModels(baseUrl, apiKey, context.signal);
+        const { models: refreshed, notes } = await fetchEnrichedCatalog(baseUrl, apiKey, context.signal, metadataHooks);
         if (context.signal.aborted) return;
+        for (const note of notes) {
+          try {
+            onCatalogError?.(`metadata note: ${note}`);
+          } catch {
+            /* reporter must not mask the refresh */
+          }
+        }
         await context.publish({
           persist: { models: refreshed, checkedAt: Date.now() },
           update: () => { models = refreshed; },
@@ -585,20 +676,24 @@ export default async function (pi: ExtensionAPI): Promise<void> {
       }
 
       try {
-        const models = await fetchModels(baseUrl, apiKey, AbortSignal.timeout(CONNECTION_TIMEOUT_MS));
+        const { models, notes } = await fetchEnrichedCatalog(baseUrl, apiKey, AbortSignal.timeout(CONNECTION_TIMEOUT_MS));
         ctx.ui.notify([
           ...lines,
           "Connection: ✓ connected; API key valid",
+          ...notes.map((note) => `Metadata note: ${note}`),
           `Models: ${models.length}`,
         ].join("\n"), "info");
       } catch (error) {
         const reason = errorMessage(error).split(apiKey).join("[REDACTED]");
+        // A metadata config error is not an auth failure: the key already
+        // validated upstream before enrichment ran.
+        const configError = error instanceof MetadataConfigError;
         ctx.ui.notify([
           ...lines,
-          "Connection: ✗ failed",
-          `Reason: ${reason}`,
+          configError ? "Connection: ✓ connected; API key valid" : "Connection: ✗ failed",
+          configError ? `Metadata: ✗ config error: ${reason}` : `Reason: ${reason}`,
           "Models: 0",
-        ].join("\n"), "error");
+        ].join("\n"), configError ? "warning" : "error");
       }
     },
   });
@@ -607,9 +702,12 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   let models: readonly GatewayModel[] = [];
   if (!process.env.PI_OFFLINE && baseUrl && apiKey) {
     try {
-      models = await fetchModels(baseUrl, apiKey, AbortSignal.timeout(CONNECTION_TIMEOUT_MS));
+      const enriched = await fetchEnrichedCatalog(baseUrl, apiKey, AbortSignal.timeout(CONNECTION_TIMEOUT_MS));
+      models = enriched.models;
+      for (const note of enriched.notes) console.warn(`[openai-api-extension] ${note}`);
     } catch (error) {
-      console.warn(`[openai-api-extension] model discovery failed: ${errorMessage(error)}`);
+      const label = error instanceof MetadataConfigError ? "metadata config" : "model discovery";
+      console.warn(`[openai-api-extension] ${label} failed: ${errorMessage(error)}`);
     }
   }
   let settingsContext: { cwd: string; isProjectTrusted(): boolean } | undefined;

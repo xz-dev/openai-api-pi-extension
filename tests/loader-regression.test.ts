@@ -321,3 +321,114 @@ test("async factory does not fetch in offline mode", async () => {
   assert.deepEqual(provider?.getModels(), []);
   assert.equal(requests, 0);
 });
+
+test("provider-info separates metadata config errors from auth failures", async () => {
+  savedEnv = Object.fromEntries(ENV_KEYS.map((key) => [key, process.env[key]]));
+  delete process.env.PI_OFFLINE;
+  const server = createServer((request, response) => {
+    assert.equal(request.headers.authorization, "Bearer provider-info-key");
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ models: [{ slug: "cfg-model", context_window: 64000 }] }));
+  });
+  servers.push(server);
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  process.env.OPENAI_API_EXTENSION_BASE_URL = `http://127.0.0.1:${address.port}/v1`;
+  process.env.OPENAI_API_EXTENSION_API_KEY = "provider-info-key";
+
+  const agentDir = await mkdtemp(join(tmpdir(), "openai-api-extension-cfg-"));
+  tempDirs.push(agentDir);
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  await writeFile(join(agentDir, "openai-api-extension.yaml"), "source_priority: not-a-list\n");
+
+  const result = await discoverAndLoadExtensions([extensionPath], projectRoot, agentDir);
+  assert.equal(result.errors.length, 0, JSON.stringify(result.errors));
+  const runtime = await ModelRuntime.create({ authPath: join(agentDir, "auth.json"), refreshOnCreate: false });
+  const runner = new ExtensionRunner(
+    result.extensions, result.runtime, projectRoot, SessionManager.inMemory(), new ModelRegistry(runtime),
+  );
+  runner.bindCore({
+    sendMessage: () => undefined, sendUserMessage: () => undefined, appendEntry: () => undefined,
+    setSessionName: () => undefined, getSessionName: () => undefined, setLabel: () => undefined,
+    getActiveTools: () => [], getAllTools: () => [], setActiveTools: () => undefined,
+    refreshTools: () => undefined, getCommands: () => [], setModel: async () => true,
+    getThinkingLevel: () => "off", setThinkingLevel: () => undefined,
+  }, {
+    getModel: () => undefined, getScopedModels: () => [], isIdle: () => true,
+    isProjectTrusted: () => true, getSignal: () => undefined, abort: () => undefined,
+    hasPendingMessages: () => false, shutdown: () => undefined, getContextUsage: () => undefined,
+    compact: () => undefined, getSystemPrompt: () => "",
+  });
+  const notifications: Array<{ message: string; type?: string }> = [];
+  runner.setUIContext({
+    select: async () => undefined, confirm: async () => false, input: async () => undefined,
+    notify: (message, type) => notifications.push({ message, type }),
+    onTerminalInput: () => () => undefined, setStatus: () => undefined,
+    setWorkingMessage: () => undefined, setWorkingVisible: () => undefined,
+    setWorkingIndicator: () => undefined, setHiddenThinkingLabel: () => undefined,
+    setWidget: () => undefined, setFooter: () => undefined, setHeader: () => undefined,
+    setTitle: () => undefined, custom: async () => undefined as never,
+    pasteToEditor: () => undefined, setEditorText: () => undefined, getEditorText: () => "",
+    editor: async () => undefined, addAutocompleteProvider: () => undefined,
+    setEditorComponent: () => undefined, getEditorComponent: () => undefined,
+    theme: {} as never, getAllThemes: () => [], getTheme: () => undefined,
+    setTheme: () => ({ success: false, error: "unused" }), getToolsExpanded: () => false,
+  }, "tui");
+
+  await runner.getCommand("provider-info")?.handler("", runner.createCommandContext());
+  assert.equal(notifications.length, 1);
+  const message = notifications[0]?.message ?? "";
+  assert.match(message, /Connection: ✓ connected; API key valid/, "config error is not an auth failure");
+  assert.match(message, /Metadata: ✗ config error:/);
+  assert.doesNotMatch(message, /provider-info-key/);
+});
+
+test("models.json modelOverrides still apply last over enriched catalog", async () => {
+  savedEnv = Object.fromEntries(ENV_KEYS.map((key) => [key, process.env[key]]));
+  delete process.env.PI_OFFLINE;
+  // Gateway catalog + a models.dev-shaped metadata source; the extension reads
+  // the config from PI_CODING_AGENT_DIR and the loopback SOURCE_URLS are not
+  // injectable at this level, so use an explicit empty chain plus a manual
+  // override to prove ordering: external chain disabled, manual override via
+  // models.json still lands on top of enrichment output.
+  const server = createServer((request, response) => {
+    assert.equal(request.headers.authorization, "Bearer override-key");
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ models: [{ slug: "override-model", context_window: 64000 }] }));
+  });
+  servers.push(server);
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  const baseUrl = `http://127.0.0.1:${address.port}/v1`;
+  process.env.OPENAI_API_EXTENSION_BASE_URL = baseUrl;
+  process.env.OPENAI_API_EXTENSION_API_KEY = "override-key";
+
+  const agentDir = await mkdtemp(join(tmpdir(), "openai-api-extension-override-"));
+  tempDirs.push(agentDir);
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  await writeFile(join(agentDir, "openai-api-extension.yaml"),
+    "source_priority: []\nmodels:\n  override-model:\n    overrides:\n      context_window: 111000\n");
+  await writeFile(join(agentDir, "models.json"), JSON.stringify({
+    providers: {
+      "openai-api-extension": { modelOverrides: { "override-model": { contextWindow: 32000 } } },
+    },
+  }));
+
+  const result = await discoverAndLoadExtensions([extensionPath], projectRoot, agentDir);
+  assert.equal(result.errors.length, 0, JSON.stringify(result.errors));
+  const runtime = await ModelRuntime.create({ authPath: join(agentDir, "auth.json"), modelsPath: join(agentDir, "models.json"), refreshOnCreate: false });
+  const registration = result.runtime.pendingNativeProviderRegistrations.find(
+    ({ provider }) => provider.id === "openai-api-extension",
+  );
+  assert.ok(registration);
+  assert.equal(
+    registration.provider.getModels().find((model) => model.id === "override-model")?.contextWindow,
+    111_000,
+    "extension config overrides apply before models.json",
+  );
+  runtime.registerNativeProvider(registration.provider);
+  const model = runtime.getModel("openai-api-extension", "override-model");
+  assert.equal(model?.contextWindow, 32000, "models.json modelOverrides win over extension enrichment");
+});

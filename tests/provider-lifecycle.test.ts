@@ -378,3 +378,218 @@ test("refresh abort reaches the catalog request without publishing partial state
   assert.equal(result.aborted, true);
   assert.equal(models.getModels(PROVIDER).length, 0);
 });
+
+// --- Metadata fallback chain lifecycle (tasks 4.1-4.4) ----------------------
+// Loopback fixtures only; SOURCE_URLS/hooks inject the fake source endpoints.
+
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { MetadataHooks } from "../index.ts";
+
+const metadataDirs: string[] = [];
+async function metadataHooks(yaml: string | undefined, sourcePayloads: Record<string, unknown> = {}) {
+  const dir = await mkdtemp(join(tmpdir(), "openai-api-metadata-"));
+  metadataDirs.push(dir);
+  const configPath = join(dir, "openai-api-extension.yaml");
+  if (yaml !== undefined) await writeFile(configPath, yaml);
+  const hits: Record<string, number> = {};
+  const make = async (key: string, payload: unknown) => {
+    const server = createServer((request, response) => {
+      hits[key] = (hits[key] ?? 0) + 1;
+      assert.equal(request.headers.authorization, undefined, "metadata sources must never see gateway credentials");
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify(payload));
+    });
+    servers.push(server);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    assert.ok(address && typeof address === "object");
+    return `http://127.0.0.1:${address.port}`;
+  };
+  const hooks: MetadataHooks = {
+    configPath: () => configPath,
+    sourceUrls: {
+      modelsDevApi: await make("modelsDevApi", sourcePayloads.modelsDevApi ?? {}),
+      modelsDevFlat: await make("modelsDevFlat", sourcePayloads.modelsDevFlat ?? {}),
+      modelparams: await make("modelparams", sourcePayloads.modelparams ?? { models: [] }),
+    },
+  };
+  return { hooks, hits };
+}
+
+afterEach(async () => {
+  await Promise.all(metadataDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
+});
+
+const MODELS_DEV_API = {
+  openai: {
+    models: {
+      "gpt-meta": {
+        name: "GPT Meta",
+        canonical_model_id: "openai/gpt-meta",
+        limit: { context: 200000, output: 32768 },
+        modalities: { input: ["text"], output: ["text"] },
+      },
+    },
+  },
+};
+
+test("refresh enriches models through the shared metadata path", async () => {
+  const gatewayServer = await gateway("gpt-meta", "test-key", false);
+  const { hooks, hits } = await metadataHooks(undefined, { modelsDevApi: MODELS_DEV_API });
+  const credentials = new InMemoryCredentialStore();
+  await credentials.modify(PROVIDER, async () => ({
+    type: "api_key", key: "test-key", env: { [BASE_URL_ENV]: gatewayServer.baseUrl },
+  }));
+  const models = createModels({ credentials, authContext: authContext() });
+  models.setProvider(createOpenAIApiProvider([], undefined, undefined, undefined, hooks));
+
+  const result = await models.refresh();
+  assert.equal(result.errors.size, 0);
+  const model = models.getModel(PROVIDER, "gpt-meta");
+  assert.equal(model?.contextWindow, 200_000, "metadata chain overwrites upstream default");
+  assert.equal(model?.maxTokens, 32_768);
+  assert.equal(hits.modelsDevApi, 1, "one shared read per endpoint per refresh");
+  assert.equal(hits.modelsDevFlat, 1);
+  assert.equal(hits.modelparams, 1);
+});
+
+test("offline restore reads no config and hits no metadata source", async () => {
+  const { hooks, hits } = await metadataHooks("source_priority: [\"models.dev/*/subscription\"]");
+  const credentials = new InMemoryCredentialStore();
+  const modelsStore = new InMemoryModelsStore();
+  await credentials.modify(PROVIDER, async () => ({
+    type: "api_key", key: "test-key", env: { [BASE_URL_ENV]: "http://127.0.0.1:1/v1" },
+  }));
+  await modelsStore.write(PROVIDER, { models: [{
+    id: "stored-model", name: "stored-model", provider: PROVIDER, api: "openai-responses",
+    baseUrl: "http://127.0.0.1:1/v1", reasoning: false, input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 64000, maxTokens: 8192,
+  }] });
+  const models = createModels({ credentials, modelsStore, authContext: authContext() });
+  models.setProvider(createOpenAIApiProvider([], undefined, undefined, undefined, hooks));
+
+  const result = await models.refresh({ allowNetwork: false });
+  assert.equal(result.errors.size, 0);
+  assert.equal(models.getModel(PROVIDER, "stored-model")?.contextWindow, 64000);
+  assert.deepEqual(hits, {}, "offline must not fetch metadata");
+});
+
+test("invalid metadata config blocks the new catalog, keeps the old one, and is not an auth error", async () => {
+  const gatewayServer = await gateway("fresh-model", "test-key");
+  const { hooks, hits } = await metadataHooks("fill_missing_only: maybe");
+  const credentials = new InMemoryCredentialStore();
+  const modelsStore = new InMemoryModelsStore();
+  await credentials.modify(PROVIDER, async () => ({
+    type: "api_key", key: "test-key", env: { [BASE_URL_ENV]: gatewayServer.baseUrl },
+  }));
+  await modelsStore.write(PROVIDER, { models: [{
+    id: "old-model", name: "old-model", provider: PROVIDER, api: "openai-responses",
+    baseUrl: gatewayServer.baseUrl, reasoning: false, input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 64000, maxTokens: 8192,
+  }] });
+  const reported: string[] = [];
+  const models = createModels({ credentials, modelsStore, authContext: authContext() });
+  models.setProvider(createOpenAIApiProvider([], (message) => reported.push(message), undefined, undefined, hooks));
+
+  const result = await models.refresh();
+  assert.equal(result.errors.size, 1);
+  assert.match(result.errors.get(PROVIDER)?.message ?? "", /fill_missing_only/);
+  assert.equal(models.getModel(PROVIDER, "old-model")?.contextWindow, 64000, "old catalog kept");
+  assert.equal(models.getModel(PROVIDER, "fresh-model"), undefined, "new catalog blocked");
+  assert.deepEqual((await modelsStore.read(PROVIDER))?.models.map((model) => model.id), ["old-model"]);
+  assert.equal(hits.modelsDevApi ?? 0, 0, "invalid config never reaches the sources");
+  const report = reported.find((message) => /fill_missing_only/.test(message));
+  assert.ok(report, "config error must be reported");
+  assert.doesNotMatch(report ?? "", /api key|unauthorized|401/i, "config error must not read as an auth failure");
+});
+
+test("failing metadata sources degrade to upstream-mapped models with a report", async () => {
+  const gatewayServer = await gateway("degraded-model", "test-key", false);
+  const dir = await mkdtemp(join(tmpdir(), "openai-api-metadata-"));
+  metadataDirs.push(dir);
+  const dead = createServer((_request, response) => { response.writeHead(500).end(); });
+  servers.push(dead);
+  await new Promise<void>((resolve) => dead.listen(0, "127.0.0.1", resolve));
+  const deadAddress = dead.address();
+  assert.ok(deadAddress && typeof deadAddress === "object");
+  const deadUrl = `http://127.0.0.1:${deadAddress.port}`;
+  const hooks: MetadataHooks = {
+    configPath: () => join(dir, "openai-api-extension.yaml"),
+    sourceUrls: { modelsDevApi: deadUrl, modelsDevFlat: deadUrl, modelparams: deadUrl },
+  };
+  const credentials = new InMemoryCredentialStore();
+  await credentials.modify(PROVIDER, async () => ({
+    type: "api_key", key: "test-key", env: { [BASE_URL_ENV]: gatewayServer.baseUrl },
+  }));
+  const reported: string[] = [];
+  const models = createModels({ credentials, authContext: authContext() });
+  models.setProvider(createOpenAIApiProvider([], (message) => reported.push(message), undefined, undefined, hooks));
+
+  const result = await models.refresh();
+  assert.equal(result.errors.size, 0, "degraded enrichment is not a refresh error");
+  assert.equal(models.getModel(PROVIDER, "degraded-model")?.contextWindow, 128_000, "upstream defaults apply");
+  assert.ok(reported.some((message) => /metadata source .* unavailable/i.test(message)));
+});
+
+test("login saves the validated key and reports a metadata config error, not an auth failure", async () => {
+  const gatewayServer = await gateway("login-meta-model", "test-key");
+  const { hooks } = await metadataHooks("source_priority: not-a-list");
+  const credentials = new InMemoryCredentialStore();
+  const models = createModels({ credentials, authContext: authContext() });
+  models.setProvider(createOpenAIApiProvider([], undefined, undefined, undefined, hooks));
+  const notifications: string[] = [];
+  let promptCount = 0;
+
+  const credential = await models.login(PROVIDER, "api_key", {
+    prompt: async () => (promptCount++ === 0 ? gatewayServer.baseUrl : "test-key"),
+    notify: (event) => {
+      if (event.type === "info") notifications.push(event.message);
+    },
+  });
+
+  assert.equal(credential.key, "test-key", "validated credential still saved");
+  assert.deepEqual(await credentials.read(PROVIDER), credential);
+  const note = notifications.find((message) => /metadata config/i.test(message));
+  assert.ok(note, "config error must surface as metadata config, not catalog unusable");
+  assert.doesNotMatch(note, /not usable|invalid api key/i);
+});
+
+test("source_priority: [] opts out of all metadata network reads", async () => {
+  const gatewayServer = await gateway("optout-model", "test-key", false);
+  const { hooks, hits } = await metadataHooks("source_priority: []");
+  const credentials = new InMemoryCredentialStore();
+  await credentials.modify(PROVIDER, async () => ({
+    type: "api_key", key: "test-key", env: { [BASE_URL_ENV]: gatewayServer.baseUrl },
+  }));
+  const models = createModels({ credentials, authContext: authContext() });
+  models.setProvider(createOpenAIApiProvider([], undefined, undefined, undefined, hooks));
+
+  const result = await models.refresh();
+  assert.equal(result.errors.size, 0);
+  assert.equal(models.getModel(PROVIDER, "optout-model")?.contextWindow, 128_000);
+  assert.deepEqual(hits, {}, "explicit empty chain must not fetch");
+});
+
+test("unknown config fields warn once and the rest of the config still applies", async () => {
+  const gatewayServer = await gateway("warn-model", "test-key", false);
+  const { hooks } = await metadataHooks(
+    "unsupported_gateway_field: true\nchannels:\n  chan:\n    metadata_from: cpa\n",
+  );
+  const credentials = new InMemoryCredentialStore();
+  await credentials.modify(PROVIDER, async () => ({
+    type: "api_key", key: "test-key", env: { [BASE_URL_ENV]: gatewayServer.baseUrl },
+  }));
+  const reported: string[] = [];
+  const models = createModels({ credentials, authContext: authContext() });
+  models.setProvider(createOpenAIApiProvider([], (message) => reported.push(message), undefined, undefined, hooks));
+
+  const result = await models.refresh();
+  assert.equal(result.errors.size, 0);
+  assert.ok(models.getModel(PROVIDER, "warn-model"));
+  const warnings = reported.filter((message) => /ignored unsupported fields/.test(message));
+  assert.equal(warnings.length, 1, "one aggregated note line per refresh");
+  assert.match(warnings[0] ?? "", /unsupported_gateway_field/);
+  assert.match(warnings[0] ?? "", /channels\.chan\.metadata_from/);
+});

@@ -47,7 +47,7 @@ async function fixture(t: any, toolTurn = false, omitAnnotations = false) {
   for (const file of pkg.files) await cp(join(project, file), join(source, file), { recursive: true });
   await mkdir(join(source, "tests/fixtures"), { recursive: true });
   await cp(join(project, "tests/fixtures/checkpoint-cleanup-extension.ts"), join(source, "tests/fixtures/checkpoint-cleanup-extension.ts"));
-  const packages = ["balanced-match", "brace-expansion", "minimatch", "openai", "ws"];
+  const packages = ["balanced-match", "brace-expansion", "minimatch", "openai", "ws", "yaml"];
   for (const name of packages) await cp(join(project, "node_modules", name), join(source, "node_modules", name), { recursive: true });
   assert.deepEqual((await readdir(join(source, "node_modules"))).sort(), packages.sort());
   const prohibited: string[] = [];
