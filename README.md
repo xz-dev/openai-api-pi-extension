@@ -188,16 +188,114 @@ to override a catalog-derived map, not to invent the default tiers.
 
 ## Model metadata
 
-The extension requests the Codex-compatible `/v1/models?client_version=...`
-catalog. Catalog refresh is atomic: every model must provide identity,
-context-window, and output-token limits, or the whole list is rejected — Pi
-keeps the last verified catalog instead of publishing invented limits or a
-partial list. `/login` is not blocked by catalog quality: only connection
-failures (unreachable gateway, invalid API key, non-Codex payload) fail login.
-If the gateway connects but the catalog is unusable, the key is saved and the
-problem is reported where it belongs — model-list refresh. Pi's `/model` overlay
-only names the provider; this extension also appends a TUI-only chat entry with
-the real discovery error (HTTP status and a short body, no URL or API key).
+The extension requests the `/v1/models` catalog (Codex `models[]` or plain
+OpenAI `data[]`). The upstream catalog alone decides which models exist and
+their public IDs; it is never rebuilt from external sources. Identity,
+context-window, and output-token limits are kept as provided, then fields
+missing from all configured sources fall back to the conservative 128K
+default — an invalid catalog is still rejected atomically and Pi keeps the
+last verified list. `/login` is not blocked by catalog quality: only
+connection failures (unreachable gateway, invalid API key, non-models
+payload) fail login. If the gateway connects but the catalog is unusable,
+the key is saved and the problem is reported where it belongs — model-list
+refresh. Pi's `/model` overlay only names the provider; this extension also
+appends a TUI-only chat entry with the real discovery error (HTTP status and
+a short body, no URL or API key).
+
+### Metadata fallback chain
+
+During each online catalog refresh the extension can also enrich models from
+two public bulk metadata sites — [models.dev](https://models.dev) and
+[modelparams.dev](https://modelparams.dev) — using the same fallback-chain
+idea as AI-gateway's models-enricher, but only over public data. External
+sources never decide which models exist; they only fill or overwrite
+metadata. Membership stays 100% upstream. Requests are bounded (16 MiB, 5 s,
+no cross-origin redirects) and never carry the gateway API key.
+
+Config lives at `~/.pi/agent/openai-api-extension.yaml` (Pi's agent dir,
+i.e. `getAgentDir()`). The file is read-only and never created
+automatically; a missing file means defaults. A file with invalid YAML or
+invalid *known* fields blocks the catalog update (old catalog kept) and is
+reported as a metadata config error — never as an invalid API key. Unknown
+top-level/channel/model fields (e.g. AI-gateway-only keys like
+`static_models`, `custom_channels`, `metadata_from`, `cpa_base_url`,
+`fetch_models`, `ollama_native_base_url`) are ignored with one warning
+listing their full paths; everything else still applies.
+
+```yaml
+# Defaults when source_priority is absent — subscriptions first, then API.
+source_priority:
+  - "*/subscription"
+  - "*/api_key"
+fill_missing_only: false
+
+models:
+  # Model rules are string globs on the full public model ID; quote keys
+  # that start with *. Exact key wins, else the first matching glob in
+  # declared order; no merging with other matching rules.
+  "*gpt-6-astra":   # matches gpt-6-astra, openai/gpt-6-astra, proxy/openai/...
+    source_priority: ["models.dev/openai", "modelparams.dev/openai/subscription"]
+  "*gpt*":          # matches any full ID containing gpt, incl. provider segments
+    fill_missing_only: true
+  model-a:          # exact: does NOT match proxy/model-a
+    overrides: { context_window: 128000 }
+
+channels:
+  proxy:
+    source_priority: ["models.dev/*/subscription"]
+    global_fallback: true   # append the root chain after this channel chain
+    fill_missing_only: true
+    models:
+      model-a:              # matches channel-relative ID (prefix stripped once)
+        source_priority: [] # model chain replaces channel+global entirely
+```
+
+**Source selectors** (`source_priority` entries): `models.dev/<provider>`,
+`models.dev/<pattern>` (any access),
+`modelparams.dev/<provider>/<subscription|api_key>`, the two-segment
+shorthands `*/subscription` and `*/api_key` (all sites), and the three-part
+`<site>/<provider-glob>/<subscription|api_key|*>`. Your list order wins;
+inside one selector models.dev is consulted before modelparams.dev.
+Overlapping selectors can't double-apply the same adopted record.
+
+**Access classification** is a local policy, not a claim about your gateway:
+modelparams.dev uses each record's own `authType`; models.dev has no auth
+field, so a fixed subscription-provider set ships in the plugin
+(`MODELS_DEV_SUBSCRIPTION_PROVIDERS` in `model-metadata.ts`) and every other
+models.dev provider counts as `api_key`. Pin a provider earlier with an
+exact `models.dev/<provider>` selector if needed.
+
+**Ambiguity**: when one selector yields several same-named records from
+different providers on one site, models.dev entries arbitrate via
+`canonical_model_id` — the model developer's self-hosted entry wins, but
+only if every candidate agrees on the same canonical ID and the developer's
+own record is inside this selector's access scope. Otherwise the group is
+skipped (with a short diagnostic) rather than guessed; a later, more
+specific selector can still resolve it. Skipped groups don't consume the
+first-hit dedupe slot.
+
+**Scope precedence**: channel-model rule > global-model rule > channel
+default > global default > built-ins. `fill_missing_only` inherits the same
+way (explicit `false` beats a parent's `true`). A model-level
+`source_priority` replaces the channel and global chains entirely —
+including `[]` to disable external sources for that model.
+
+**Merge modes**: default is full overwrite (external values win field by
+field); `fill_missing_only: true` only fills fields the upstream left
+missing. `null` never erases a lower-priority value; an explicit empty
+`supported_reasoning_levels: []` means "no tiers" rather than "missing".
+Manual `overrides` (model rule, then legacy channel `overrides.<model>`)
+apply after source merging; Pi's `models.json` `modelOverrides` always
+applies last. `lookup_ids` map a source selector key to the exact query ID
+for that source; `provider_prefix_map` only changes the query identity,
+never the public ID.
+
+**Opt out** of all external enrichment with a root `source_priority: []`
+(and no local chains), then refresh. Offline restore and `allowNetwork:
+false` refreshes read no config and hit no metadata site. If every metadata
+source fails, the upstream-mapped catalog still publishes with a degrade
+note; if the upstream catalog itself fails, Pi keeps the persisted catalog.
+The inference path never fetches metadata.
 
 ## Development
 
