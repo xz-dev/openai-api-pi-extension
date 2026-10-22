@@ -192,35 +192,55 @@ function thinkingLevelMap(efforts: ReasoningEffort[]) {
 
 export type GatewayModel = Model<"openai-responses">;
 
-/** Maps an OpenAI-compatible /models payload entry to a Pi model. */
-export function mapModel(entry: unknown, baseUrl = DEFAULT_BASE_URL): GatewayModel | undefined {
+/**
+ * Maps an OpenAI-compatible /models payload entry to a Pi model.
+ * `enriched` supplies already-merged metadata fields (canonical names);
+ * when absent the raw upstream row itself is used.
+ */
+export function mapModel(
+  entry: unknown,
+  baseUrl = DEFAULT_BASE_URL,
+  enriched?: Readonly<Record<string, unknown>>,
+): GatewayModel | undefined {
   if (typeof entry !== "object" || entry === null || Array.isArray(entry)) return undefined;
   const row = entry as UpstreamModel;
   const identity = entryIdentity(row);
   if (!identity) return undefined;
-  const contextWindow = num(row.context_window) ?? num(row.context_length) ?? DEFAULT_CONTEXT_WINDOW;
-  const maxTokens = num(row.max_output_tokens) ?? num(row.max_completion_tokens) ?? num(row.max_tokens);
+  // Canonical metadata fields, in alias-preference order. Enriched fields (if
+  // provided) carry the same canonical names produced by model-metadata.ts.
+  const meta = enriched ?? (row as Readonly<Record<string, unknown>>);
+  const pick = (...keys: string[]) => keys.map((key) => meta[key]).find((value) => value !== undefined && value !== null);
+  const contextWindow = num(pick("context_window", "context_length")) ?? DEFAULT_CONTEXT_WINDOW;
+  const maxTokens = num(pick("max_output_tokens", "max_completion_tokens", "max_tokens"));
   // Ported omniroute semantics: a gateway entry without declared limits uses the
-  // default context window instead of rejecting the whole catalog.
+  // default context window instead of rejecting the whole catalog. Defaults fill
+  // last so fill_missing_only can see real missing values upstream.
   const resolvedMaxTokens = maxTokens ?? contextWindow;
   const map = thinkingLevelMap(
     parseEfforts(
-      row.supported_reasoning_levels ?? (isRecord(row.capabilities) ? row.capabilities.effort_tiers : undefined),
+      pick("supported_reasoning_levels") ??
+        (isRecord(row.capabilities) ? row.capabilities.effort_tiers : undefined),
     ),
   );
+  const inputModalities = pick("input_modalities");
+  const name = firstString(meta.name, meta.display_name) ?? identity.name;
   return {
     id: identity.id,
-    name: identity.name,
+    name,
     provider: PROVIDER,
     api: "openai-responses",
     baseUrl,
     reasoning: map !== undefined,
     ...(map ? { thinkingLevelMap: map } : {}),
-    input: Array.isArray(row.input_modalities) && row.input_modalities.includes("image") ? ["text", "image"] : ["text"],
+    input: Array.isArray(inputModalities) && inputModalities.includes("image") ? ["text", "image"] : ["text"],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow,
     maxTokens: resolvedMaxTokens,
   };
+}
+
+function firstString(...values: unknown[]): string | undefined {
+  return values.find((value): value is string => typeof value === "string" && value.trim() !== "")?.trim();
 }
 
 /** Fetches the raw gateway catalog; throws only on transport/shape failures (HTTP, auth, non-Codex payload). */
@@ -237,10 +257,14 @@ export async function fetchCatalog(baseUrl: string, apiKey: string, signal?: Abo
     throw new Error(`Model discovery failed: HTTP ${response.status}${safeBody ? `: ${safeBody}` : ""}`);
   }
   const payload: unknown = await response.json();
-  if (typeof payload !== "object" || payload === null || !Array.isArray((payload as { models?: unknown }).models)) {
-    throw new Error("Model discovery did not return a Codex model catalog");
+  const entries =
+    typeof payload === "object" && payload !== null
+      ? ((payload as { models?: unknown; data?: unknown }).models ?? (payload as { data?: unknown }).data)
+      : undefined;
+  if (!Array.isArray(entries)) {
+    throw new Error("Model discovery did not return a Codex or OpenAI model catalog");
   }
-  return (payload as { models: unknown[] }).models;
+  return entries;
 }
 
 /**
@@ -249,7 +273,17 @@ export async function fetchCatalog(baseUrl: string, apiKey: string, signal?: Abo
  * capability limits never reject the catalog; any remaining unusable entry
  * still rejects the whole list, never a partial one.
  */
-export function mapCatalog(entries: readonly unknown[], baseUrl = DEFAULT_BASE_URL): GatewayModel[] {
+/**
+ * Maps a raw catalog atomically for Pi chat usage. `resolveMetadata`, when
+ * provided, returns the merged metadata fields for a public id (upstream row
+ * is the second argument) for the enrichment chain; it runs before default
+ * filling so fill-only can see real missing values.
+ */
+export function mapCatalog(
+  entries: readonly unknown[],
+  baseUrl = DEFAULT_BASE_URL,
+  resolveMetadata?: (publicId: string, row: Readonly<Record<string, unknown>>) => Readonly<Record<string, unknown>>,
+): GatewayModel[] {
   const models = entries
     .flatMap((entry) => {
       if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
@@ -258,7 +292,8 @@ export function mapCatalog(entries: readonly unknown[], baseUrl = DEFAULT_BASE_U
       const row = entry as UpstreamModel;
       if (!entryIdentity(row)) throw new Error("Model discovery returned an invalid catalog entry");
       if (!isConversationalTextModel(row)) return [];
-      const model = mapModel(entry, baseUrl);
+      const enriched = resolveMetadata?.(entryIdentity(row)!.id, row as Readonly<Record<string, unknown>>);
+      const model = mapModel(entry, baseUrl, enriched);
       if (!model) throw new Error("Model discovery returned an invalid catalog entry");
       return [model];
     })
@@ -268,8 +303,13 @@ export function mapCatalog(entries: readonly unknown[], baseUrl = DEFAULT_BASE_U
 }
 
 /** Fetches and maps the gateway catalog atomically; throws on transport, shape, or entry-level failures. */
-export async function fetchModels(baseUrl: string, apiKey: string, signal?: AbortSignal): Promise<GatewayModel[]> {
-  return mapCatalog(await fetchCatalog(baseUrl, apiKey, signal), baseUrl);
+export async function fetchModels(
+  baseUrl: string,
+  apiKey: string,
+  signal?: AbortSignal,
+  resolveMetadata?: (publicId: string, row: Readonly<Record<string, unknown>>) => Readonly<Record<string, unknown>>,
+): Promise<GatewayModel[]> {
+  return mapCatalog(await fetchCatalog(baseUrl, apiKey, signal), baseUrl, resolveMetadata);
 }
 
 function credentialBaseUrl(credential: ApiKeyCredential | undefined): string | undefined {

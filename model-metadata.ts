@@ -1,0 +1,813 @@
+/**
+ * Pure model-metadata resolution: YAML config validation, model-rule glob
+ * selection, source-chain and fill_missing_only inheritance, source selector
+ * parsing, query-identity mapping, and the two merge modes.
+ *
+ * No network or filesystem I/O here; metadata-sources.ts owns public bulk
+ * endpoint reads and index.ts owns the provider lifecycle. Field names follow
+ * the gateway metadata vocabulary (context_window, max_output_tokens,
+ * supported_reasoning_levels, ...) shared by upstream catalogs and the public
+ * sources; mapModel consumes them last so defaults never mask real missing
+ * values.
+ */
+import { minimatch } from "minimatch";
+import { parseDocument } from "yaml";
+
+export type MetadataFields = Record<string, unknown>;
+
+/** Sites this change can read. `*` in a selector expands to both. */
+export const METADATA_SITES = ["models.dev", "modelparams.dev"] as const;
+export type MetadataSite = (typeof METADATA_SITES)[number];
+
+/** Default chain when root source_priority is absent: subscriptions first. */
+export const DEFAULT_SOURCE_PRIORITY: readonly string[] = ["*/subscription", "*/api_key"];
+
+/**
+ * models.dev does not publish an access-type field. Providers in this set are
+ * classified subscription for selector purposes; every other provider
+ * (including ones added later) falls into the api_key group. Source: the
+ * current models.dev catalog's subscription products.
+ */
+export const MODELS_DEV_SUBSCRIPTION_PROVIDERS: ReadonlySet<string> = new Set([
+  "alibaba-coding-plan",
+  "alibaba-coding-plan-cn",
+  "github-copilot",
+  "kuae-cloud-coding-plan",
+  "minimax-cn-coding-plan",
+  "minimax-coding-plan",
+  "tencent-coding-plan",
+  "umans-ai-coding-plan",
+  "volcengine-coding-plan",
+  "zai-coding-plan",
+  "zhipuai-coding-plan",
+]);
+
+export type ModelRule = {
+  sourcePriority?: readonly string[];
+  fillMissingOnly?: boolean;
+  lookupIds?: Readonly<Record<string, string>>;
+  overrides?: Readonly<Record<string, unknown>>;
+};
+
+export type ChannelConfig = {
+  sourcePriority?: readonly string[];
+  globalFallback?: boolean;
+  fillMissingOnly?: boolean;
+  providerPrefixMap?: Readonly<Record<string, readonly string[]>>;
+  /** Legacy exact-name overrides: overrides.<model> -> fields. */
+  overrides?: Readonly<Record<string, Readonly<Record<string, unknown>>>>;
+  models?: Readonly<Record<string, ModelRule>>;
+};
+
+export type MetadataConfig = {
+  /** undefined = absent (use built-in default); [] = explicit opt-out. */
+  sourcePriority?: readonly string[];
+  fillMissingOnly?: boolean;
+  providerPrefixMap?: Readonly<Record<string, readonly string[]>>;
+  models?: Readonly<Record<string, ModelRule>>;
+  channels?: Readonly<Record<string, ChannelConfig>>;
+  /** Full dotted paths of ignored unknown fields, in document order. */
+  warnings: readonly string[];
+};
+
+export class MetadataConfigError extends Error {
+  readonly path: string;
+  constructor(path: string, message: string) {
+    super(`${path}: ${message}`);
+    this.name = "MetadataConfigError";
+    this.path = path;
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+const KNOWN_ROOT_KEYS = new Set([
+  "source_priority",
+  "fill_missing_only",
+  "provider_prefix_map",
+  "models",
+  "channels",
+]);
+const KNOWN_CHANNEL_KEYS = new Set([
+  "source_priority",
+  "global_fallback",
+  "fill_missing_only",
+  "provider_prefix_map",
+  "overrides",
+  "models",
+]);
+const KNOWN_MODEL_KEYS = new Set(["source_priority", "fill_missing_only", "lookup_ids", "overrides"]);
+
+function readBool(value: unknown, path: string): boolean | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "boolean") throw new MetadataConfigError(path, "expected a boolean");
+  return value;
+}
+
+function readChain(value: unknown, path: string): readonly string[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
+    throw new MetadataConfigError(path, "expected a list of source selector strings");
+  }
+  for (const token of value as string[]) parseSelector(token, `${path} item ${JSON.stringify(token)}`);
+  return value as readonly string[];
+}
+
+function readStringMap(value: unknown, path: string): Record<string, string> | undefined {
+  if (value === undefined) return undefined;
+  if (!isRecord(value)) throw new MetadataConfigError(path, "expected a mapping");
+  const out: Record<string, string> = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (typeof item !== "string" || item === "") {
+      throw new MetadataConfigError(`${path}.${key}`, "expected a non-empty string");
+    }
+    out[key] = item;
+  }
+  return out;
+}
+
+function readProviderPrefixMap(value: unknown, path: string): Record<string, readonly string[]> | undefined {
+  if (value === undefined) return undefined;
+  if (!isRecord(value)) throw new MetadataConfigError(path, "expected a mapping");
+  const component = (raw: unknown, at: string): string => {
+    if (typeof raw !== "string" || raw === "" || raw.includes("/") || /\s/.test(raw)) {
+      throw new MetadataConfigError(at, "provider must be a non-empty string without slash or whitespace");
+    }
+    return raw.toLowerCase();
+  };
+  const out: Record<string, readonly string[]> = {};
+  for (const [key, item] of Object.entries(value)) {
+    const name = component(key, `${path}.${key}`);
+    const list = Array.isArray(item) ? item : [item];
+    if (list.length === 0) throw new MetadataConfigError(`${path}.${key}`, "targets must not be empty");
+    const targets: string[] = [];
+    for (const raw of list) {
+      const target = component(raw, `${path}.${key}`);
+      if (!targets.includes(target)) targets.push(target);
+    }
+    out[name] = targets;
+  }
+  return out;
+}
+
+function readFieldMap(value: unknown, path: string): Record<string, unknown> | undefined {
+  if (value === undefined) return undefined;
+  if (!isRecord(value)) throw new MetadataConfigError(path, "expected a mapping");
+  return value;
+}
+
+function readModelRule(value: unknown, path: string, warnings: string[]): ModelRule {
+  if (!isRecord(value)) throw new MetadataConfigError(path, "expected a mapping");
+  for (const key of Object.keys(value)) {
+    if (!KNOWN_MODEL_KEYS.has(key)) warnings.push(`${path}.${key}`);
+  }
+  const rule: ModelRule = {
+    sourcePriority: readChain(value.source_priority, `${path}.source_priority`),
+    fillMissingOnly: readBool(value.fill_missing_only, `${path}.fill_missing_only`),
+    lookupIds: readStringMap(value.lookup_ids, `${path}.lookup_ids`),
+    overrides: readFieldMap(value.overrides, `${path}.overrides`),
+  };
+  for (const token of Object.keys(rule.lookupIds ?? {})) {
+    parseSelector(token, `${path}.lookup_ids key ${JSON.stringify(token)}`);
+  }
+  return rule;
+}
+
+function readModelRules(value: unknown, path: string, warnings: string[]): Record<string, ModelRule> | undefined {
+  if (value === undefined) return undefined;
+  if (!isRecord(value)) throw new MetadataConfigError(path, "expected a mapping of pattern -> rule");
+  const out: Record<string, ModelRule> = {};
+  for (const [pattern, rule] of Object.entries(value)) {
+    out[pattern] = readModelRule(rule, `${path}.${pattern}`, warnings);
+  }
+  return out;
+}
+
+function readChannel(value: unknown, path: string, warnings: string[]): ChannelConfig {
+  if (!isRecord(value)) throw new MetadataConfigError(path, "expected a mapping");
+  for (const key of Object.keys(value)) {
+    if (!KNOWN_CHANNEL_KEYS.has(key)) warnings.push(`${path}.${key}`);
+  }
+  const overrides = readFieldMap(value.overrides, `${path}.overrides`);
+  if (overrides) {
+    for (const [model, fields] of Object.entries(overrides)) {
+      if (!isRecord(fields)) {
+        throw new MetadataConfigError(`${path}.overrides.${model}`, "expected a mapping of fields");
+      }
+    }
+  }
+  return {
+    sourcePriority: readChain(value.source_priority, `${path}.source_priority`),
+    globalFallback: readBool(value.global_fallback, `${path}.global_fallback`),
+    fillMissingOnly: readBool(value.fill_missing_only, `${path}.fill_missing_only`),
+    providerPrefixMap: readProviderPrefixMap(value.provider_prefix_map, `${path}.provider_prefix_map`),
+    overrides: overrides as ChannelConfig["overrides"],
+    models: readModelRules(value.models, `${path}.models`, warnings),
+  };
+}
+
+/**
+ * Parses the YAML text of openai-api-extension.yaml. Missing/empty content
+ * yields an empty config (default chain applies). Invalid YAML, duplicate
+ * keys, or invalid known-field values raise MetadataConfigError; unknown
+ * fields are ignored and collected as warnings.
+ */
+export function parseMetadataConfig(yamlText: string | undefined): MetadataConfig {
+  const warnings: string[] = [];
+  if (yamlText === undefined || yamlText.trim() === "") {
+    return { warnings };
+  }
+  let root: unknown;
+  try {
+    const doc = parseDocument(yamlText);
+    if (doc.errors.length > 0) {
+      const first = doc.errors[0];
+      throw new MetadataConfigError(
+        `line ${first.linePos?.[0]?.line ?? "?"}`,
+        first.message.split("\n")[0] ?? "invalid YAML",
+      );
+    }
+    root = doc.toJS();
+  } catch (error) {
+    if (error instanceof MetadataConfigError) throw error;
+    throw new MetadataConfigError("openai-api-extension.yaml", error instanceof Error ? error.message : String(error));
+  }
+  if (root === null || root === undefined) return { warnings };
+  if (!isRecord(root)) throw new MetadataConfigError("openai-api-extension.yaml", "expected a top-level mapping");
+  for (const key of Object.keys(root)) {
+    if (!KNOWN_ROOT_KEYS.has(key)) warnings.push(key);
+  }
+  const channelsValue = root.channels;
+  let channels: Record<string, ChannelConfig> | undefined;
+  if (channelsValue !== undefined) {
+    if (!isRecord(channelsValue)) throw new MetadataConfigError("channels", "expected a mapping");
+    channels = {};
+    for (const [name, channel] of Object.entries(channelsValue)) {
+      channels[name] = readChannel(channel, `channels.${name}`, warnings);
+    }
+  }
+  return {
+    sourcePriority: readChain(root.source_priority, "source_priority"),
+    fillMissingOnly: readBool(root.fill_missing_only, "fill_missing_only"),
+    providerPrefixMap: readProviderPrefixMap(root.provider_prefix_map, "provider_prefix_map"),
+    models: readModelRules(root.models, "models", warnings),
+    channels,
+    warnings,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Model-rule glob: plain string match, `*` = any chars including `/` and empty.
+// Case-sensitive, anchored to the whole string; not minimatch path semantics.
+// ---------------------------------------------------------------------------
+
+export function modelPatternToRegExp(pattern: string): RegExp {
+  const source = pattern
+    .split("*")
+    .map((literal) => literal.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+    .join("[\\s\\S]*");
+  return new RegExp(`^${source}$`);
+}
+
+/** True when the pattern (literal chars + `*`) matches the whole model id. */
+export function matchModelPattern(pattern: string, id: string): boolean {
+  return modelPatternToRegExp(pattern).test(id);
+}
+
+/**
+ * Selects at most one rule from a models block: an exact key wins; otherwise
+ * the first matching glob in declaration order. No stacking or re-ordering.
+ */
+export function selectModelRule(
+  rules: Readonly<Record<string, ModelRule>> | undefined,
+  id: string,
+): ModelRule | undefined {
+  if (!rules) return undefined;
+  const exact = rules[id];
+  if (exact !== undefined) return exact;
+  for (const [pattern, rule] of Object.entries(rules)) {
+    if (pattern.includes("*") && matchModelPattern(pattern, id)) return rule;
+  }
+  return undefined;
+}
+
+/**
+ * Strips exactly one channel prefix when the public id's first segment exactly
+ * equals a configured channel key. Returns the channel-relative id used for
+ * channel model rules and metadata queries; the public id never changes.
+ */
+export function stripChannelPrefix(
+  publicId: string,
+  channels: Readonly<Record<string, ChannelConfig>> | undefined,
+): { channel?: string; id: string } {
+  const slash = publicId.indexOf("/");
+  if (slash > 0 && channels && Object.hasOwn(channels, publicId.slice(0, slash))) {
+    return { channel: publicId.slice(0, slash), id: publicId.slice(slash + 1) };
+  }
+  return { id: publicId };
+}
+
+// ---------------------------------------------------------------------------
+// Chain + mode inheritance across the four scopes.
+// ---------------------------------------------------------------------------
+
+export type ResolvedPolicy = {
+  sourcePriority: readonly string[];
+  fillMissingOnly: boolean;
+  lookupIds: Readonly<Record<string, string>>;
+  /** Manual overrides, lowest to highest: global model, channel legacy, channel model. */
+  overrides: Readonly<Record<string, unknown>>;
+  channel?: string;
+  channelId: string;
+};
+
+function mergeOverrides(
+  base: Readonly<Record<string, unknown>>,
+  extra: Readonly<Record<string, unknown>> | undefined,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...base };
+  if (extra) overlayMetadata(out, extra);
+  return out;
+}
+
+/**
+ * Resolves the effective policy for one public model id.
+ *
+ * Chain: channel model rule > global model rule explicit source_priority
+ * replaces everything; when neither model rule declares a chain the channel
+ * chain applies, with the global chain deduped-appended unless
+ * global_fallback:false or the channel chain is an explicit []. An absent
+ * root chain means the built-in default; root [] disables global sources but
+ * never removes explicit channel/model chains.
+ *
+ * Mode: channel model > global model > channel default > global default >
+ * false, by field presence (explicit false overrides parent true).
+ */
+export function resolveModelPolicy(config: MetadataConfig, publicId: string): ResolvedPolicy {
+  const { channel, id: channelId } = stripChannelPrefix(publicId, config.channels);
+  const channelConfig = channel ? config.channels?.[channel] : undefined;
+  const globalRule = selectModelRule(config.models, publicId);
+  const channelRule = channelConfig ? selectModelRule(channelConfig.models, channelId) : undefined;
+
+  // Chain resolution.
+  const rootChain = config.sourcePriority ?? DEFAULT_SOURCE_PRIORITY;
+  let chain: readonly string[];
+  if (channelRule?.sourcePriority !== undefined) {
+    chain = channelRule.sourcePriority;
+  } else if (globalRule?.sourcePriority !== undefined) {
+    chain = globalRule.sourcePriority;
+  } else if (channelConfig) {
+    const channelChain = channelConfig.sourcePriority;
+    if (channelConfig.globalFallback === false) {
+      chain = channelChain ?? [];
+    } else if (channelChain === undefined) {
+      chain = rootChain;
+    } else if (channelChain.length === 0) {
+      chain = channelChain;
+    } else {
+      chain = [...channelChain];
+      for (const token of rootChain) if (!chain.includes(token)) chain.push(token);
+    }
+  } else {
+    chain = rootChain;
+  }
+
+  // Mode resolution by field presence.
+  const fillMissingOnly =
+    channelRule?.fillMissingOnly ??
+    globalRule?.fillMissingOnly ??
+    channelConfig?.fillMissingOnly ??
+    config.fillMissingOnly ??
+    false;
+
+  // lookup_ids: global model rule first, channel model rule overrides same keys.
+  const lookupIds: Record<string, string> = { ...(globalRule?.lookupIds ?? {}) };
+  for (const [key, value] of Object.entries(channelRule?.lookupIds ?? {})) lookupIds[key] = value;
+
+  // Manual overrides low -> high: global model, channel legacy, channel model.
+  let overrides: Record<string, unknown> = {};
+  overrides = mergeOverrides(overrides, globalRule?.overrides);
+  overrides = mergeOverrides(overrides, channelConfig?.overrides?.[channelId]);
+  overrides = mergeOverrides(overrides, channelRule?.overrides);
+
+  return { sourcePriority: chain, fillMissingOnly, lookupIds, overrides, channel, channelId };
+}
+
+// ---------------------------------------------------------------------------
+// Source selectors.
+// ---------------------------------------------------------------------------
+
+export type AccessType = "subscription" | "api_key";
+
+export type Selector = {
+  site: MetadataSite | "*";
+  /** Provider glob segment (minimatch), or undefined for the exact models.dev form. */
+  providerPattern?: string;
+  /** Exact provider name (no glob metacharacters). */
+  provider?: string;
+  access: AccessType | "*";
+  token: string;
+};
+
+const PROVIDER_PATTERN_CHARS = /^[A-Za-z0-9._*-]+$/;
+
+/**
+ * Parses a source selector token. Supported forms:
+ *   models.dev/<provider>            exact token, any access
+ *   models.dev/<provider-pattern>    glob over providers, any access
+ *   modelparams.dev/<provider>/<access>   exact token
+ *   <site>/<provider-pattern>/<access>    site = models.dev | modelparams.dev | *
+ *   *(star)/subscription | *(star)/api_key   all sites + providers
+ */
+export function parseSelector(token: string, path = "source_priority"): Selector {
+  if (typeof token !== "string" || token.trim() !== token || token === "") {
+    throw new MetadataConfigError(path, "selector must be a non-empty string");
+  }
+  const parts = token.split("/");
+  const access = (value: string): AccessType | "*" => {
+    if (value === "subscription" || value === "api_key" || value === "*") return value;
+    throw new MetadataConfigError(path, `invalid access type ${JSON.stringify(value)} in ${JSON.stringify(token)}`);
+  };
+  const site = (value: string): MetadataSite | "*" => {
+    if (value === "models.dev" || value === "modelparams.dev" || value === "*") return value;
+    throw new MetadataConfigError(path, `unknown site ${JSON.stringify(value)} in ${JSON.stringify(token)}`);
+  };
+  const providerPattern = (value: string): string => {
+    if (value === "" || !PROVIDER_PATTERN_CHARS.test(value)) {
+      throw new MetadataConfigError(path, `invalid provider pattern ${JSON.stringify(value)} in ${JSON.stringify(token)}`);
+    }
+    return value;
+  };
+  if (parts.length === 2) {
+    // `*/subscription` and `*/api_key` are the two-segment shorthand.
+    if (parts[0] === "*") {
+      return { site: "*", providerPattern: "*", access: access(parts[1]), token };
+    }
+    const s = site(parts[0]);
+    const pattern = providerPattern(parts[1]);
+    if (s === "modelparams.dev") {
+      throw new MetadataConfigError(path, `modelparams.dev selectors need an access segment: ${JSON.stringify(token)}`);
+    }
+    return pattern.includes("*")
+      ? { site: s, providerPattern: pattern, access: "*", token }
+      : { site: s, provider: pattern, access: "*", token };
+  }
+  if (parts.length === 3) {
+    return {
+      site: site(parts[0]),
+      providerPattern: providerPattern(parts[1]),
+      access: access(parts[2]),
+      token,
+    };
+  }
+  throw new MetadataConfigError(path, `invalid selector ${JSON.stringify(token)}`);
+}
+
+/** Access group of a source record under the local classification policy. */
+export function classifyAccess(site: MetadataSite, provider: string, authType: unknown): AccessType | undefined {
+  if (site === "models.dev") {
+    return MODELS_DEV_SUBSCRIPTION_PROVIDERS.has(provider.toLowerCase()) ? "subscription" : "api_key";
+  }
+  const normalized = typeof authType === "string" ? authType.trim().toLowerCase() : "";
+  if (normalized === "api_key" || normalized === "subscription") return normalized;
+  return undefined; // unknown authType matches only access:* selectors
+}
+
+export function selectorSites(selector: Selector): readonly MetadataSite[] {
+  return selector.site === "*" ? METADATA_SITES : [selector.site];
+}
+
+/** Sites a selector needs, in built-in order (models.dev before modelparams.dev). */
+export function selectorNeedsSite(selector: Selector, site: MetadataSite): boolean {
+  return selectorSites(selector).includes(site);
+}
+
+// ---------------------------------------------------------------------------
+// Source records + per-selector resolution.
+// ---------------------------------------------------------------------------
+
+/** One normalized external record as published by a bulk source. */
+export type SourceRecord = {
+  site: MetadataSite;
+  /** Source provider key, lowercased (models.dev key or modelparams provider). */
+  provider: string;
+  /** Source-side model id (for models.dev: key inside the provider map). */
+  modelId: string;
+  /** Raw authType from modelparams.dev; undefined for models.dev. */
+  authType?: unknown;
+  /** models.dev canonical_model_id, e.g. "openai/gpt-5". */
+  canonicalModelId?: string;
+  fields: MetadataFields;
+};
+
+export type ResolutionDiagnostic = { kind: "ambiguous" | "missing"; token: string; modelId: string; detail: string };
+
+/**
+ * Whether a source record belongs to a selector: site group, provider glob,
+ * and access classification (unknown authType only matches access "*").
+ */
+export function recordMatchesSelector(selector: Selector, record: SourceRecord): boolean {
+  if (!selectorSites(selector).includes(record.site)) return false;
+  if (selector.provider !== undefined) {
+    if (record.provider !== selector.provider.toLowerCase()) return false;
+  } else if (selector.providerPattern !== undefined) {
+    if (!minimatch(record.provider, selector.providerPattern)) return false;
+  }
+  if (selector.access === "*") return true;
+  return classifyAccess(record.site, record.provider, record.authType) === selector.access;
+}
+
+/**
+ * Merges provider_prefix_map: channel entries replace same-name global
+ * entries; a name maps only once (no recursive expansion).
+ */
+export function mergeProviderPrefixMaps(
+  global: Readonly<Record<string, readonly string[]>> | undefined,
+  local: Readonly<Record<string, readonly string[]>> | undefined,
+): Record<string, readonly string[]> {
+  const out: Record<string, readonly string[]> = { ...(global ?? {}) };
+  for (const [key, value] of Object.entries(local ?? {})) out[key] = value;
+  return out;
+}
+
+/**
+ * Candidate query identities for one selector group.
+ *
+ * - An explicit lookup_ids entry for the selector token fixes the query id.
+ * - A qualified query id's first segment may be remapped through
+ *   provider_prefix_map (metadata query identity only; public id unchanged).
+ * - Bare names ask the selector-matched providers; qualified names keep their
+ *   own vendor namespace and only match providers via prefix targets.
+ */
+export function* candidateIdentities(
+  selector: Selector,
+  site: MetadataSite,
+  queryId: string,
+  policy: ResolvedPolicy,
+  prefixMap: Readonly<Record<string, readonly string[]>>,
+  records: readonly SourceRecord[],
+): Generator<{ provider: string; queryId: string }> {
+  const override = policy.lookupIds[selector.token];
+  const slash = queryId.indexOf("/");
+  const qualified = slash > 0;
+  const providerSegment = qualified ? queryId.slice(0, slash).toLowerCase() : "";
+  const bareId = qualified ? queryId.slice(slash + 1) : queryId;
+  const targets =
+    qualified && prefixMap[providerSegment] ? prefixMap[providerSegment] : qualified ? [providerSegment] : undefined;
+  const seen = new Set<string>();
+  for (const record of records) {
+    if (record.site !== site || !recordMatchesSelector(selector, record)) continue;
+    if (targets !== undefined && !targets.some((t) => t === record.provider)) continue;
+    const id = override ?? (qualified ? bareId : queryId);
+    const key = `${record.provider}${id}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      yield { provider: record.provider, queryId: id };
+    }
+  }
+}
+
+/**
+ * Finds the record for one query id inside one provider's table.
+ * Exact id wins; then a unique case-folded match; then, for bare query names
+ * only, records whose last `/` segment equals the name (provider-side vendor
+ * namespaces like `openai/gpt-5` still identify the same product). Multiple
+ * distinct records matching any tier are ambiguous, never a silent pick.
+ */
+function lookupRecord(
+  records: readonly SourceRecord[],
+  site: MetadataSite,
+  provider: string,
+  queryId: string,
+): SourceRecord | undefined {
+  let folded: SourceRecord | undefined;
+  let foldedCount = 0;
+  const bareMatches: SourceRecord[] = [];
+  const isBare = !queryId.includes("/");
+  for (const record of records) {
+    if (record.site !== site || record.provider !== provider) continue;
+    if (record.modelId === queryId) return record;
+    if (record.modelId.toLowerCase() === queryId.toLowerCase()) {
+      folded = record;
+      foldedCount++;
+    } else if (isBare && record.modelId.toLowerCase().endsWith(`/${queryId.toLowerCase()}`)) {
+      if (!bareMatches.includes(record)) bareMatches.push(record);
+    }
+  }
+  if (foldedCount > 1) return undefined;
+  if (folded) return folded;
+  if (bareMatches.length === 1) return bareMatches[0];
+  return undefined; // 0 or >1 bare matches
+}
+
+/**
+ * Resolves one selector against one site group.
+ *
+ * Returns the chosen record, or a diagnostic. Within a site group, multiple
+ * provider candidates are ambiguous unless models.dev creator arbitration
+ * resolves them: every candidate must declare the same canonical_model_id
+ * `<creator>/<model>` and the creator provider's own entry (id == `<model>`)
+ * must itself be among the candidates.
+ */
+export function resolveSelectorSite(
+  selector: Selector,
+  site: MetadataSite,
+  queryId: string,
+  policy: ResolvedPolicy,
+  prefixMap: Readonly<Record<string, readonly string[]>>,
+  records: readonly SourceRecord[],
+): { record?: SourceRecord; diagnostic?: ResolutionDiagnostic } {
+  const candidates: SourceRecord[] = [];
+  const seen = new Set<string>();
+  for (const identity of candidateIdentities(selector, site, queryId, policy, prefixMap, records)) {
+    const hit = lookupRecord(records, site, identity.provider, identity.queryId);
+    if (hit && !seen.has(hit.provider + "" + hit.modelId)) {
+      seen.add(hit.provider + "" + hit.modelId);
+      candidates.push(hit);
+    }
+  }
+  if (candidates.length === 0) return { diagnostic: { kind: "missing", token: selector.token, modelId: queryId, detail: `no ${site} candidate` } };
+  if (candidates.length === 1) return { record: candidates[0] };
+  if (site === "models.dev") {
+    const canonical = candidates[0].canonicalModelId;
+    const consistent =
+      canonical !== undefined && candidates.every((candidate) => candidate.canonicalModelId === canonical);
+    if (consistent) {
+      const slash = canonical.indexOf("/");
+      const creator = canonical.slice(0, slash);
+      const creatorModel = canonical.slice(slash + 1);
+      const own = candidates.find(
+        (candidate) => candidate.provider === creator && candidate.modelId === creatorModel,
+      );
+      if (own) return { record: own };
+    }
+  }
+  const providers = [...new Set(candidates.map((candidate) => candidate.provider))].sort();
+  return {
+    diagnostic: {
+      kind: "ambiguous",
+      token: selector.token,
+      modelId: queryId,
+      detail: `${site} candidates ${providers.join(",")} disagree on ${queryId}`,
+    },
+  };
+}
+
+export type ChainResolution = {
+  fields: MetadataFields;
+  diagnostics: ResolutionDiagnostic[];
+  /** Sites any adopted/attempted selector needed — drives which endpoints to fetch. */
+  neededSites: ReadonlySet<MetadataSite>;
+};
+
+/**
+ * Resolves the full source chain for one model: each selector expands to site
+ * groups in built-in order (models.dev before modelparams.dev inside one
+ * selector); per canonical field, the highest-priority declared value wins;
+ * fields still missing continue to lower-priority sources. An adopted
+ * source+identity pair is never reconsidered; a group skipped for ambiguity
+ * does not consume a dedupe slot.
+ */
+export function resolveMetadataChain(
+  policy: ResolvedPolicy,
+  publicId: string,
+  queryId: string,
+  prefixMap: Readonly<Record<string, readonly string[]>>,
+  records: readonly SourceRecord[],
+): ChainResolution {
+  const fields: MetadataFields = {};
+  const diagnostics: ResolutionDiagnostic[] = [];
+  const adopted = new Set<string>();
+  const neededSites = new Set<MetadataSite>();
+  const declared = new Set<string>();
+  for (const token of policy.sourcePriority) {
+    const selector = parseSelector(token);
+    for (const site of selectorSites(selector)) {
+      neededSites.add(site);
+      const { record, diagnostic } = resolveSelectorSite(selector, site, queryId, policy, prefixMap, records);
+      if (diagnostic) {
+        if (diagnostic.kind === "ambiguous") diagnostics.push(diagnostic);
+        continue;
+      }
+      if (!record) continue;
+      const key = `${record.site} ${record.provider} ${record.modelId}`;
+      if (adopted.has(key)) continue;
+      adopted.add(key);
+      for (const [field, value] of Object.entries(normalizeFields(record.fields))) {
+        if (value === undefined || value === null || declared.has(field)) continue;
+        declared.add(field);
+        fields[field] = value;
+      }
+    }
+  }
+  return { fields, diagnostics, neededSites };
+}
+
+// ---------------------------------------------------------------------------
+// Metadata merge: alias normalization, per-field selection, mode merge,
+// manual overrides. Objects merge recursively, arrays replace, null keeps the
+// lower layer.
+// ---------------------------------------------------------------------------
+
+/** Canonical fields consumed by mapModel; all source aliases land here. */
+const FIELD_ALIASES: Readonly<Record<string, readonly string[]>> = {
+  context_window: ["context_window", "context_length"],
+  max_output_tokens: ["max_output_tokens", "max_completion_tokens", "max_tokens"],
+  max_input_tokens: ["max_input_tokens"],
+  supported_reasoning_levels: ["supported_reasoning_levels"],
+  default_reasoning_level: ["default_reasoning_level"],
+  input_modalities: ["input_modalities"],
+  output_modalities: ["output_modalities"],
+  name: ["name", "display_name"],
+};
+
+/** Fields metadata may never set (identity/routing stay upstream-owned). */
+const PROTECTED_FIELDS = new Set(["id", "slug", "provider", "baseUrl", "api", "key", "headers"]);
+
+/**
+ * Copies known metadata fields onto canonical names. Earlier aliases win
+ * (context_window before context_length); unknown/protected fields drop.
+ */
+export function normalizeFields(input: Readonly<Record<string, unknown>>): MetadataFields {
+  const out: MetadataFields = {};
+  for (const [canonical, aliases] of Object.entries(FIELD_ALIASES)) {
+    for (const alias of aliases) {
+      if (input[alias] !== undefined && input[alias] !== null) {
+        out[canonical] = input[alias];
+        break;
+      }
+    }
+  }
+  return out;
+}
+
+/** A field counts as "missing" for fill-only when absent, null, or invalid. */
+export function fieldIsMissing(canonical: string, value: unknown): boolean {
+  if (value === undefined || value === null) return true;
+  if (canonical === "context_window" || canonical === "max_output_tokens" || canonical === "max_input_tokens") {
+    return !(typeof value === "number" && Number.isFinite(value) && value > 0);
+  }
+  return false;
+}
+
+/** Recursive object merge; arrays/scalars replace; null never erases. */
+export function overlayMetadata(target: MetadataFields, source: Readonly<Record<string, unknown>> | undefined): MetadataFields {
+  if (!source) return target;
+  for (const [key, value] of Object.entries(source)) {
+    if (value === null || value === undefined) continue;
+    if (isRecord(value)) {
+      const current = isRecord(target[key]) ? (target[key] as MetadataFields) : {};
+      target[key] = overlayMetadata(current, value);
+    } else {
+      target[key] = value;
+    }
+  }
+  return target;
+}
+
+/**
+ * Merges upstream metadata U with external E under the policy mode.
+ * overwrite: merge(U, E) — external wins per field.
+ * fill-only:  merge(E, U) — upstream wins except where a field is missing.
+ */
+export function mergeMetadata(
+  upstream: Readonly<Record<string, unknown>>,
+  external: Readonly<Record<string, unknown>>,
+  fillMissingOnly: boolean,
+): MetadataFields {
+  const base = normalizeFields(upstream);
+  const ext = normalizeFields(external);
+  if (!fillMissingOnly) {
+    const out = { ...base };
+    for (const [key, value] of Object.entries(ext)) {
+      if (value !== undefined && value !== null) out[key] = value;
+    }
+    return out;
+  }
+  const out = { ...ext };
+  for (const [key, value] of Object.entries(base)) {
+    if (!fieldIsMissing(key, value)) {
+      out[key] = value;
+    } else if (key === "supported_reasoning_levels" && Array.isArray(value)) {
+      // An explicit [] means "no levels", not "missing".
+      out[key] = value;
+    }
+  }
+  return out;
+}
+
+/** Applies manual overrides on top of the merged metadata (null never erases). */
+export function applyOverrides(
+  merged: MetadataFields,
+  overrides: Readonly<Record<string, unknown>>,
+): MetadataFields {
+  const out = { ...merged };
+  for (const [key, value] of Object.entries(overrides)) {
+    if (PROTECTED_FIELDS.has(key)) continue;
+    if (value === null || value === undefined) continue;
+    out[key] = value;
+  }
+  return out;
+}

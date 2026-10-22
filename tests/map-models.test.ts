@@ -124,16 +124,33 @@ test("mapModel rejects entries without usable id", () => {
   assert.equal(mapModel([]), undefined);
 });
 
-test("fetchModels requests Codex catalog and rejects plain OpenAI shape", async () => {
+test("fetchModels requests the catalog and accepts both Codex models[] and OpenAI data[]", async () => {
   const originalFetch = globalThis.fetch;
   let requestedUrl = "";
   globalThis.fetch = async (input) => {
     requestedUrl = String(input);
-    return Response.json({ data: [{ id: "gpt-x" }] });
+    return Response.json({ data: [{ id: "gpt-x", context_window: 64000, max_tokens: 8192 }] });
   };
   try {
-    await assert.rejects(fetchModels("https://gateway.example/v1", "secret-key"), /Codex model catalog/);
+    const models = await fetchModels("https://gateway.example/v1", "secret-key");
+    assert.equal(models.length, 1);
+    assert.equal(models[0].id, "gpt-x");
     assert.equal(requestedUrl, `https://gateway.example/v1/models?client_version=${VERSION}`);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  globalThis.fetch = async () => Response.json({ models: [{ slug: "codex-y", context_window: 64000 }] });
+  try {
+    const models = await fetchModels("https://gateway.example/v1", "secret-key");
+    assert.equal(models[0].id, "codex-y");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  globalThis.fetch = async () => Response.json({ unexpected: true });
+  try {
+    await assert.rejects(fetchModels("https://gateway.example/v1", "secret-key"), /model catalog/);
   } finally {
     globalThis.fetch = originalFetch;
   }

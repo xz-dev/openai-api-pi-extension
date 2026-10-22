@@ -9,6 +9,8 @@
   },
   "files": [
     "index.ts",
+    "model-metadata.ts",
+    "metadata-sources.ts",
     "request-compression.ts",
     "responses-websocket-fetch.ts",
     "response-checkpoints.ts",
@@ -34,7 +36,8 @@
   "dependencies": {
     "minimatch": "10.2.6",
     "openai": "6.40.0",
-    "ws": "^8.18.0"
+    "ws": "^8.18.0",
+    "yaml": "^2.9.1"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "^0.84.2 || ^1.0.0",
