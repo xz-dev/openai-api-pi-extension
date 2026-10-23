@@ -417,7 +417,7 @@ export function resolveModelPolicy(config: MetadataConfig, publicId: string): Re
     globalRule?.fillMissingOnly ??
     channelConfig?.fillMissingOnly ??
     config.fillMissingOnly ??
-    false;
+    true;
 
   // lookup_ids: global model rule first, channel model rule overrides same keys.
   const lookupIds: Record<string, string> = { ...(globalRule?.lookupIds ?? {}) };
@@ -647,10 +647,14 @@ function lookupRecords(
   const hits = exact.length > 0 ? exact : folded.length > 0 ? folded : bare;
   // Distinct canonical targets within one matched id (e.g. MODEL and Model
   // declaring different canonical_model_id) are different identities that
-  // happen to fold together — ambiguous, never interchangeable.
-  const canonicals = new Set(hits.map((record) => record.canonicalModelId ?? ""));
+  // happen to fold together — ambiguous, never interchangeable. Folded hits
+  // collapse only when every hit has the same exact source modelId: folded
+  // matches of distinct IDs (MODEL vs Model) are ambiguous even with equal
+  // fields/canonicals, otherwise results would depend on record order.
   const ambiguous = hits.length > 1 &&
-    (canonicals.size > 1 || !hits.every((hit) => fieldsIdentical(hit, hits[0])));
+    (new Set(hits.map((record) => record.modelId)).size > 1 ||
+      new Set(hits.map((record) => record.canonicalModelId ?? "")).size > 1 ||
+      !hits.every((hit) => fieldsIdentical(hit, hits[0])));
   return { hits, ambiguous };
 }
 

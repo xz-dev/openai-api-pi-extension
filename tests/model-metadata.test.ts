@@ -171,7 +171,7 @@ test("resolveModelPolicy: default chain when unconfigured", () => {
   // Literal assertion: the documented default is subscription first.
   assert.deepEqual([...policy.sourcePriority], ["*/subscription", "*/api_key"]);
   assert.deepEqual([...DEFAULT_SOURCE_PRIORITY], ["*/subscription", "*/api_key"]);
-  assert.equal(policy.fillMissingOnly, false);
+  assert.equal(policy.fillMissingOnly, true);
 });
 
 test("resolveModelPolicy: channel chain + deduped global fallback", () => {
@@ -231,7 +231,7 @@ test("resolveModelPolicy: global model rule beats channel default, channel model
   assert.deepEqual([...resolveModelPolicy(noChannelRule, "proxy/m").sourcePriority], ["G"]);
 });
 
-test("resolveModelPolicy: fill_missing_only precedence channel model > global model > channel > global > false", () => {
+test("resolveModelPolicy: fill_missing_only precedence channel model > global model > channel > global > true", () => {
   const base = cfg({ fillMissingOnly: true, channels: { proxy: { fillMissingOnly: false } } });
   assert.equal(resolveModelPolicy(base, "proxy/m").fillMissingOnly, false); // channel wins over global
   const withGlobalRule = cfg({
@@ -408,11 +408,10 @@ test("resolveSelectorSite: a conflicting duplicate invalidates the whole site gr
   assert.ok(resolved.diagnostics.some((d) => d.kind === "ambiguous"));
 });
 
-test("resolveSelectorSite: case-folded duplicates collapse only within one canonical identity", () => {
-  // F3: MODEL and Model under one provider are one case-folded identity.
-  // Same canonical + identical fields → interchangeable duplicates. Same
-  // canonical + conflicting fields → ambiguous. Differing canonicals →
-  // distinct identities that must stay ambiguous, never collapse by fields.
+test("resolveSelectorSite: case-folded distinct IDs are ambiguous, not collapsible", () => {
+  // F3: MODEL and Model under one provider only fold to the query; they are
+  // distinct source identities. Equal fields or equal/missing canonicals do
+  // NOT make them interchangeable — otherwise record order picks the winner.
   const selector = parseSelector("models.dev/openai");
   const policy = resolveModelPolicy(cfg(), "model");
   const rec = (id: string, context: number, canonical?: string) =>
@@ -421,7 +420,20 @@ test("resolveSelectorSite: case-folded duplicates collapse only within one canon
     rec("MODEL", 100, "openai/model"),
     rec("Model", 100, "openai/model"),
   ]);
-  assert.equal(identical.record?.fields.context_window, 100);
+  assert.equal(identical.record, undefined, "folded distinct IDs are ambiguous");
+  assert.equal(identical.diagnostic?.kind, "ambiguous");
+  const noCanonical = resolveSelectorSite(selector, "models.dev", "model", policy, {}, [
+    rec("MODEL", 100),
+    rec("Model", 100),
+  ]);
+  assert.equal(noCanonical.record, undefined, "missing canonicals stay ambiguous");
+  assert.equal(noCanonical.diagnostic?.kind, "ambiguous");
+  // Same exact modelId duplicates collapse only when field-identical.
+  const sameId = resolveSelectorSite(selector, "models.dev", "model", policy, {}, [
+    dev("openai", "model", "openai/model", { context_window: 100 }),
+    dev("openai", "model", "openai/model", { context_window: 100 }),
+  ]);
+  assert.equal(sameId.record?.fields.context_window, 100);
   const conflictingFields = resolveSelectorSite(selector, "models.dev", "model", policy, {}, [
     rec("MODEL", 100, "openai/model"),
     rec("Model", 200, "openai/model"),
@@ -772,9 +784,16 @@ test("createMetadataResolver + mapCatalog: fill-only sees real missing values be
   assert.equal(kept?.contextWindow, 96000);
 });
 
-test("createMetadataResolver: default overwrite mode lets external win; source_priority: [] disables lookups", () => {
-  const records = [dev("openai", "m", "openai/m", { context_window: 1000000 })];
-  const full = createMetadataResolver(cfg({ sourcePriority: ["models.dev/openai"] }), records);
+test("createMetadataResolver: default fill-only keeps upstream; explicit false overwrites; [] disables lookups", () => {
+  const records = [dev("openai", "m", "openai/m", { context_window: 1000000, max_output_tokens: 128000 })];
+  // 默认补漏保留上游值: unset mode keeps the upstream context and only fills
+  // the missing maxTokens.
+  const fill = createMetadataResolver(cfg({ sourcePriority: ["models.dev/openai"] }), records);
+  const [kept] = mapCatalog([{ id: "m", context_window: 500000 }], "https://gw", fill.resolve);
+  assert.equal(kept?.contextWindow, 500000);
+  assert.equal(kept?.maxTokens, 128000);
+  // 显式 false 允许外部覆盖.
+  const full = createMetadataResolver(cfg({ sourcePriority: ["models.dev/openai"], fillMissingOnly: false }), records);
   const [over] = mapCatalog([{ id: "m", context_window: 128000 }], "https://gw", full.resolve);
   assert.equal(over?.contextWindow, 1000000);
   const off = createMetadataResolver(cfg({ sourcePriority: [] }), records);

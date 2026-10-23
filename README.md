@@ -208,8 +208,8 @@ During each online catalog refresh the extension can also enrich models from
 two public bulk metadata sites — [models.dev](https://models.dev) and
 [modelparams.dev](https://modelparams.dev) — using the same fallback-chain
 idea as AI-gateway's models-enricher, but only over public data. External
-sources never decide which models exist; they only fill or overwrite
-metadata. Membership stays 100% upstream. Requests are bounded (16 MiB, 5 s,
+sources never decide which models exist; they only fill missing metadata
+unless explicitly configured to overwrite. Membership stays 100% upstream. Requests are bounded (16 MiB, 5 s,
 no cross-origin redirects) and never carry the gateway API key.
 
 Config lives at `~/.pi/agent/openai-api-extension.yaml` (Pi's agent dir,
@@ -227,7 +227,7 @@ listing their full paths; everything else still applies.
 source_priority:
   - "*/subscription"
   - "*/api_key"
-fill_missing_only: false
+fill_missing_only: true   # built-in default; false allows overwrite
 
 models:
   # Model rules are string globs on the full public model ID; quote keys
@@ -236,7 +236,7 @@ models:
   "*gpt-6-astra":   # matches gpt-6-astra, openai/gpt-6-astra, proxy/openai/...
     source_priority: ["models.dev/openai", "modelparams.dev/openai/subscription"]
   "*gpt*":          # matches any full ID containing gpt, incl. provider segments
-    fill_missing_only: true
+    fill_missing_only: false  # opt into full overwrite for matching models
   model-a:          # exact: does NOT match proxy/model-a
     overrides: { context_window: 128000 }
 
@@ -244,7 +244,7 @@ channels:
   proxy:
     source_priority: ["models.dev/*/subscription"]
     global_fallback: true   # append the root chain after this channel chain
-    fill_missing_only: true
+    fill_missing_only: false  # channel-level opt-out of fill-only
     models:
       model-a:              # matches channel-relative ID (prefix stripped once)
         source_priority: [] # model chain replaces channel+global entirely
@@ -280,9 +280,10 @@ way (explicit `false` beats a parent's `true`). A model-level
 `source_priority` replaces the channel and global chains entirely —
 including `[]` to disable external sources for that model.
 
-**Merge modes**: default is full overwrite (external values win field by
-field); `fill_missing_only: true` only fills fields the upstream left
-missing. `null` never erases a lower-priority value; an explicit empty
+**Merge modes**: default is fill-only (`fill_missing_only: true`): external
+values fill only fields the upstream left missing or invalid; upstream values
+win. Set `fill_missing_only: false` at global, channel or model scope to let
+external values win field by field. `null` never erases a lower-priority value; an explicit empty
 `supported_reasoning_levels: []` means "no tiers" rather than "missing".
 Manual `overrides` (model rule, then legacy channel `overrides.<model>`)
 apply after source merging; Pi's `models.json` `modelOverrides` always
