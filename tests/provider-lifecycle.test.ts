@@ -380,45 +380,68 @@ test("refresh abort reaches the catalog request without publishing partial state
 });
 
 // --- Metadata fallback chain lifecycle (tasks 4.1-4.4) ----------------------
-// Loopback fixtures only; SOURCE_URLS/hooks inject the fake source endpoints.
+// Loopback/fake-fetch fixtures only. The config file is pointed at a temp dir
+// via PI_CODING_AGENT_DIR; source endpoints are intercepted at globalThis.fetch
+// by URL so production source endpoints and config path are exercised.
 
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { MetadataHooks } from "../index.ts";
+import { SOURCE_URLS } from "../metadata-sources.ts";
 
 const metadataDirs: string[] = [];
-async function metadataHooks(yaml: string | undefined, sourcePayloads: Record<string, unknown> = {}) {
-  const dir = await mkdtemp(join(tmpdir(), "openai-api-metadata-"));
+const realFetch = globalThis.fetch;
+/** True for any URL the metadata layer may legitimately request. */
+const isMetadataUrl = (url: string) =>
+  url === SOURCE_URLS.modelsDevApi || url === SOURCE_URLS.modelsDevFlat || url === SOURCE_URLS.modelparams;
+
+/**
+ * Sets PI_CODING_AGENT_DIR to a temp config dir and returns:
+ *  - hits: per-endpoint request counts (asserts no Authorization header)
+ *  - payload/setPayload/hang: control over the fake source responses
+ */
+function metadataEnv(yaml: string | undefined, sourcePayloads: Record<string, unknown> = {}) {
+  const dir = mkdtempSync(join(tmpdir(), "openai-api-metadata-"));
   metadataDirs.push(dir);
-  const configPath = join(dir, "openai-api-extension.yaml");
-  if (yaml !== undefined) await writeFile(configPath, yaml);
+  if (yaml !== undefined) writeFileSync(join(dir, "openai-api-extension.yaml"), yaml);
+  process.env.PI_CODING_AGENT_DIR = dir;
   const hits: Record<string, number> = {};
-  const make = async (key: string, payload: unknown) => {
-    const server = createServer((request, response) => {
-      hits[key] = (hits[key] ?? 0) + 1;
-      assert.equal(request.headers.authorization, undefined, "metadata sources must never see gateway credentials");
-      response.writeHead(200, { "content-type": "application/json" });
-      response.end(JSON.stringify(payload));
-    });
-    servers.push(server);
-    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-    const address = server.address();
-    assert.ok(address && typeof address === "object");
-    return `http://127.0.0.1:${address.port}`;
+  const payloadFor = new Map<string, unknown>([
+    [SOURCE_URLS.modelsDevApi, sourcePayloads.modelsDevApi ?? {}],
+    [SOURCE_URLS.modelsDevFlat, sourcePayloads.modelsDevFlat ?? {}],
+    [SOURCE_URLS.modelparams, sourcePayloads.modelparams ?? { models: [] }],
+  ]);
+  const hanging = new Set<string>();
+  globalThis.fetch = async (input, init) => {
+    const url = String(input);
+    if (!isMetadataUrl(url)) return realFetch(input, init);
+    const key = url === SOURCE_URLS.modelsDevApi ? "modelsDevApi" : url === SOURCE_URLS.modelsDevFlat ? "modelsDevFlat" : "modelparams";
+    hits[key] = (hits[key] ?? 0) + 1;
+    const headers = init?.headers as Record<string, string> | undefined;
+    assert.equal(headers?.authorization, undefined, "metadata sources must never see gateway credentials");
+    if (hanging.has(key)) {
+      return new Promise<Response>((_resolve, reject) => {
+        const signal = init?.signal;
+        if (signal?.aborted) reject(signal.reason);
+        else signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+      });
+    }
+    return Response.json(payloadFor.get(key));
   };
-  const hooks: MetadataHooks = {
-    configPath: () => configPath,
-    sourceUrls: {
-      modelsDevApi: await make("modelsDevApi", sourcePayloads.modelsDevApi ?? {}),
-      modelsDevFlat: await make("modelsDevFlat", sourcePayloads.modelsDevFlat ?? {}),
-      modelparams: await make("modelparams", sourcePayloads.modelparams ?? { models: [] }),
+  return {
+    hits,
+    setPayload: (key: string, payload: unknown) => {
+      payloadFor.set(SOURCE_URLS[key === "modelparams" ? "modelparams" : key === "modelsDevFlat" ? "modelsDevFlat" : "modelsDevApi"], payload);
     },
+    hang: (key: string) => hanging.add(key),
+    unhang: (key: string) => hanging.delete(key),
   };
-  return { hooks, hits };
 }
 
 afterEach(async () => {
+  globalThis.fetch = realFetch;
+  delete process.env.PI_CODING_AGENT_DIR;
   await Promise.all(metadataDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
 
@@ -435,15 +458,35 @@ const MODELS_DEV_API = {
   },
 };
 
-test("refresh enriches models through the shared metadata path", async () => {
+test("refresh enriches models through the shared metadata path", async (t) => {
+  const hits: Record<string, number> = {};
+  // Intercept BEFORE the provider reads anything; restore right after refresh.
+  const saveFetch = globalThis.fetch;
+  const saveDir = process.env.PI_CODING_AGENT_DIR;
+  globalThis.fetch = async (input, init) => {
+    const url = String(input);
+    if (url === SOURCE_URLS.modelsDevApi || url === SOURCE_URLS.modelsDevFlat || url === SOURCE_URLS.modelparams) {
+      const key = url === SOURCE_URLS.modelsDevApi ? "modelsDevApi" : url === SOURCE_URLS.modelsDevFlat ? "modelsDevFlat" : "modelparams";
+      hits[key] = (hits[key] ?? 0) + 1;
+      assert.equal((init?.headers as Record<string, string> | undefined)?.authorization, undefined);
+      return Response.json(key === "modelsDevApi" ? MODELS_DEV_API : key === "modelparams" ? { models: [] } : {});
+    }
+    return saveFetch(input, init);
+  };
+  process.env.PI_CODING_AGENT_DIR = mkdtempSync(join(tmpdir(), "openai-api-metadata-"));
+  const dir = process.env.PI_CODING_AGENT_DIR;
+  t.after(() => {
+    globalThis.fetch = saveFetch;
+    if (saveDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = saveDir;
+    metadataDirs.push(dir!);
+  });
   const gatewayServer = await gateway("gpt-meta", "test-key", false);
-  const { hooks, hits } = await metadataHooks(undefined, { modelsDevApi: MODELS_DEV_API });
   const credentials = new InMemoryCredentialStore();
   await credentials.modify(PROVIDER, async () => ({
     type: "api_key", key: "test-key", env: { [BASE_URL_ENV]: gatewayServer.baseUrl },
   }));
   const models = createModels({ credentials, authContext: authContext() });
-  models.setProvider(createOpenAIApiProvider([], undefined, undefined, undefined, hooks));
+  models.setProvider(createOpenAIApiProvider());
 
   const result = await models.refresh();
   assert.equal(result.errors.size, 0);
@@ -456,7 +499,7 @@ test("refresh enriches models through the shared metadata path", async () => {
 });
 
 test("offline restore reads no config and hits no metadata source", async () => {
-  const { hooks, hits } = await metadataHooks("source_priority: [\"models.dev/*/subscription\"]");
+  const { hits } = metadataEnv("source_priority: [\"models.dev/*/subscription\"]");
   const credentials = new InMemoryCredentialStore();
   const modelsStore = new InMemoryModelsStore();
   await credentials.modify(PROVIDER, async () => ({
@@ -468,7 +511,7 @@ test("offline restore reads no config and hits no metadata source", async () => 
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 64000, maxTokens: 8192,
   }] });
   const models = createModels({ credentials, modelsStore, authContext: authContext() });
-  models.setProvider(createOpenAIApiProvider([], undefined, undefined, undefined, hooks));
+  models.setProvider(createOpenAIApiProvider());
 
   const result = await models.refresh({ allowNetwork: false });
   assert.equal(result.errors.size, 0);
@@ -478,7 +521,7 @@ test("offline restore reads no config and hits no metadata source", async () => 
 
 test("invalid metadata config blocks the new catalog, keeps the old one, and is not an auth error", async () => {
   const gatewayServer = await gateway("fresh-model", "test-key");
-  const { hooks, hits } = await metadataHooks("fill_missing_only: maybe");
+  const { hits } = metadataEnv("fill_missing_only: maybe");
   const credentials = new InMemoryCredentialStore();
   const modelsStore = new InMemoryModelsStore();
   await credentials.modify(PROVIDER, async () => ({
@@ -491,7 +534,7 @@ test("invalid metadata config blocks the new catalog, keeps the old one, and is 
   }] });
   const reported: string[] = [];
   const models = createModels({ credentials, modelsStore, authContext: authContext() });
-  models.setProvider(createOpenAIApiProvider([], (message) => reported.push(message), undefined, undefined, hooks));
+  models.setProvider(createOpenAIApiProvider([], (message) => reported.push(message)));
 
   const result = await models.refresh();
   assert.equal(result.errors.size, 1);
@@ -507,25 +550,16 @@ test("invalid metadata config blocks the new catalog, keeps the old one, and is 
 
 test("failing metadata sources degrade to upstream-mapped models with a report", async () => {
   const gatewayServer = await gateway("degraded-model", "test-key", false);
-  const dir = await mkdtemp(join(tmpdir(), "openai-api-metadata-"));
-  metadataDirs.push(dir);
-  const dead = createServer((_request, response) => { response.writeHead(500).end(); });
-  servers.push(dead);
-  await new Promise<void>((resolve) => dead.listen(0, "127.0.0.1", resolve));
-  const deadAddress = dead.address();
-  assert.ok(deadAddress && typeof deadAddress === "object");
-  const deadUrl = `http://127.0.0.1:${deadAddress.port}`;
-  const hooks: MetadataHooks = {
-    configPath: () => join(dir, "openai-api-extension.yaml"),
-    sourceUrls: { modelsDevApi: deadUrl, modelsDevFlat: deadUrl, modelparams: deadUrl },
-  };
+  metadataEnv(undefined); // config absent; all source fetches throw below
+  globalThis.fetch = async (input, init) =>
+    isMetadataUrl(String(input)) ? Promise.reject(new Error("down")) : realFetch(input, init);
   const credentials = new InMemoryCredentialStore();
   await credentials.modify(PROVIDER, async () => ({
     type: "api_key", key: "test-key", env: { [BASE_URL_ENV]: gatewayServer.baseUrl },
   }));
   const reported: string[] = [];
   const models = createModels({ credentials, authContext: authContext() });
-  models.setProvider(createOpenAIApiProvider([], (message) => reported.push(message), undefined, undefined, hooks));
+  models.setProvider(createOpenAIApiProvider([], (message) => reported.push(message)));
 
   const result = await models.refresh();
   assert.equal(result.errors.size, 0, "degraded enrichment is not a refresh error");
@@ -535,10 +569,10 @@ test("failing metadata sources degrade to upstream-mapped models with a report",
 
 test("login saves the validated key and reports a metadata config error, not an auth failure", async () => {
   const gatewayServer = await gateway("login-meta-model", "test-key");
-  const { hooks } = await metadataHooks("source_priority: not-a-list");
+  metadataEnv("source_priority: not-a-list");
   const credentials = new InMemoryCredentialStore();
   const models = createModels({ credentials, authContext: authContext() });
-  models.setProvider(createOpenAIApiProvider([], undefined, undefined, undefined, hooks));
+  models.setProvider(createOpenAIApiProvider());
   const notifications: string[] = [];
   let promptCount = 0;
 
@@ -574,23 +608,13 @@ test("cancelled login during enrichment never publishes or persists its catalog"
   }] });
 
   // Metadata sources hang until the caller signal aborts.
-  const dir = await mkdtemp(join(tmpdir(), "openai-api-metadata-"));
-  metadataDirs.push(dir);
-  const hanging = createServer((request, _response) => {
-    request.socket.on("close", () => undefined); // never respond
-  });
-  servers.push(hanging);
-  await new Promise<void>((resolve) => hanging.listen(0, "127.0.0.1", resolve));
-  const address = hanging.address();
-  assert.ok(address && typeof address === "object");
-  const deadUrl = `http://127.0.0.1:${address.port}`;
-  const hooks: MetadataHooks = {
-    configPath: () => join(dir, "openai-api-extension.yaml"),
-    sourceUrls: { modelsDevApi: deadUrl, modelsDevFlat: deadUrl, modelparams: deadUrl },
-  };
+  const { hang } = metadataEnv(undefined);
+  hang("modelsDevApi");
+  hang("modelsDevFlat");
+  hang("modelparams");
 
   const models = createModels({ credentials, modelsStore, authContext: authContext() });
-  models.setProvider(createOpenAIApiProvider([], undefined, undefined, undefined, hooks));
+  models.setProvider(createOpenAIApiProvider());
 
   // Prime the restored catalog so a later offline refresh publishes "old-model".
   await models.refresh({ allowNetwork: false });
@@ -631,13 +655,13 @@ test("cancelled login during enrichment never publishes or persists its catalog"
 
 test("source_priority: [] opts out of all metadata network reads", async () => {
   const gatewayServer = await gateway("optout-model", "test-key", false);
-  const { hooks, hits } = await metadataHooks("source_priority: []");
+  const { hits } = metadataEnv("source_priority: []");
   const credentials = new InMemoryCredentialStore();
   await credentials.modify(PROVIDER, async () => ({
     type: "api_key", key: "test-key", env: { [BASE_URL_ENV]: gatewayServer.baseUrl },
   }));
   const models = createModels({ credentials, authContext: authContext() });
-  models.setProvider(createOpenAIApiProvider([], undefined, undefined, undefined, hooks));
+  models.setProvider(createOpenAIApiProvider());
 
   const result = await models.refresh();
   assert.equal(result.errors.size, 0);
@@ -647,7 +671,7 @@ test("source_priority: [] opts out of all metadata network reads", async () => {
 
 test("unknown config fields warn once and the rest of the config still applies", async () => {
   const gatewayServer = await gateway("warn-model", "test-key", false);
-  const { hooks } = await metadataHooks(
+  metadataEnv(
     "unsupported_gateway_field: true\nchannels:\n  chan:\n    metadata_from: cpa\n",
   );
   const credentials = new InMemoryCredentialStore();
@@ -656,7 +680,7 @@ test("unknown config fields warn once and the rest of the config still applies",
   }));
   const reported: string[] = [];
   const models = createModels({ credentials, authContext: authContext() });
-  models.setProvider(createOpenAIApiProvider([], (message) => reported.push(message), undefined, undefined, hooks));
+  models.setProvider(createOpenAIApiProvider([], (message) => reported.push(message)));
 
   const result = await models.refresh();
   assert.equal(result.errors.size, 0);

@@ -9,8 +9,15 @@
  * resolved chain depends on it.
  */
 import {
-  classifyAccess,
+  applyOverrides,
+  fieldIsValid,
+  mergeMetadata,
+  mergeProviderPrefixMaps,
+  resolveMetadataChain,
+  resolveModelPolicy,
+  type MetadataConfig,
   type MetadataSite,
+  type ResolutionDiagnostic,
   type SourceRecord,
 } from "./model-metadata.ts";
 
@@ -250,9 +257,10 @@ export async function fetchMetadataSources(
               )
             : undefined;
           if (existing) {
-            // Same full identity: flat only fills fields api.json lacks.
+            // Same full identity: flat fills only fields api.json lacks — an
+            // invalid api.json value counts as missing (F5).
             for (const [key, value] of Object.entries(record.fields)) {
-              if (existing.fields[key] === undefined) existing.fields[key] = value;
+              if (!fieldIsValid(key, existing.fields[key])) existing.fields[key] = value;
             }
           } else {
             records.push(record);
@@ -282,21 +290,6 @@ export async function fetchMetadataSources(
 // Per-model resolution over the shared record list.
 // ---------------------------------------------------------------------------
 
-import {
-  applyOverrides,
-  mergeMetadata,
-  mergeProviderPrefixMaps,
-  resolveMetadataChain,
-  resolveModelPolicy,
-  type MetadataConfig,
-  type ResolutionDiagnostic,
-} from "./model-metadata.ts";
-
-export type ResolvedModel = {
-  fields: Record<string, unknown>;
-  diagnostics: ResolutionDiagnostic[];
-};
-
 export type MetadataResolver = {
   resolve: (publicId: string, upstream: Readonly<Record<string, unknown>>) => Readonly<Record<string, unknown>>;
   /** Ambiguity/degradation diagnostics collected while resolving the catalog. */
@@ -325,7 +318,7 @@ export function createMetadataResolver(
     const queryId = policy.channelId;
     const resolved =
       policy.sourcePriority.length > 0
-        ? resolveMetadataChain(policy, publicId, queryId, prefixMap, records)
+        ? resolveMetadataChain(policy, queryId, prefixMap, records)
         : undefined;
     for (const diagnostic of resolved?.diagnostics ?? []) {
       const key = `${diagnostic.kind} ${diagnostic.token} ${diagnostic.modelId} ${diagnostic.detail}`;
@@ -357,5 +350,3 @@ export function neededSites(config: MetadataConfig, publicIds: readonly string[]
   }
   return out;
 }
-
-export { classifyAccess };

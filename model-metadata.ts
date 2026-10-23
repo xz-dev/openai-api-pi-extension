@@ -170,7 +170,20 @@ function readModelRule(value: unknown, path: string, warnings: string[]): ModelR
     overrides: readFieldMap(value.overrides, `${path}.overrides`),
   };
   for (const token of Object.keys(rule.lookupIds ?? {})) {
-    parseSelector(token, `${path}.lookup_ids key ${JSON.stringify(token)}`);
+    // Keys are exact concrete sources: models.dev/<provider> or
+    // modelparams.dev/<provider>/<access>. A wildcard segment would apply one
+    // id across several sources, so it is a config error.
+    const selector = parseSelector(token, `${path}.lookup_ids key ${JSON.stringify(token)}`);
+    const concrete =
+      (selector.site === "models.dev" && selector.provider !== undefined && selector.access === "*") ||
+      (selector.site === "modelparams.dev" && selector.providerPattern !== undefined &&
+        !selector.providerPattern.includes("*") && selector.access !== "*");
+    if (!concrete) {
+      throw new MetadataConfigError(
+        `${path}.lookup_ids key ${JSON.stringify(token)}`,
+        "expected an exact concrete source (models.dev/<provider> or modelparams.dev/<provider>/<access>)",
+      );
+    }
   }
   return rule;
 }
@@ -263,17 +276,30 @@ export function parseMetadataConfig(yamlText: string | undefined): MetadataConfi
 // Case-sensitive, anchored to the whole string; not minimatch path semantics.
 // ---------------------------------------------------------------------------
 
-export function modelPatternToRegExp(pattern: string): RegExp {
-  const source = pattern
-    .split("*")
-    .map((literal) => literal.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
-    .join("[\\s\\S]*");
-  return new RegExp(`^${source}$`);
-}
-
-/** True when the pattern (literal chars + `*`) matches the whole model id. */
+/**
+ * Plain-string glob match: `*` matches zero or more of any character
+ * (including `/`), everything else is literal. Anchored, case-sensitive,
+ * consecutive `*` equal one — ordered literal-chunk matching, never a
+ * generated backtracking regexp.
+ */
 export function matchModelPattern(pattern: string, id: string): boolean {
-  return modelPatternToRegExp(pattern).test(id);
+  const chunks = pattern.split("*");
+  if (chunks.length === 1) return pattern === id;
+  const first = chunks[0];
+  if (first !== "" && !id.startsWith(first)) return false;
+  const last = chunks[chunks.length - 1];
+  if (last !== "" && !id.endsWith(last)) return false;
+  if (id.length < first.length + last.length) return false; // prefix and suffix must not overlap
+  let pos = first.length;
+  const end = id.length - last.length;
+  for (let index = 1; index < chunks.length - 1; index++) {
+    const chunk = chunks[index];
+    if (chunk === "") continue;
+    const found = id.indexOf(chunk, pos);
+    if (found === -1 || found + chunk.length > end) return false;
+    pos = found + chunk.length;
+  }
+  return true;
 }
 
 /**
@@ -328,7 +354,18 @@ function mergeOverrides(
   extra: Readonly<Record<string, unknown>> | undefined,
 ): Record<string, unknown> {
   const out: Record<string, unknown> = { ...base };
-  if (extra) overlayMetadata(out, extra);
+  if (!extra) return out;
+  // Aliases of one canonical field must collide at merge time: a lower-scope
+  // `context_window` must not survive a higher-scope `context_length`. Each
+  // layer normalizes onto canonical names before overlaying.
+  const aliases = new Set(Object.values(FIELD_ALIASES).flat());
+  const known: Record<string, unknown> = {};
+  const rest: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(extra)) {
+    (aliases.has(key) || key === "capabilities" ? known : rest)[key] = value;
+  }
+  overlayMetadata(out, rest);
+  overlayMetadata(out, normalizeFields(known));
   return out;
 }
 
@@ -479,11 +516,6 @@ export function selectorSites(selector: Selector): readonly MetadataSite[] {
   return selector.site === "*" ? METADATA_SITES : [selector.site];
 }
 
-/** Sites a selector needs, in built-in order (models.dev before modelparams.dev). */
-export function selectorNeedsSite(selector: Selector, site: MetadataSite): boolean {
-  return selectorSites(selector).includes(site);
-}
-
 // ---------------------------------------------------------------------------
 // Source records + per-selector resolution.
 // ---------------------------------------------------------------------------
@@ -535,10 +567,9 @@ export function mergeProviderPrefixMaps(
 /**
  * Candidate query identities for one selector group.
  *
- * - An explicit lookup_ids entry for the concrete expanded source
+ * - An explicit lookup_ids entry keyed by the concrete expanded source
  *   (`<site>/<provider>` for models.dev, `<site>/<provider>/<access>` for
- *   modelparams.dev) fixes the query id — also under wildcard selectors; the
- *   literal selector token is accepted as a fallback key for compatibility.
+ *   modelparams.dev) fixes the query id — also under wildcard selectors.
  * - A qualified query id's first segment may be remapped through
  *   provider_prefix_map (metadata query identity only; public id unchanged).
  * - Bare names ask the selector-matched providers; qualified names keep their
@@ -565,7 +596,7 @@ export function* candidateIdentities(
     const access = classifyAccess(record.site, record.provider, record.authType);
     const concreteKey =
       site === "modelparams.dev" && access ? `${site}/${record.provider}/${access}` : `${site}/${record.provider}`;
-    const override = policy.lookupIds[concreteKey] ?? policy.lookupIds[selector.token];
+    const override = policy.lookupIds[concreteKey];
     const id = override ?? (qualified ? bareId : queryId);
     const key = `${record.provider}${id}`;
     if (!seen.has(key)) {
@@ -601,7 +632,7 @@ function lookupRecords(
   provider: string,
   queryId: string,
   selector: Selector,
-): SourceRecord[] {
+): { hits: SourceRecord[]; ambiguous: boolean } {
   const exact: SourceRecord[] = [];
   const folded: SourceRecord[] = [];
   const bare: SourceRecord[] = [];
@@ -613,9 +644,14 @@ function lookupRecords(
     else if (record.modelId.toLowerCase() === queryId.toLowerCase()) folded.push(record);
     else if (isBare && record.modelId.toLowerCase().endsWith(`/${queryId.toLowerCase()}`)) bare.push(record);
   }
-  if (exact.length > 0) return exact;
-  if (folded.length > 0) return folded;
-  return bare;
+  const hits = exact.length > 0 ? exact : folded.length > 0 ? folded : bare;
+  // Distinct canonical targets within one matched id (e.g. MODEL and Model
+  // declaring different canonical_model_id) are different identities that
+  // happen to fold together — ambiguous, never interchangeable.
+  const canonicals = new Set(hits.map((record) => record.canonicalModelId ?? ""));
+  const ambiguous = hits.length > 1 &&
+    (canonicals.size > 1 || !hits.every((hit) => fieldsIdentical(hit, hits[0])));
+  return { hits, ambiguous };
 }
 
 /**
@@ -639,25 +675,31 @@ export function resolveSelectorSite(
   const seen = new Set<string>();
   let ambiguousDuplicates = false;
   for (const identity of candidateIdentities(selector, site, queryId, policy, prefixMap, records)) {
-    const hits = lookupRecords(records, site, identity.provider, identity.queryId, selector);
+    const { hits, ambiguous } = lookupRecords(records, site, identity.provider, identity.queryId, selector);
     if (hits.length === 0) continue;
-    const first = hits[0];
-    if (hits.length > 1 && !hits.every((hit) => fieldsIdentical(hit, first))) {
-      // Same provider+model with disagreeing fields (e.g. modelparams.dev
-      // apiSurface variants) cannot be uniquely located: skip this identity.
+    if (ambiguous) {
+      // Same provider+model with disagreeing fields or distinct canonical
+      // targets (e.g. modelparams.dev apiSurface variants) cannot be uniquely
+      // located: the whole site group is ambiguous, not just this identity.
       ambiguousDuplicates = true;
       continue;
     }
+    const first = hits[0];
     if (!seen.has(first.provider + "" + first.modelId)) {
       seen.add(first.provider + "" + first.modelId);
       candidates.push(first);
     }
   }
+  if (ambiguousDuplicates) {
+    // A conflicting duplicate anywhere in the group invalidates the whole
+    // site group — a surviving clean candidate must not silently win.
+    return {
+      diagnostic: { kind: "ambiguous", token: selector.token, modelId: queryId, detail: `${site} has conflicting duplicate records for ${queryId}` },
+    };
+  }
   if (candidates.length === 0) {
     return {
-      diagnostic: ambiguousDuplicates
-        ? { kind: "ambiguous", token: selector.token, modelId: queryId, detail: `${site} has conflicting duplicate records for ${queryId}` }
-        : { kind: "missing", token: selector.token, modelId: queryId, detail: `no ${site} candidate` },
+      diagnostic: { kind: "missing", token: selector.token, modelId: queryId, detail: `no ${site} candidate` },
     };
   }
   if (candidates.length === 1) return { record: candidates[0] };
@@ -689,8 +731,6 @@ export function resolveSelectorSite(
 export type ChainResolution = {
   fields: MetadataFields;
   diagnostics: ResolutionDiagnostic[];
-  /** Sites any adopted/attempted selector needed — drives which endpoints to fetch. */
-  neededSites: ReadonlySet<MetadataSite>;
 };
 
 /**
@@ -703,7 +743,6 @@ export type ChainResolution = {
  */
 export function resolveMetadataChain(
   policy: ResolvedPolicy,
-  publicId: string,
   queryId: string,
   prefixMap: Readonly<Record<string, readonly string[]>>,
   records: readonly SourceRecord[],
@@ -711,12 +750,10 @@ export function resolveMetadataChain(
   const fields: MetadataFields = {};
   const diagnostics: ResolutionDiagnostic[] = [];
   const adopted = new Set<string>();
-  const neededSites = new Set<MetadataSite>();
   const declared = new Set<string>();
   for (const token of policy.sourcePriority) {
     const selector = parseSelector(token);
     for (const site of selectorSites(selector)) {
-      neededSites.add(site);
       const { record, diagnostic } = resolveSelectorSite(selector, site, queryId, policy, prefixMap, records);
       if (diagnostic) {
         if (diagnostic.kind === "ambiguous") diagnostics.push(diagnostic);
@@ -733,7 +770,7 @@ export function resolveMetadataChain(
       }
     }
   }
-  return { fields, diagnostics, neededSites };
+  return { fields, diagnostics };
 }
 
 // ---------------------------------------------------------------------------

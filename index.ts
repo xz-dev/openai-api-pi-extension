@@ -27,7 +27,6 @@ import {
   createMetadataResolver,
   fetchMetadataSources,
   neededSites,
-  SOURCE_URLS,
 } from "./metadata-sources.ts";
 import { MetadataConfigError, parseMetadataConfig } from "./model-metadata.ts";
 import {
@@ -323,12 +322,6 @@ export async function fetchModels(
 
 const METADATA_CONFIG_FILE = "openai-api-extension.yaml";
 
-/** Test seam for the metadata config path and source endpoints (production uses the defaults). */
-export type MetadataHooks = {
-  configPath?: () => string;
-  sourceUrls?: typeof SOURCE_URLS;
-};
-
 export type CatalogEnrichment = {
   models: GatewayModel[];
   /** Human-readable one-line notes: ignored config fields and degraded sources. */
@@ -344,16 +337,18 @@ export type CatalogEnrichment = {
  * - MetadataConfigError (invalid known values / bad YAML) propagates: callers
  *   keep the previous catalog and must not surface it as an auth failure.
  * - Failed sources degrade to upstream-mapped models with a note.
+ * - Caller-abort propagates; a source phase that outlives the caller's
+ *   deadline degrades to upstream-only so a slow metadata host never drops
+ *   an already-valid gateway catalog.
  */
 export async function enrichCatalog(
   entries: readonly unknown[],
   baseUrl: string,
   signal: AbortSignal | undefined,
-  hooks: MetadataHooks = {},
 ): Promise<CatalogEnrichment> {
   let text: string | undefined;
   try {
-    text = await readFile(hooks.configPath?.() ?? join(getAgentDir(), METADATA_CONFIG_FILE), "utf8");
+    text = await readFile(join(getAgentDir(), METADATA_CONFIG_FILE), "utf8");
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
       throw new MetadataConfigError(METADATA_CONFIG_FILE, errorMessage(error));
@@ -374,11 +369,18 @@ export async function enrichCatalog(
   const needed = neededSites(config, publicIds);
   let records: Awaited<ReturnType<typeof fetchMetadataSources>>["records"] = [];
   if (needed.size > 0 && !signal?.aborted) {
-    const result = await fetchMetadataSources(needed, signal, hooks.sourceUrls ?? SOURCE_URLS);
-    records = result.records;
-    for (const site of result.failed) notes.push(`metadata source ${site} unavailable; using upstream values`);
-    for (const site of result.malformed) {
-      if (!result.failed.has(site)) notes.push(`metadata source ${site} returned no usable records; using upstream values`);
+    try {
+      const result = await fetchMetadataSources(needed, signal);
+      records = result.records;
+      for (const site of result.failed) notes.push(`metadata source ${site} unavailable; using upstream values`);
+      for (const site of result.malformed) {
+        if (!result.failed.has(site)) notes.push(`metadata source ${site} returned no usable records; using upstream values`);
+      }
+    } catch (error) {
+      if (!signal?.aborted) throw error;
+      // The shared deadline fired inside the source phase: degrade instead of
+      // dropping a verified gateway catalog.
+      notes.push("metadata sources timed out; using upstream values");
     }
   }
   const resolver = createMetadataResolver(config, records);
@@ -393,9 +395,8 @@ export async function fetchEnrichedCatalog(
   baseUrl: string,
   apiKey: string,
   signal: AbortSignal | undefined,
-  hooks: MetadataHooks = {},
 ): Promise<CatalogEnrichment> {
-  return enrichCatalog(await fetchCatalog(baseUrl, apiKey, signal), baseUrl, signal, hooks);
+  return enrichCatalog(await fetchCatalog(baseUrl, apiKey, signal), baseUrl, signal);
 }
 
 function credentialBaseUrl(credential: ApiKeyCredential | undefined): string | undefined {
@@ -426,7 +427,6 @@ async function resolveConnection(
 
 function apiKeyAuth(
   onValidated: (baseUrl: string, apiKey: string, models: readonly GatewayModel[]) => void,
-  metadataHooks: MetadataHooks,
 ): ApiKeyAuth {
   return {
     name: `${PROVIDER_NAME} connection`,
@@ -449,7 +449,7 @@ function apiKeyAuth(
       interaction.notify({ type: "progress", message: "Validating connection..." });
       const entries = await fetchCatalog(baseUrl, apiKey, interaction.signal);
       try {
-        const { models, notes } = await enrichCatalog(entries, baseUrl, interaction.signal, metadataHooks);
+        const { models, notes } = await enrichCatalog(entries, baseUrl, interaction.signal);
         // A cancelled login must not publish the catalogue it fetched.
         interaction.signal.throwIfAborted();
         onValidated(baseUrl, apiKey, models);
@@ -489,7 +489,6 @@ export function createOpenAIApiProvider(
   onCatalogError?: (message: string) => void,
   getRawCheckpointExclude: () => unknown = () => undefined,
   getRawCheckpointMode: () => unknown = () => undefined,
-  metadataHooks: MetadataHooks = {},
 ): Provider<"openai-responses"> {
   let models = initialModels;
   let initialModelsPublished = false;
@@ -525,7 +524,7 @@ export function createOpenAIApiProvider(
     auth: {
       apiKey: apiKeyAuth((baseUrl, apiKey, validatedModels) => {
         validatedLogin = { baseUrl, apiKey, models: validatedModels, checkedAt: Date.now() };
-      }, metadataHooks),
+      }),
     },
     getModels: () => models,
     refreshModels: async (context: RefreshModelsContext) => {
@@ -563,7 +562,7 @@ export function createOpenAIApiProvider(
       const apiKey = context.credential.key;
       if (!baseUrl || !apiKey) return;
       try {
-        const { models: refreshed, notes } = await fetchEnrichedCatalog(baseUrl, apiKey, context.signal, metadataHooks);
+        const { models: refreshed, notes } = await fetchEnrichedCatalog(baseUrl, apiKey, context.signal);
         if (context.signal.aborted) return;
         for (const note of notes) {
           try {
