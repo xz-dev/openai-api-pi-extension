@@ -111,7 +111,12 @@ function effortValuesToLevels(values: unknown): unknown[] | undefined {
 }
 
 /** api.json hit: provider-keyed map; `id` may alias the model inside the provider. */
-function normalizeModelsDevRecord(provider: string, key: string, raw: Record<string, unknown>): SourceRecord {
+function normalizeModelsDevRecord(
+  provider: string,
+  key: string,
+  raw: Record<string, unknown>,
+  providerName?: string,
+): SourceRecord {
   const limit = isRecord(raw.limit) ? raw.limit : {};
   const modalities = isRecord(raw.modalities) ? raw.modalities : {};
   const fields: Record<string, unknown> = {
@@ -134,6 +139,7 @@ function normalizeModelsDevRecord(provider: string, key: string, raw: Record<str
     provider: provider.toLowerCase(),
     modelId: key,
     canonicalModelId: firstString(raw.canonical_model_id),
+    providerName,
     fields,
   };
 }
@@ -143,9 +149,10 @@ function indexModelsDevApi(payload: unknown): SourceRecord[] {
   if (!isRecord(payload)) return out;
   for (const [provider, entry] of Object.entries(payload)) {
     if (!isRecord(entry) || !isRecord(entry.models)) continue;
+    const providerName = firstString(entry.name);
     for (const [key, raw] of Object.entries(entry.models)) {
       if (!isRecord(raw)) continue;
-      const record = normalizeModelsDevRecord(provider, key, raw);
+      const record = normalizeModelsDevRecord(provider, key, raw, providerName);
       out.push(record);
       // m.id is an in-namespace alias of the same record, not a new product.
       const alias = firstString(raw.id);
@@ -318,7 +325,7 @@ export function createMetadataResolver(
     const queryId = policy.channelId;
     const resolved =
       policy.sourcePriority.length > 0
-        ? resolveMetadataChain(policy, queryId, prefixMap, records)
+        ? resolveMetadataChain(policy, queryId, prefixMap, records, config.subscriptionCorrections)
         : undefined;
     for (const diagnostic of resolved?.diagnostics ?? []) {
       const key = `${diagnostic.kind} ${diagnostic.token} ${diagnostic.modelId} ${diagnostic.detail}`;

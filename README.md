@@ -260,9 +260,20 @@ Overlapping selectors can't double-apply the same adopted record.
 
 **Access classification** is a local policy, not a claim about your gateway:
 modelparams.dev uses each record's own `authType`; models.dev has no auth
-field, so a fixed subscription-provider set ships in the plugin
-(`MODELS_DEV_SUBSCRIPTION_PROVIDERS` in `model-metadata.ts`) and every other
-models.dev provider counts as `api_key`. Pin a provider earlier with an
+field, so providers are recognized by naming convention — ids matching
+`-(coding|token|code|step)-plan` (optionally with a region suffix), ending in
+`-pass`, or `github-copilot`, plus display names containing
+Coding/Token/Code/Step Plan — and everything else counts as `api_key`.
+Correct the rule per provider at the root of the YAML:
+
+```yaml
+models_dev_subscription:
+  add: [some-new-sub]      # force subscription
+  remove: [some-misjudged] # force api_key
+```
+
+Matching is exact and case-insensitive on the provider id; `add` beats
+`remove`, `remove` beats the naming rule. Pin a provider earlier with an
 exact `models.dev/<provider>` selector if needed.
 
 **Ambiguity**: when one selector yields several same-named records from

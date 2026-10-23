@@ -23,24 +23,17 @@ export type MetadataSite = (typeof METADATA_SITES)[number];
 export const DEFAULT_SOURCE_PRIORITY: readonly string[] = ["*/subscription", "*/api_key"];
 
 /**
- * models.dev does not publish an access-type field. Providers in this set are
- * classified subscription for selector purposes; every other provider
- * (including ones added later) falls into the api_key group. Source: the
- * current models.dev catalog's subscription products.
+ * models.dev does not publish an access-type field, so subscription products
+ * are recognized by naming convention: provider ids like `*-coding-plan`,
+ * `*-token-plan`, `*-pass` or `github-copilot`, and display names containing
+ * "Coding/Token/Code/Step Plan". `models_dev_subscription.add/remove` in the
+ * YAML config corrects the rule (add > remove > rule).
  */
-export const MODELS_DEV_SUBSCRIPTION_PROVIDERS: ReadonlySet<string> = new Set([
-  "alibaba-coding-plan",
-  "alibaba-coding-plan-cn",
-  "github-copilot",
-  "kuae-cloud-coding-plan",
-  "minimax-cn-coding-plan",
-  "minimax-coding-plan",
-  "tencent-coding-plan",
-  "umans-ai-coding-plan",
-  "volcengine-coding-plan",
-  "zai-coding-plan",
-  "zhipuai-coding-plan",
-]);
+const SUBSCRIPTION_ID_RULE = /-(coding|token|code|step)-plan(-|$)|-pass$|^github-copilot$/;
+const SUBSCRIPTION_NAME_RULE = /\b(coding|token|code|step) plan\b/i;
+
+/** Exact, case-insensitive provider-id corrections from models_dev_subscription. */
+export type SubscriptionCorrections = { add?: ReadonlySet<string>; remove?: ReadonlySet<string> };
 
 export type ModelRule = {
   sourcePriority?: readonly string[];
@@ -66,6 +59,8 @@ export type MetadataConfig = {
   providerPrefixMap?: Readonly<Record<string, readonly string[]>>;
   models?: Readonly<Record<string, ModelRule>>;
   channels?: Readonly<Record<string, ChannelConfig>>;
+  /** models_dev_subscription corrections; root-level only. */
+  subscriptionCorrections?: SubscriptionCorrections;
   /** Full dotted paths of ignored unknown fields, in document order. */
   warnings: readonly string[];
 };
@@ -89,6 +84,7 @@ const KNOWN_ROOT_KEYS = new Set([
   "provider_prefix_map",
   "models",
   "channels",
+  "models_dev_subscription",
 ]);
 const KNOWN_CHANNEL_KEYS = new Set([
   "source_priority",
@@ -150,6 +146,28 @@ function readProviderPrefixMap(value: unknown, path: string): Record<string, rea
     out[name] = targets;
   }
   return out;
+}
+
+function readProviderIdList(value: unknown, path: string): ReadonlySet<string> | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) throw new MetadataConfigError(path, "expected a list of provider ids");
+  const out = new Set<string>();
+  for (const item of value) {
+    if (typeof item !== "string" || item === "") {
+      throw new MetadataConfigError(path, "expected non-empty provider id strings");
+    }
+    out.add(item.toLowerCase());
+  }
+  return out;
+}
+
+function readSubscriptionCorrections(value: unknown, path: string): SubscriptionCorrections | undefined {
+  if (value === undefined) return undefined;
+  if (!isRecord(value)) throw new MetadataConfigError(path, "expected a mapping of add/remove");
+  for (const key of Object.keys(value)) {
+    if (key !== "add" && key !== "remove") throw new MetadataConfigError(`${path}.${key}`, "expected only add/remove lists");
+  }
+  return { add: readProviderIdList(value.add, `${path}.add`), remove: readProviderIdList(value.remove, `${path}.remove`) };
 }
 
 function readFieldMap(value: unknown, path: string): Record<string, unknown> | undefined {
@@ -267,6 +285,7 @@ export function parseMetadataConfig(yamlText: string | undefined): MetadataConfi
     providerPrefixMap: readProviderPrefixMap(root.provider_prefix_map, "provider_prefix_map"),
     models: readModelRules(root.models, "models", warnings),
     channels,
+    subscriptionCorrections: readSubscriptionCorrections(root.models_dev_subscription, "models_dev_subscription"),
     warnings,
   };
 }
@@ -503,9 +522,17 @@ export function parseSelector(token: string, path = "source_priority"): Selector
 }
 
 /** Access group of a source record under the local classification policy. */
-export function classifyAccess(site: MetadataSite, provider: string, authType: unknown): AccessType | undefined {
+export function classifyAccess(
+  site: MetadataSite,
+  provider: string,
+  authType: unknown,
+  providerName?: string,
+  corrections?: SubscriptionCorrections,
+): AccessType | undefined {
   if (site === "models.dev") {
-    return MODELS_DEV_SUBSCRIPTION_PROVIDERS.has(provider.toLowerCase()) ? "subscription" : "api_key";
+    const id = provider.toLowerCase();
+    const rule = SUBSCRIPTION_ID_RULE.test(id) || (providerName !== undefined && SUBSCRIPTION_NAME_RULE.test(providerName));
+    return (rule && !corrections?.remove?.has(id)) || corrections?.add?.has(id) ? "subscription" : "api_key";
   }
   const normalized = typeof authType === "string" ? authType.trim().toLowerCase() : "";
   if (normalized === "api_key" || normalized === "subscription") return normalized;
@@ -529,6 +556,8 @@ export type SourceRecord = {
   modelId: string;
   /** Raw authType from modelparams.dev; undefined for models.dev. */
   authType?: unknown;
+  /** models.dev provider display `name`, used by the subscription naming rule. */
+  providerName?: string;
   /** models.dev canonical_model_id, e.g. "openai/gpt-5". */
   canonicalModelId?: string;
   fields: MetadataFields;
@@ -540,7 +569,11 @@ export type ResolutionDiagnostic = { kind: "ambiguous" | "missing"; token: strin
  * Whether a source record belongs to a selector: site group, provider glob,
  * and access classification (unknown authType only matches access "*").
  */
-export function recordMatchesSelector(selector: Selector, record: SourceRecord): boolean {
+export function recordMatchesSelector(
+  selector: Selector,
+  record: SourceRecord,
+  corrections?: SubscriptionCorrections,
+): boolean {
   if (!selectorSites(selector).includes(record.site)) return false;
   if (selector.provider !== undefined) {
     if (record.provider !== selector.provider.toLowerCase()) return false;
@@ -548,7 +581,7 @@ export function recordMatchesSelector(selector: Selector, record: SourceRecord):
     if (!minimatch(record.provider, selector.providerPattern)) return false;
   }
   if (selector.access === "*") return true;
-  return classifyAccess(record.site, record.provider, record.authType) === selector.access;
+  return classifyAccess(record.site, record.provider, record.authType, record.providerName, corrections) === selector.access;
 }
 
 /**
@@ -582,6 +615,7 @@ export function* candidateIdentities(
   policy: ResolvedPolicy,
   prefixMap: Readonly<Record<string, readonly string[]>>,
   records: readonly SourceRecord[],
+  corrections?: SubscriptionCorrections,
 ): Generator<{ provider: string; queryId: string }> {
   const slash = queryId.indexOf("/");
   const qualified = slash > 0;
@@ -591,9 +625,9 @@ export function* candidateIdentities(
     qualified && prefixMap[providerSegment] ? prefixMap[providerSegment] : qualified ? [providerSegment] : undefined;
   const seen = new Set<string>();
   for (const record of records) {
-    if (record.site !== site || !recordMatchesSelector(selector, record)) continue;
+    if (record.site !== site || !recordMatchesSelector(selector, record, corrections)) continue;
     if (targets !== undefined && !targets.some((t) => t === record.provider)) continue;
-    const access = classifyAccess(record.site, record.provider, record.authType);
+    const access = classifyAccess(record.site, record.provider, record.authType, record.providerName, corrections);
     const concreteKey =
       site === "modelparams.dev" && access ? `${site}/${record.provider}/${access}` : `${site}/${record.provider}`;
     const override = policy.lookupIds[concreteKey];
@@ -632,6 +666,7 @@ function lookupRecords(
   provider: string,
   queryId: string,
   selector: Selector,
+  corrections?: SubscriptionCorrections,
 ): { hits: SourceRecord[]; ambiguous: boolean } {
   const exact: SourceRecord[] = [];
   const folded: SourceRecord[] = [];
@@ -639,7 +674,7 @@ function lookupRecords(
   const isBare = !queryId.includes("/");
   for (const record of records) {
     if (record.site !== site || record.provider !== provider) continue;
-    if (!recordMatchesSelector(selector, record)) continue;
+    if (!recordMatchesSelector(selector, record, corrections)) continue;
     if (record.modelId === queryId) exact.push(record);
     else if (record.modelId.toLowerCase() === queryId.toLowerCase()) folded.push(record);
     else if (isBare && record.modelId.toLowerCase().endsWith(`/${queryId.toLowerCase()}`)) bare.push(record);
@@ -674,12 +709,13 @@ export function resolveSelectorSite(
   policy: ResolvedPolicy,
   prefixMap: Readonly<Record<string, readonly string[]>>,
   records: readonly SourceRecord[],
+  corrections?: SubscriptionCorrections,
 ): { record?: SourceRecord; diagnostic?: ResolutionDiagnostic } {
   const candidates: SourceRecord[] = [];
   const seen = new Set<string>();
   let ambiguousDuplicates = false;
-  for (const identity of candidateIdentities(selector, site, queryId, policy, prefixMap, records)) {
-    const { hits, ambiguous } = lookupRecords(records, site, identity.provider, identity.queryId, selector);
+  for (const identity of candidateIdentities(selector, site, queryId, policy, prefixMap, records, corrections)) {
+    const { hits, ambiguous } = lookupRecords(records, site, identity.provider, identity.queryId, selector, corrections);
     if (hits.length === 0) continue;
     if (ambiguous) {
       // Same provider+model with disagreeing fields or distinct canonical
@@ -750,6 +786,7 @@ export function resolveMetadataChain(
   queryId: string,
   prefixMap: Readonly<Record<string, readonly string[]>>,
   records: readonly SourceRecord[],
+  corrections?: SubscriptionCorrections,
 ): ChainResolution {
   const fields: MetadataFields = {};
   const diagnostics: ResolutionDiagnostic[] = [];
@@ -758,7 +795,7 @@ export function resolveMetadataChain(
   for (const token of policy.sourcePriority) {
     const selector = parseSelector(token);
     for (const site of selectorSites(selector)) {
-      const { record, diagnostic } = resolveSelectorSite(selector, site, queryId, policy, prefixMap, records);
+      const { record, diagnostic } = resolveSelectorSite(selector, site, queryId, policy, prefixMap, records, corrections);
       if (diagnostic) {
         if (diagnostic.kind === "ambiguous") diagnostics.push(diagnostic);
         continue;

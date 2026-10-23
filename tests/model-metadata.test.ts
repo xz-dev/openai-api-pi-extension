@@ -262,13 +262,65 @@ test("parseSelector: all supported forms, invalid rejected", () => {
   assert.throws(() => parseSelector("models.dev/"), MetadataConfigError);
 });
 
-test("classifyAccess: models.dev subscription set vs modelparams authType", () => {
-  assert.equal(classifyAccess("models.dev", "zai-coding-plan", undefined), "subscription");
-  assert.equal(classifyAccess("models.dev", "zai", undefined), "api_key");
-  assert.equal(classifyAccess("models.dev", "new-provider", undefined), "api_key");
+test("classifyAccess: models.dev naming rule vs modelparams authType", () => {
+  // Id rule: -(coding|token|code|step)-plan, -pass, github-copilot.
+  for (const provider of [
+    "zai-coding-plan",
+    "tencent-token-plan",
+    "kimi-code-plan-cn",
+    "stepfun-step-plan",
+    "xiaomi-token-plan-sgp",
+    "cline-pass",
+    "github-copilot",
+  ]) {
+    assert.equal(classifyAccess("models.dev", provider, undefined), "subscription", provider);
+  }
+  // Name-only rule hit.
+  assert.equal(classifyAccess("models.dev", "foo", undefined, "Foo Coding Plan"), "subscription");
+  // Rule misses.
+  for (const [provider, name] of [
+    ["openai", "OpenAI"],
+    ["minimax", "MiniMax (minimax.io)"],
+    ["zai", "Z.AI"],
+    ["llmgateway", "DevPass (LLM Gateway)"],
+    ["planet-ai", "Planet AI"],
+    ["new-provider", undefined],
+  ]) {
+    assert.equal(classifyAccess("models.dev", provider, undefined, name), "api_key", provider);
+  }
+  // modelparams authType is unchanged.
   assert.equal(classifyAccess("modelparams.dev", "zai", "subscription"), "subscription");
   assert.equal(classifyAccess("modelparams.dev", "zai", "api_key"), "api_key");
   assert.equal(classifyAccess("modelparams.dev", "zai", "oauth"), undefined);
+});
+
+test("classifyAccess: models_dev_subscription add/remove corrections", () => {
+  const corrections = { add: new Set(["fresh-sub", "foo"]), remove: new Set(["zai-coding-plan"]) };
+  // add forces subscription even without a rule hit.
+  assert.equal(classifyAccess("models.dev", "fresh-sub", undefined, "Fresh Gate", corrections), "subscription");
+  // remove forces api_key even on a rule hit.
+  assert.equal(classifyAccess("models.dev", "zai-coding-plan", undefined, "Z.AI Coding Plan", corrections), "api_key");
+  // add wins over remove; matching is case-insensitive.
+  const addAndRemove = { add: new Set(["foo"]), remove: new Set(["foo"]) };
+  assert.equal(classifyAccess("models.dev", "foo", undefined, undefined, addAndRemove), "subscription");
+  // Config parsing folds ids to lowercase, so YAML is case-insensitive.
+  const caseFold = parseMetadataConfig("models_dev_subscription:\n  add: [Fresh-Sub]\n").subscriptionCorrections;
+  assert.equal(classifyAccess("models.dev", "fresh-sub", undefined, undefined, caseFold), "subscription");
+});
+
+test("parseMetadataConfig: models_dev_subscription validation", () => {
+  const parsed = parseMetadataConfig("models_dev_subscription:\n  add: [Foo-Sub]\n  remove: [old-plan]\n");
+  assert.deepEqual(parsed.subscriptionCorrections?.add, new Set(["foo-sub"]));
+  assert.deepEqual(parsed.subscriptionCorrections?.remove, new Set(["old-plan"]));
+  // Only valid at root.
+  assert.throws(() => parseMetadataConfig("models_dev_subscription: [x]\n"), MetadataConfigError);
+  assert.throws(() => parseMetadataConfig("models_dev_subscription:\n  add: [\"\"]\n"), MetadataConfigError);
+  assert.throws(() => parseMetadataConfig("models_dev_subscription:\n  add: [42]\n"), MetadataConfigError);
+  // Unknown key inside is rejected; under a channel it lands in warnings.
+  assert.throws(() => parseMetadataConfig("models_dev_subscription:\n  extra: [x]\n"), MetadataConfigError);
+  const nested = parseMetadataConfig("channels:\n  proxy:\n    models_dev_subscription:\n      add: [x]\n");
+  assert.equal(nested.subscriptionCorrections, undefined);
+  assert.ok(nested.warnings.some((w) => w.includes("models_dev_subscription")));
 });
 
 // --- 2.3-2.4 identity + ambiguity ------------------------------------------
@@ -582,6 +634,21 @@ test("resolveMetadataChain: reversed user order actually inverts access-type pri
   const subFirst = resolveModelPolicy(cfg({ sourcePriority: ["*/subscription", "*/api_key"] }), "m");
   assert.equal(resolveMetadataChain(apiFirst, "m", {}, records).fields.context_window, 64000);
   assert.equal(resolveMetadataChain(subFirst, "m", {}, records).fields.context_window, 128000);
+});
+
+test("resolveMetadataChain: naming-rule subscription providers resolve under */subscription first", () => {
+  // A newly named *-token-plan provider not in any list is subscription by
+  // rule; the default chain consults it before */api_key. remove turns it
+  // back into api_key so the api_key record wins.
+  const records: SourceRecord[] = [
+    dev("foo-token-plan", "m", "openai/m", { context_window: 999 }),
+    dev("openai", "m", "openai/m", { context_window: 128 }),
+  ];
+  const policy = resolveModelPolicy(cfg(), "m"); // default chain */subscription first
+  const subFirst = resolveMetadataChain(policy, "m", {}, records);
+  assert.equal(subFirst.fields.context_window, 999, "rule-named provider is picked by */subscription before */api_key");
+  const removed = resolveMetadataChain(policy, "m", {}, records, { remove: new Set(["foo-token-plan"]) });
+  assert.equal(removed.fields.context_window, 128, "remove drops it to */api_key where openai wins by arbitration");
 });
 
 test("resolveMetadataChain: exact token before covering wildcard keeps one adoption", () => {

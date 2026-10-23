@@ -132,11 +132,15 @@
 
 ### Requirement: 访问类型分类政策
 
-系统 SHALL 使用 modelparams.dev 的 authType 分类；未知 authType SHALL NOT 匹配 subscription/api_key 选择器。models.dev 的已登记订阅 provider SHALL 匹配 subscription，其余 provider SHALL 匹配 api_key。此分类 SHALL 仅用于元数据排序，不宣称网关实际认证方式或实测能力。未限定访问类型的精确 models.dev token SHALL 不受分类阻挡。
+系统 SHALL 使用 modelparams.dev 的 authType 分类；未知 authType SHALL NOT 匹配 subscription/api_key 选择器。models.dev provider SHALL 按命名规则（provider id 匹配 `-(coding|token|code|step)-plan`、`-pass` 结尾或 `github-copilot`，或显示名含 Coding/Token/Code/Step Plan）识别为 subscription，并 SHALL 允许根级 `models_dev_subscription.add/remove` 精确修正（add 优先于 remove，remove 优先于规则）。其余 provider SHALL 匹配 api_key。此分类 SHALL 仅用于元数据排序，不宣称网关实际认证方式或实测能力。未限定访问类型的精确 models.dev token SHALL 不受分类阻挡。
 
 #### Scenario: 新 models.dev provider 进入 API 组
 - **WHEN** models.dev 出现尚未登记的 provider `new-provider`
 - **THEN** 它匹配 `*/api_key`，不匹配 `*/subscription`
+
+#### Scenario: 命名规则识别新订阅 provider
+- **WHEN** models.dev 新增 provider `foo-token-plan`，它不在任何登记列表中
+- **THEN** 它匹配 `*/subscription`；配置 `models_dev_subscription.remove: [foo-token-plan]` 后它匹配 `*/api_key`
 
 #### Scenario: 已知订阅来源与普通来源区分
 - **WHEN** models.dev 同时有 zai-coding-plan 和 zai
