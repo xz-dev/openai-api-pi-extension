@@ -10,7 +10,11 @@
   "files": [
     "index.ts",
     "model-metadata.ts",
-    "metadata-sources.ts",
+    "metadata-config.ts",
+    "metadata-compile.ts",
+    "metadata-compile-worker.mjs",
+    "metadata-view.ts",
+    "metadata-tmpfile.ts",
     "request-compression.ts",
     "responses-websocket-fetch.ts",
     "response-checkpoints.ts",
@@ -34,7 +38,9 @@
     "test": "node --import ./tests/fixtures/request-compression-preload.mjs --test tests/*.test.ts"
   },
   "dependencies": {
+    "@opencode-ai/models": "*",
     "minimatch": "10.2.6",
+    "modelparams": "*",
     "openai": "6.40.0",
     "ws": "^8.18.0",
     "yaml": "^2.9.1"

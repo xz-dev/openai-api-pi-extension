@@ -24,227 +24,215 @@
 
 ### Requirement: 内置链与显式配置
 
-系统 SHALL 在根级 `source_priority` 未配置时采用 `["*/subscription", "*/api_key"]`，在根级明确配置列表时整体替换内置链。显式 `[]` SHALL 表示无全局外部来源，而非恢复默认。用户配置 SHALL 从 agent 目录的 `openai-api-extension.yaml` 读取；配置文件缺失等同未配置，配置错误 SHALL 被报告且禁止本次新目录发布。
+系统 SHALL 在根级 `chain` 未配置时采用内置默认链 `["models.dev/@creator/api_key", "modelparams.dev/@creator/api_key"]`，默认链 SHALL NOT 包含 subscription 来源。根级明确配置列表时 SHALL 整体替换内置链；显式 `[]` SHALL 表示无全局外部来源，而非恢复默认。用户配置 SHALL 从 agent 目录的 `openai-api-extension.yaml` 读取；配置文件缺失等同未配置。非法 YAML、重复键、已知字段的非法值及旧版字段 SHALL 作为配置错误报告，并禁止本次新目录发布、保留此前已验证目录。不属于本插件且不属于旧版字段的未知字段 SHALL 被忽略，并在一条警告中列出完整路径。
 
 #### Scenario: 无用户配置即有默认链
-- **WHEN** 没有配置文件且允许网络目录刷新
-- **THEN** 依次考虑 models.dev 订阅、modelparams.dev 订阅、models.dev API、modelparams.dev API 来源
+- **WHEN** 没有配置文件且上游目录刷新成功
+- **THEN** 每个模型依次考虑 models.dev 原厂 API 来源与 modelparams.dev 原厂 API 来源
+- **AND** 不考虑任何 subscription 来源
 
 #### Scenario: 全局显式空链退出默认富化
-- **WHEN** 根级 `source_priority: []` 且没有显式局部链
-- **THEN** 不访问外部元数据站点，仍根据上游数据及现有最终默认值发布模型
+- **WHEN** 根级 `chain: []` 且没有模型规则声明链
+- **THEN** 不读取外部元数据，仍根据上游数据及现有最终默认值发布模型
 
 #### Scenario: 无效配置不静默变为默认配置
-- **WHEN** 配置包含非法 selector 或非布尔 fill_missing_only
+- **WHEN** 配置包含非法链条目或非布尔 `fill_missing_only`
 - **THEN** 报告配置路径及原因，不切换到内置默认链，不覆盖已有目录
 
 #### Scenario: gateway 专属字段忽略并警告
-- **WHEN** 配置同时包含合法 source_priority 与 `static_models`、`cpa_base_url` 等不支持字段
-- **THEN** 警告列出被忽略字段的完整路径，合法 source_priority 照常生效，目录正常更新
+- **WHEN** 配置同时包含合法 `chain` 与 `static_models`、`cpa_base_url` 等不支持字段
+- **THEN** 警告列出被忽略字段的完整路径，合法 `chain` 照常生效，目录正常更新
 
-### Requirement: 模型规则支持完整 ID 字符串 glob
+### Requirement: 有序模型规则层叠
 
-系统 SHALL 支持根级 `models.<pattern>` 与渠道 `channels.<channel>.models.<pattern>`。根级规则 SHALL 匹配完整公开模型 ID，包含任意 provider/渠道前缀及裸名；渠道规则 SHALL 仅在所属渠道内匹配剥离一次渠道前缀后的剩余 ID。匹配 SHALL 区分大小写并覆盖整个目标字符串，`*` SHALL 匹配零个或多个任意字符（包含 `/`），其余字符 SHALL 按字面处理；连续 `*` SHALL 不产生路径专用语义。
+系统 SHALL 支持根级 `models` 为有序规则列表，每条规则以 `match` 声明匹配模式。`match` SHALL 匹配完整公开模型 ID，包含任意前缀及裸名；匹配 SHALL 区分大小写并覆盖整个目标字符串，`*` SHALL 匹配零个或多个任意字符（包含 `/`），其余字符 SHALL 按字面处理，连续 `*` SHALL 不产生路径专用语义。
 
-每个 models 块 SHALL 优先选择精确键，无精确键时 SHALL 按配置声明顺序只选择第一条匹配 glob。系统 SHALL NOT 按模式长度重新排序或叠加同块其他匹配规则。重复配置键 SHALL 报错。规则 SHALL 只选择配置，不更改公开 ID，不将 glob 作为外部模型查询身份。
+一个模型 SHALL 按列表声明顺序应用所有命中规则，逐字段叠加：同一字段由后命中的规则覆盖先命中的规则，未设置的字段 SHALL 保留先前规则或根级的值；`overrides` SHALL 按规则顺序逐层合并。系统 SHALL NOT 按模式长度或精确程度重新排序。规则 SHALL 只选择配置，不更改公开 ID，不将 `match` 模式作为外部查询身份。
 
 #### Scenario: 后缀 glob 同时覆盖裸名和多级前缀
-- **WHEN** 根级规则为 `"*gpt-6-astra"`
+- **WHEN** 规则 `match: "*gpt-6-astra"`
 - **THEN** `gpt-6-astra`、`openai/gpt-6-astra` 和 `proxy/openai/gpt-6-astra` 均命中
 - **AND** `gpt-6-astra-preview` 不命中
 
-#### Scenario: 包含 glob 按完整字符串匹配
-- **WHEN** 根级规则为 `"*gpt*"`
-- **THEN** `gpt-6-astra`、`vendor/gpt-6-luna` 和 `gpt-proxy/claude` 均命中
-- **AND** `vendor/claude` 与 `vendor/GPT-6-astra` 不命中
+#### Scenario: 后命中的规则覆盖先命中的同字段
+- **WHEN** 列表依次为 `match: "*"` 设置 `fill_missing_only: false`，`match: "proxy/*"` 设置 `fill_missing_only: true`
+- **THEN** `proxy/claude` 的 `fill_missing_only` 为 true，`other/claude` 为 false
 
-#### Scenario: 精确键不受配置位置影响
-- **WHEN** 根级块先声明 `"*gpt*"`，后声明精确键 `"openai/gpt-6-astra"`
-- **THEN** 该完整 ID 选择精确规则，不选择较早的 glob
-- **AND** 裸名 `gpt-6-astra` 不因精确键包含同名末段而匹配它
+#### Scenario: 多条命中规则逐字段叠加
+- **WHEN** `match: "proxy/*"` 设置 `overrides: {contextWindow: 200000}`，其后 `match: "proxy/claude"` 设置 `chain`
+- **THEN** `proxy/claude` 同时使用后者的 `chain` 与前者的 `contextWindow` 覆盖
 
-#### Scenario: 多个 glob 首条胜出且不叠加
-- **WHEN** 同块依次声明 `"*gpt*"` 和 `"*gpt-6-astra"`，两条都命中且没有精确键
-- **THEN** 只采用第一条规则，后者即使更具体也不参与配置合成
-
-#### Scenario: 未设置字段不从同块落选规则继承
-- **WHEN** 精确规则仅设置 fill_missing_only，而同块另一个命中的 glob 设置 source_priority
-- **THEN** source_priority 从下一作用域继承，不使用落选 glob 的链
-
-#### Scenario: 渠道模型 glob 只在所属渠道生效
-- **WHEN** 渠道 proxy 中有模型规则 `"*gpt-6-astra"`
-- **THEN** 它匹配 `proxy/vendor/gpt-6-astra` 的渠道内 ID `vendor/gpt-6-astra`
-- **AND** 不作用于 `another/gpt-6-astra` 或裸名 `gpt-6-astra`
+#### Scenario: 精确模式不因声明位置获得额外优先级
+- **WHEN** 列表先声明 `match: "proxy/claude"` 设置 `fill_missing_only: true`，后声明 `match: "*"` 设置 `fill_missing_only: false`
+- **THEN** `proxy/claude` 的 `fill_missing_only` 为 false
 
 #### Scenario: 配置匹配不放宽外部身份
-- **WHEN** 根级 `"*gpt*"` 同时匹配两个不同实际模型
-- **THEN** 每个模型仍用自己的明确查询身份获取元数据，不共享 glob 查询结果或彼此的元数据
+- **WHEN** `match: "*gpt*"` 同时匹配两个不同实际模型
+- **THEN** 每个模型仍用自己的查询身份获取元数据，不共享查询结果或彼此的元数据
 
-### Requirement: 三级来源链继承兼容
+### Requirement: 合并模式与 Pi 模型覆盖
 
-系统 SHALL 支持根级、渠道默认及模型规则的来源链，其中模型规则 SHALL 按渠道所选模型规则 > 全局所选模型规则查找显式 source_priority。首个显式模型链 SHALL 整体替换渠道及全局链，包括显式 `[]`；高层未声明时 SHALL 向下一作用域继承。两层模型规则均未声明链时，渠道非空链 SHALL 默认优先于去重追加的全局链；`global_fallback: false` SHALL 禁止追加全局链，渠道显式空链 SHALL 禁止继承全局链。
+系统 SHALL 支持布尔 `fill_missing_only`，按根级默认 < 命中模型规则（按声明顺序，后者优先）继承，未配置时默认 false。false SHALL 允许外部来源覆盖上游同字段；true SHALL 只填上游缺失或校验不通过的字段。字段别名 SHALL 在合并前统一，最终默认值 SHALL 在富化后补入。明确的空 effort 数组 SHALL NOT 被视为缺失。
 
-#### Scenario: 渠道追加且去重全局链
-- **WHEN** 全局链为 `[A, B]`，渠道链为 `[B, C]`，global_fallback 未配置
-- **THEN** 该渠道未声明模型链的模型按 `[B, C, A]` 解析
+人工 `overrides` SHALL 作用于富化与默认值补入后的最终 Pi 模型对象，使用 Pi 模型字段名（如 `contextWindow`、`maxTokens`、`thinkingLevelMap`、`compat`），并按 RFC 7396 JSON Merge Patch 语义合并：对象递归合并，数组与标量整体替换，`null` 删除该字段。多条命中规则的 `overrides` SHALL 按规则顺序依次应用。`overrides` SHALL NOT 修改 `id`、`provider`、`api`、`baseUrl`；包含这些字段 SHALL 作为配置错误。Pi `modelOverrides` SHALL 在插件 overrides 之后最终生效。
 
-#### Scenario: 渠道关闭全局兜底
-- **WHEN** 渠道设置 `global_fallback: false` 且未配置渠道链
-- **THEN** 该渠道没有显式模型链的模型不使用任何外部来源
+#### Scenario: 默认外部覆盖上游
+- **WHEN** 上游 context_window 为 500000，外部解析值为 1000000，模式未配置
+- **THEN** 发布模型 contextWindow 为 1000000
 
-#### Scenario: 模型链替换而不是追加
-- **WHEN** 全局链为 `[A]`、渠道链为 `[B]`、某模型链为 `[C]`
-- **THEN** 该模型只使用 `[C]`
-
-#### Scenario: 全局模型规则覆盖渠道默认且可被渠道模型规则覆盖
-- **WHEN** 全局默认链为 `[A]`、渠道默认链为 `[B]`、全局所选模型规则链为 `[C]`
-- **THEN** 没有显式渠道模型链时采用 `[C]`，不追加 `[A]` 或 `[B]`
-- **AND** 渠道所选模型规则显式链为 `[]` 时，最终链为空
-
-#### Scenario: 局部空链与根级空链作用域不同
-- **WHEN** 渠道显式链为 `[]` 且两层所选模型规则均未声明链
-- **THEN** 该模型不继承非空全局链
-- **AND** 若根级链为空但另一个模型规则显式配置 `[C]`，该模型仍可使用 `[C]`
-
-### Requirement: 用户可排序的来源选择器
-
-系统 SHALL 兼容 `models.dev/<provider>` 和 `modelparams.dev/<provider>/<access>` 精确 token，并支持 `*/subscription`、`*/api_key`、`<site>/<provider-pattern>/<access>` 及 `models.dev/<provider-pattern>`。site SHALL 为支持的站点或 `*`；access SHALL 为 subscription、api_key 或 `*`；provider-pattern SHALL 只允许字面值及 `*`，不提供任意 URL、正则或复杂 glob。用户列表顺序 SHALL 优先于内置站点顺序；同一选择器内 models.dev SHALL 优先于 modelparams.dev。重复且已成功采用的最终来源查询 SHALL 只保留最早位置，空匹配 SHALL 继续后续项；因歧义跳过的候选 SHALL NOT 阻止后续精确选择器再次解析。
-
-#### Scenario: 用户可反转订阅与 API 顺序
-- **WHEN** 链为 `["*/api_key", "*/subscription"]` 且同一字段有无歧义 API 值 64000 和订阅值 128000
-- **THEN** 外部解析值为 64000，不被内置订阅优先顺序再次改写
-
-#### Scenario: 用户可反转站点顺序
-- **WHEN** 链为 `["modelparams.dev/*/subscription", "models.dev/*/subscription"]` 且两站有无歧义冲突值
-- **THEN** modelparams.dev 的值优先
-
-#### Scenario: 默认订阅优先跨越站点
-- **WHEN** 默认链下 models.dev 仅有 API 值 64000，modelparams.dev 有订阅值 128000
-- **THEN** 外部解析值为 128000
-
-#### Scenario: 同选择器内站点排序且继续补字段
-- **WHEN** 两站都有无歧义订阅记录，models.dev 提供 context_window，modelparams.dev 提供不同 context_window 和额外 max_output_tokens
-- **THEN** context_window 使用 models.dev 值，max_output_tokens 使用 modelparams.dev 值
-
-#### Scenario: 精确来源与通配符重复
-- **WHEN** 先列精确 models.dev 来源，后列包含同一查询的通配符
-- **THEN** 同一来源不获得第二次排序或覆盖机会，结果不依赖目录枚举顺序
-
-### Requirement: 访问类型分类政策
-
-系统 SHALL 使用 modelparams.dev 的 authType 分类；未知 authType SHALL NOT 匹配 subscription/api_key 选择器。models.dev provider SHALL 按命名规则（provider id 匹配 `-(coding|token|code|step)-plan`、`-pass` 结尾或 `github-copilot`，或显示名含 Coding/Token/Code/Step Plan）识别为 subscription，并 SHALL 允许根级 `models_dev_subscription.add/remove` 精确修正（add 优先于 remove，remove 优先于规则）。其余 provider SHALL 匹配 api_key。此分类 SHALL 仅用于元数据排序，不宣称网关实际认证方式或实测能力。未限定访问类型的精确 models.dev token SHALL 不受分类阻挡。
-
-#### Scenario: 新 models.dev provider 进入 API 组
-- **WHEN** models.dev 出现尚未登记的 provider `new-provider`
-- **THEN** 它匹配 `*/api_key`，不匹配 `*/subscription`
-
-#### Scenario: 命名规则识别新订阅 provider
-- **WHEN** models.dev 新增 provider `foo-token-plan`，它不在任何登记列表中
-- **THEN** 它匹配 `*/subscription`；配置 `models_dev_subscription.remove: [foo-token-plan]` 后它匹配 `*/api_key`
-
-#### Scenario: 已知订阅来源与普通来源区分
-- **WHEN** models.dev 同时有 zai-coding-plan 和 zai
-- **THEN** 前者进入 subscription 组，后者进入 api_key 组
-
-#### Scenario: 精确 token 可提升尚未分类的产品
-- **WHEN** 链先列 `models.dev/new-provider`，再列 `*/subscription`
-- **THEN** new-provider 的无歧义字段仍优先，即使其默认分类是 API
-
-### Requirement: 来源选择不能伪造模型身份
-
-系统 SHALL 保持公开 ID 不变，仅剥离一次精确匹配已配置 channels 键的渠道前缀用于配置查找。系统 SHALL 支持 provider_prefix_map 与精确 lookup_ids 进行元数据查询映射，且不得通过模糊型号匹配扩展身份。匹配 SHALL 精确优先，大小写折叠仅在唯一匹配时可用。同一 selector 的同一站点组若存在多个不同 provider 候选，系统 SHALL 优先采用模型开发商自托管条目：仅当全部候选在 models.dev 中声明同一 `canonical_model_id`（`<creator>/<model>`）且 provider `<creator>` 的 ID 为 `<model>` 的记录也在当前候选中时，采用该记录。无法唯一确定时，系统 SHALL 跳过该组、报告歧义并继续下一组，不按接口返回顺序、字母排序或混合字段裁决。开发商仲裁 SHALL NOT 越过当前选择器的访问类型范围。
-
-#### Scenario: 厂商子路径不是第二个渠道前缀
-- **WHEN** 已配置渠道 proxy，上游 ID 为 `proxy/vendor/model-a`
-- **THEN** 渠道模型键为 `vendor/model-a`，公开 ID 仍为 `proxy/vendor/model-a`
-
-#### Scenario: 同名多 provider 时采用开发商自托管条目
-- **WHEN** `*/api_key` 组对裸名 `gpt-5` 命中 openai、openrouter、helicone，且三者 canonical_model_id 均为 `openai/gpt-5`
-- **THEN** 采用 openai provider 的 `gpt-5` 记录，交换返回顺序不改变结果
-
-#### Scenario: 无法定位开发商时不随机选取
-- **WHEN** models.dev 的通配符组对某裸模型名命中两个 provider，且 canonical 不一致或开发商条目不在候选中，下一站点组有一个无歧义候选
-- **THEN** 跳过 models.dev 组并采用下一组，交换 models.dev 返回顺序不改变结果
-
-#### Scenario: 开发商仲裁不越过访问类型
-- **WHEN** `*/subscription` 组只命中两个订阅 provider，开发商条目属于 api_key 组
-- **THEN** 订阅组视为歧义跳过，不在订阅组中采用开发商 api_key 条目
-
-#### Scenario: 精确 token 消除宽泛通配符歧义
-- **WHEN** 一个宽泛选择器因同名多 provider 歧义被跳过，后续链显式指定其中一个 provider 且该来源 ID 唯一
-- **THEN** 后续精确选择器仍可采用该来源，不把其他 provider 的同名记录混入
-
-### Requirement: 三级合并模式与显式人工覆盖
-
-系统 SHALL 支持布尔 `fill_missing_only`，按渠道所选模型规则 > 全局所选模型规则 > 渠道默认 > 全局默认继承，未配置默认 true。false SHALL 允许外部来源覆盖上游同字段，true SHALL 只填缺失或字段校验不通过的值。别名 SHALL 在合并前统一，最终默认值 SHALL 在富化后补入。对象 SHALL 按字段递归合并，数组 SHALL 作为完整值；null SHALL 不清除下层。明确的空 effort 数组 SHALL NOT 被视为缺失。人工覆盖 SHALL 按全局所选模型 overrides < 渠道旧式精确 overrides < 渠道所选模型 overrides 叠加；Pi modelOverrides SHALL 最终生效。模型规则 lookup_ids SHALL 按精确来源键继承并以渠道模型同键优先，其键和值 SHALL NOT 进行 glob 捕获替换。
-
-#### Scenario: 默认补漏保留上游值
-- **WHEN** 上游 context_window 为 500000，外部无歧义解析值为 1000000，模式未配置
-- **THEN** 插件元数据 contextWindow 为 500000
-- **AND** 上游未提供 max_output_tokens 时，外部的 128000 被补入 maxTokens
-
-#### Scenario: 显式 false 允许外部覆盖
-- **WHEN** 根级 fill_missing_only 为 false，上游 context_window 为 128000，外部无歧义解析值为 1000000
-- **THEN** 插件元数据 contextWindow 为 1000000
-
-#### Scenario: 渠道补漏且模型可恢复覆盖
-- **WHEN** 全局为 false、渠道为 true、一个模型显式 false，上游与外部限额冲突
-- **THEN** 该模型采用外部值，渠道内未覆盖模式的其他模型保留上游值
-
-#### Scenario: 全局模型模式高于渠道默认
-- **WHEN** 渠道默认 fill_missing_only 为 false，根级所选 `"*gpt*"` 模型规则设置 true，渠道所选模型规则未设置该字段
-- **THEN** 该模型采用补漏模式
-- **AND** 渠道所选模型规则显式设为 false 后，该模型恢复全覆盖
+#### Scenario: 显式 true 只补缺失
+- **WHEN** 命中规则设置 `fill_missing_only: true`，上游 context_window 为 128000，外部解析值为 1000000，上游未提供输出上限而外部提供 128000
+- **THEN** 发布模型 contextWindow 为 128000，maxTokens 为 128000
 
 #### Scenario: 别名不得绕过补漏
 - **WHEN** 补漏模式中上游 context_length 为 128000，外部 context_window 为 1000000
 - **THEN** 最终 contextWindow 保留 128000
 
 #### Scenario: 默认值不得掩盖真实缺失
-- **WHEN** 上游没有 context 字段，补漏模式中外部提供 64000
-- **THEN** 最终 contextWindow 为 64000，不因插件默认值提前填入而保留 128000
+- **WHEN** 上游没有 context 字段，外部提供 64000
+- **THEN** 最终 contextWindow 为 64000，而不是插件默认 128000
 
 #### Scenario: 明确禁用推理不能被补出档位
 - **WHEN** 补漏模式中上游 supported_reasoning_levels 为 `[]`，外部提供 low/high
 - **THEN** 空数组保留，不新增推理档位
 
-#### Scenario: 人工覆盖高于模式与来源
-- **WHEN** 补漏模式保留上游 128000，模型 overrides 设置 context_window 为 64000
-- **THEN** 插件发布 64000
-- **AND** Pi modelOverrides 若再设置 contextWindow 为 32000，最终用户模型为 32000
+#### Scenario: 嵌套覆盖只改指定档位
+- **WHEN** 发布前模型 thinkingLevelMap 含 high 与 xhigh，规则 `overrides: {thinkingLevelMap: {xhigh: null, max: "xhigh"}}`
+- **THEN** 发布模型 thinkingLevelMap 不含 xhigh，max 映射为 "xhigh"，high 保持不变
 
-### Requirement: 生命周期与失败隔离
+#### Scenario: 多层覆盖按顺序合并
+- **WHEN** 先命中规则设置 `overrides: {contextWindow: 200000, compat: {a: 1}}`，后命中规则设置 `overrides: {compat: {b: 2}}`
+- **THEN** 发布模型 contextWindow 为 200000，compat 同时含 a 与 b
 
-启动预取、登录成功后的目录、provider 刷新与连接信息展示 SHALL 使用一致的元数据规则。外部来源失败 SHALL 继续后续可用来源；全部外部来源失败 SHALL 保留已验证上游数据及最终默认值。上游目录失败 SHALL 保留先前持久化目录，不能用外部目录替代成员集合。取消 SHALL 中止发布；离线或不允许网络时 SHALL 不访问上游及外部站点。推理请求 SHALL 不触发元数据网络请求。元数据/配置失败 SHALL NOT 被报告为有效凭证失效。
+#### Scenario: 身份字段不可覆盖
+- **WHEN** 规则 `overrides` 包含 `baseUrl`
+- **THEN** 报告配置错误，不覆盖已有目录
 
-#### Scenario: 全部外部来源失败仍可使用上游目录
-- **WHEN** 上游目录有效而所有外部来源超时或返回无效结构
-- **THEN** 可发布上游映射结果，并报告富化降级而非认证失败
+#### Scenario: Pi modelOverrides 最终生效
+- **WHEN** 插件 overrides 设置 contextWindow 为 64000，Pi modelOverrides 设置 contextWindow 为 32000
+- **THEN** 最终用户模型为 32000
 
-#### Scenario: 离线恢复不重新查询来源
+### Requirement: 本地富化生命周期与降级
+
+登录成功后的目录、provider 刷新、连接信息展示与编译结果查看 SHALL 使用一致的元数据规则。插件加载阶段 SHALL NOT 发起网络请求或元数据编译：目录恢复由 Pi 持久化存储离线完成，交互会话的目录刷新由 Pi 在界面就绪后后台发起；命令行首次发现 SHALL 通过显式刷新（`pi --refresh --list-models`）完成。外部元数据 SHALL 只在上游目录读取成功后参与编译，推理请求 SHALL 不触发元数据加载。某一外部数据包不可加载或结构无法识别时，依赖该站点的条目 SHALL 降级跳过并报告提示，其余条目继续生效。上游目录失败 SHALL 保留先前持久化目录，不能用外部数据替代成员集合。取消 SHALL 中止发布。元数据或配置失败 SHALL NOT 被报告为凭证失效。
+
+#### Scenario: 外部数据包不可用仍可使用上游目录
+- **WHEN** 上游目录有效而 modelparams 包缺失或结构无法识别
+- **THEN** 发布结果只缺 modelparams 条目提供的字段，并报告该站点降级而非认证失败
+
+#### Scenario: 离线恢复不重新编译
 - **WHEN** 启动为离线模式且已有持久化目录
-- **THEN** 恢复目录，不发任何元数据网络请求
+- **THEN** 恢复持久化目录，不读取配置或外部数据
 
 #### Scenario: 取消不发布半成品
-- **WHEN** 上游读取完成、外部富化尚未完成时用户取消
+- **WHEN** 上游读取完成、元数据编译尚未完成时用户取消
 - **THEN** 不发布本次部分结果，不覆盖原有持久化目录
 
 #### Scenario: 连接信息区分认证与配置错误
 - **WHEN** 上游认证成功但 YAML 配置无效
 - **THEN** 登录仍可保存已验证凭证，目录不更新，连接信息明确显示元数据配置错误而非 API key 无效
 
-### Requirement: 外部来源请求保护
+### Requirement: 链条目语法与编译结果
 
-外部富化 SHALL 只读取固定公开批量目录，不向来源发送上游凭证、对话或用户模型清单。每次刷新 SHALL 在模型间共享来源读取，不按模型逐次请求；关闭全部有效链时 SHALL 不请求外部站点。外部响应 SHALL 有大小上限、超时和取消保护，且 SHALL 拒绝跨源重定向。
+系统 SHALL 接受链条目形如 `<site>/<provider>/<access>[/<model_id>]` 或整条关键词 `@default`。`site` SHALL 为 `models.dev` 或 `modelparams.dev`；`provider` SHALL 为字面 provider ID 或 `@creator`；`access` SHALL 为 `subscription` 或 `api_key`；省略第 4 段 SHALL 等同 `@id`，写出时 SHALL 作为字面查询 ID，可包含 `/`，解析时只按前三个 `/` 切分。任何段 SHALL NOT 接受 `*` 或其他通配符；非法条目 SHALL 作为配置错误。`@default` SHALL 在其位置插入根级生效链。模型规则声明的 `chain` SHALL 替换该模型此前生效的链。
 
-#### Scenario: 外部站点收不到网关凭证
-- **WHEN** 上游请求使用 Authorization 和自定义认证 headers
-- **THEN** models.dev/modelparams.dev 请求不含这些 headers、Cookie 或凭证参数
+系统 SHALL 在每次富化时，基于配置与本次加载的外部数据，为每个模型编译一份只含具体条目的有序链：每个条目 SHALL 为 `<site>/<provider>/<access>/<model_id>` 形式，不含关键词或通配符。相同配置与相同外部数据版本 SHALL 产生相同编译结果。执行时 SHALL 只对编译条目做精确查表；每个字段 SHALL 采用链中第一个提供有效值的条目。models.dev 条目的 `access` SHALL 视为用户声明标签，不按 provider 名称推断；modelparams.dev 条目 SHALL 只命中 `authType` 等于该 `access` 的记录。
 
-#### Scenario: 多模型刷新仍使用批量读取
-- **WHEN** 多个模型的有效链依赖同一个来源端点
-- **THEN** 本次刷新只读取该端点一次，不为每个模型重复读取
+#### Scenario: 聚合 provider 变体不影响原厂条目
+- **WHEN** 公开 ID 为 `gw/claude-fable-5-1`，models.dev 原厂 anthropic 有该模型，另有聚合 provider 含多个带命名空间的同名变体
+- **THEN** 编译链含 `models.dev/anthropic/api_key/claude-fable-5-1`，模型获得 anthropic 记录的限额
+- **AND** 聚合 provider 的记录不参与该模型解析
 
-#### Scenario: 超大或越界来源响应按来源失败处理
-- **WHEN** 外部响应超过 16 MiB、请求超过 5 秒或要求跨源重定向
-- **THEN** 停止该来源读取并继续允许的回退，不无限占用刷新资源
+#### Scenario: 通配符条目被拒绝
+- **WHEN** 链包含 `"*/api_key"` 或 `"models.dev/*/api_key"`
+- **THEN** 报告配置错误并指出条目路径
+
+#### Scenario: 字面第 4 段指定查询 ID
+- **WHEN** 规则 `match: "claude"` 设置 `chain: ["models.dev/anthropic/api_key/claude-sonnet-4-5"]`
+- **THEN** 模型 `claude` 的编译链为该具体条目，公开 ID 仍为 `claude`
+
+#### Scenario: @default 原地插入根链
+- **WHEN** 根链为 `[A, B]`，命中规则 `chain: ["models.dev/zai-coding-plan/subscription", "@default"]`
+- **THEN** 该模型按订阅条目、A、B 的顺序编译
+
+#### Scenario: 字段按条目顺序首个有效值
+- **WHEN** 第一条目提供 context_window，第二条目提供不同 context_window 与 supported_reasoning_levels
+- **THEN** context_window 采用第一条目，supported_reasoning_levels 采用第二条目
+
+### Requirement: 原厂判定与厂商别名组
+
+`@creator` SHALL 按以下规则解析：以 `@id` 的查询候选在 models.dev 全部 provider 记录中查找声明了 `canonical_model_id` 的匹配记录，取其 `<creator>/` 前缀作为原厂；属于同一内置厂商别名组的原厂 SHALL 视为同一原厂。系统 SHALL 内置有序厂商别名组，初始包含 `[zhipuai, zai, z-ai]`、`[moonshotai, moonshot]`、`[thinkingmachines, thinking-machines]`；转售或托管平台 SHALL NOT 与原厂列入同组。原厂解析成功时，`@creator` SHALL 在每个站点按组内顺序展开为该站点命名空间中实际存在的成员；不属于任何组的原厂 SHALL 只展开为自身。
+
+找不到任何原厂时，含 `@creator` 的条目 SHALL 标记为 unresolved 并跳过，模型继续使用其余条目及上游值。匹配到多个不同原厂且模型生效链实际包含 `@creator` 条目时，系统 SHALL 报告配置错误，指出模型 ID 与冲突原厂，并禁止本次目录发布；生效链不含 `@creator` 的模型 SHALL NOT 因此报错。
+
+#### Scenario: 别名组展开到各站点存在的成员
+- **WHEN** `glm-5.1` 的 canonical 原厂为 zhipuai，models.dev 存在 provider zhipuai 与 zai，modelparams.dev 存在 provider z-ai
+- **THEN** 默认链编译为 `models.dev/zhipuai/api_key/glm-5.1`、`models.dev/zai/api_key/glm-5.1`、`modelparams.dev/z-ai/api_key/glm-5.1`（各条目仅在该表含此模型时保留）
+
+#### Scenario: 同组原厂不算冲突
+- **WHEN** 同一查询 ID 的 canonical 原厂分别为 zhipuai 与 zai
+- **THEN** 原厂解析成功，不报告冲突
+
+#### Scenario: 找不到原厂时跳过
+- **WHEN** 查询 ID 在 models.dev 没有任何带 canonical 的记录
+- **THEN** `@creator` 条目标记 unresolved 并跳过，目录正常发布
+
+#### Scenario: 原厂冲突阻止发布
+- **WHEN** 查询 ID 的 canonical 原厂为不同组的 vendor-a 与 vendor-b，且该模型生效链含 `@creator`
+- **THEN** 报告配置错误，列出模型 ID 与两个原厂，保留此前已验证目录
+
+#### Scenario: 显式 provider 可消除冲突
+- **WHEN** 上一场景中用户为该模型添加 `chain: ["models.dev/vendor-a/api_key"]`
+- **THEN** 不再报错，模型按该具体条目解析
+
+### Requirement: 查询 ID 归一化
+
+`@id` SHALL 取公开模型 ID 最后一个 `/` 之后的部分作为基准查询 ID，并按内置固定顺序生成归一化候选（至少包含：原样、大小写折叠、`.` 与 `-` 互换、去除日期后缀）。每个候选 SHALL 只与来源记录的模型 ID 精确比较；在同一具体来源表中 SHALL 采用最先命中的候选。归一化规则 SHALL NOT 由用户配置。
+
+#### Scenario: 点号写法命中横线记录
+- **WHEN** 公开 ID 为 `proxy/claude-sonnet-4.5`，anthropic 表只有 `claude-sonnet-4-5`
+- **THEN** 编译条目为 `models.dev/anthropic/api_key/claude-sonnet-4-5`
+
+#### Scenario: 原样命中优先于归一化
+- **WHEN** 来源表同时有 `Model-X` 与 `model-x`，公开 ID 末段为 `Model-X`
+- **THEN** 编译条目使用 `Model-X`
+
+#### Scenario: 无法命中的别名回退上游
+- **WHEN** 公开 ID 为网关自定义别名 `claude`，任何来源表都没有可命中的候选，且无规则指定字面查询 ID
+- **THEN** 该模型不获得外部字段，使用上游值及默认值发布
+
+### Requirement: 旧版配置字段报错
+
+系统 SHALL 将 `source_priority`、`provider_prefix_map`、`lookup_ids`、`models_dev_subscription`、`channels`、`global_fallback` 以及 mapping 形式的 `models` 视为旧版字段。出现任一旧版字段时，系统 SHALL 报告配置错误，指出字段完整路径并给出对应的新写法提示，且 SHALL 禁止本次目录发布。
+
+#### Scenario: 旧链字段给出迁移提示
+- **WHEN** 配置根级包含 `source_priority: ["*/api_key"]`
+- **THEN** 报告配置错误，提示改用 `chain` 与具体条目，保留此前已验证目录
+
+#### Scenario: 旧 mapping 形式模型规则报错
+- **WHEN** 配置 `models` 为 `{"*gpt*": {...}}` 形式
+- **THEN** 报告配置错误，提示改为 `- match: "*gpt*"` 列表形式
+
+### Requirement: 本地元数据包与内存释放
+
+系统 SHALL 从已安装的 `@opencode-ai/models` 快照与 `modelparams` 包读取 models.dev 与 modelparams.dev 数据，SHALL NOT 为元数据发起网络请求。插件 SHALL NOT 对这两个包设置版本上限。编译完成后，系统 SHALL 释放完整外部数据，只保留编译结果与发布给 Pi 的模型表。编译结果 SHALL 记录两个数据包的版本与 models.dev 快照生成时间。
+
+#### Scenario: 富化不联网
+- **WHEN** 上游目录刷新成功并执行默认链编译
+- **THEN** 除上游 `/models` 请求外，不产生 models.dev 或 modelparams.dev 网络请求
+
+#### Scenario: 编译后不常驻完整数据
+- **WHEN** 一次富化完成
+- **THEN** 插件进程不再持有完整 models.dev 快照或 modelparams 目录数据
+
+#### Scenario: 编译结果标明数据版本
+- **WHEN** 查看编译结果
+- **THEN** 结果包含两个数据包的版本号与 models.dev 快照生成时间
+
+### Requirement: 元数据提示不作为错误显示
+
+富化过程产生的非错误提示（被忽略字段、站点降级、unresolved 条目汇总）SHALL 以普通提示形式呈现，SHALL NOT 使用错误样式的会话条目。配置错误与上游目录失败 SHALL 仍按错误呈现。
+
+#### Scenario: 降级提示非错误样式
+- **WHEN** 某站点数据包不可用导致降级
+- **THEN** 用户看到普通提示，而不是红色错误条目

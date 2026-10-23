@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, test } from "node:test";
+
 import {
   createAgentSessionServices,
   discoverAndLoadExtensions,
@@ -16,6 +17,8 @@ import {
 } from "@earendil-works/pi-coding-agent";
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+
+
 const extensionPath = join(projectRoot, "index.ts");
 const tempDirs: string[] = [];
 const servers: Server[] = [];
@@ -234,12 +237,12 @@ test("real Pi runtime lets process environment override stored fields independen
   }
 });
 
-test("async factory publishes environment catalog before startup", async () => {
+test("async factory performs no network fetch even with env credentials", async () => {
   savedEnv = Object.fromEntries(ENV_KEYS.map((key) => [key, process.env[key]]));
   delete process.env.PI_OFFLINE;
-  const server = createServer((request, response) => {
-    assert.equal(request.url, `/v1/models?client_version=${VERSION}`);
-    assert.equal(request.headers.authorization, "Bearer loader-key");
+  let requests = 0;
+  const server = createServer((_request, response) => {
+    requests++;
     response.writeHead(200, { "content-type": "application/json" });
     response.end(JSON.stringify({ models: [{ slug: "loader-model", context_window: 64000, max_tokens: 8192 }] }));
   });
@@ -257,69 +260,35 @@ test("async factory publishes environment catalog before startup", async () => {
   const provider = result.runtime.pendingNativeProviderRegistrations.find(
     ({ provider }) => provider.id === "openai-api-extension",
   )?.provider;
-  assert.equal(provider?.getModels()[0]?.id, "loader-model");
+  // Startup must not block on the gateway: no fetch, empty initial catalog.
+  assert.equal(requests, 0);
+  assert.deepEqual(provider?.getModels(), []);
 });
 
-test("async factory bounds discovery and degrades on failure", async () => {
+test("async factory starts no metadata worker and loads instantly", async () => {
   savedEnv = Object.fromEntries(ENV_KEYS.map((key) => [key, process.env[key]]));
   delete process.env.PI_OFFLINE;
   process.env.OPENAI_API_EXTENSION_BASE_URL = "https://gateway.example/private/v1";
   process.env.OPENAI_API_EXTENSION_API_KEY = "loader-key";
   const originalFetch = globalThis.fetch;
-  const originalTimeout = AbortSignal.timeout;
-  const originalWarn = console.warn;
-  let timeoutMs: number | undefined;
-  const signal = new AbortController().signal;
-  globalThis.fetch = async () => { throw new Error("simulated outage"); };
-  Object.defineProperty(AbortSignal, "timeout", {
-    configurable: true,
-    value: (ms: number) => {
-      timeoutMs = ms;
-      return signal;
-    },
-  });
-  console.warn = () => {};
+  let fetched = false;
+  globalThis.fetch = async () => { fetched = true; throw new Error("simulated outage"); };
   try {
     const agentDir = await mkdtemp(join(tmpdir(), "openai-api-extension-loader-"));
     tempDirs.push(agentDir);
+    const started = performance.now();
     const result = await discoverAndLoadExtensions([extensionPath], projectRoot, agentDir);
+    // A hanging prefetch would show up here; loader-only work is well under a second.
+    assert.ok(performance.now() - started < 5_000, "load must not await the gateway");
     assert.equal(result.errors.length, 0, JSON.stringify(result.errors));
     const provider = result.runtime.pendingNativeProviderRegistrations.find(
       ({ provider }) => provider.id === "openai-api-extension",
     )?.provider;
-    assert.equal(timeoutMs, 15_000);
+    assert.equal(fetched, false);
     assert.deepEqual(provider?.getModels(), []);
   } finally {
     globalThis.fetch = originalFetch;
-    Object.defineProperty(AbortSignal, "timeout", { configurable: true, value: originalTimeout });
-    console.warn = originalWarn;
   }
-});
-
-test("async factory does not fetch in offline mode", async () => {
-  savedEnv = Object.fromEntries(ENV_KEYS.map((key) => [key, process.env[key]]));
-  let requests = 0;
-  const server = createServer((_request, response) => {
-    requests++;
-    response.writeHead(500).end();
-  });
-  servers.push(server);
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-  const address = server.address();
-  assert.ok(address && typeof address === "object");
-  process.env.OPENAI_API_EXTENSION_BASE_URL = `http://127.0.0.1:${address.port}/v1`;
-  process.env.OPENAI_API_EXTENSION_API_KEY = "loader-key";
-  process.env.PI_OFFLINE = "1";
-
-  const agentDir = await mkdtemp(join(tmpdir(), "openai-api-extension-loader-"));
-  tempDirs.push(agentDir);
-  const result = await discoverAndLoadExtensions([extensionPath], projectRoot, agentDir);
-  assert.equal(result.errors.length, 0, JSON.stringify(result.errors));
-  const provider = result.runtime.pendingNativeProviderRegistrations.find(
-    ({ provider }) => provider.id === "openai-api-extension",
-  )?.provider;
-  assert.deepEqual(provider?.getModels(), []);
-  assert.equal(requests, 0);
 });
 
 test("provider-info separates metadata config errors from auth failures", async () => {
@@ -340,7 +309,7 @@ test("provider-info separates metadata config errors from auth failures", async 
   const agentDir = await mkdtemp(join(tmpdir(), "openai-api-extension-cfg-"));
   tempDirs.push(agentDir);
   process.env.PI_CODING_AGENT_DIR = agentDir;
-  await writeFile(join(agentDir, "openai-api-extension.yaml"), "source_priority: not-a-list\n");
+  await writeFile(join(agentDir, "openai-api-extension.yaml"), "chain: not-a-list\n");
 
   const result = await discoverAndLoadExtensions([extensionPath], projectRoot, agentDir);
   assert.equal(result.errors.length, 0, JSON.stringify(result.errors));
@@ -409,7 +378,7 @@ test("models.json modelOverrides still apply last over enriched catalog", async 
   tempDirs.push(agentDir);
   process.env.PI_CODING_AGENT_DIR = agentDir;
   await writeFile(join(agentDir, "openai-api-extension.yaml"),
-    "source_priority: []\nmodels:\n  override-model:\n    overrides:\n      context_window: 111000\n");
+    "chain: []\nmodels:\n  - match: override-model\n    overrides:\n      contextWindow: 111000\n");
   await writeFile(join(agentDir, "models.json"), JSON.stringify({
     providers: {
       "openai-api-extension": { modelOverrides: { "override-model": { contextWindow: 32000 } } },
@@ -423,12 +392,19 @@ test("models.json modelOverrides still apply last over enriched catalog", async 
     ({ provider }) => provider.id === "openai-api-extension",
   );
   assert.ok(registration);
+  // No startup prefetch: the provider is empty until an explicit refresh.
+  assert.deepEqual(registration.provider.getModels(), []);
+  runtime.registerNativeProvider(registration.provider);
+  // Finish registration's offline convergence before starting the network phase.
+  await runtime.refresh({ allowNetwork: false, providers: ["openai-api-extension"] });
+  const refresh = await runtime.refresh({ allowNetwork: true, providers: ["openai-api-extension"] });
+  assert.equal(refresh.aborted, false, "network refresh must finish before checking override order");
+  assert.deepEqual([...refresh.errors.keys()], [], JSON.stringify([...refresh.errors]));
   assert.equal(
     registration.provider.getModels().find((model) => model.id === "override-model")?.contextWindow,
     111_000,
     "extension config overrides apply before models.json",
   );
-  runtime.registerNativeProvider(registration.provider);
   const model = runtime.getModel("openai-api-extension", "override-model");
   assert.equal(model?.contextWindow, 32000, "models.json modelOverrides win over extension enrichment");
 });

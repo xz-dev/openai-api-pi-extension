@@ -7,7 +7,12 @@
  */
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { getAgentDir, type ExtensionAPI, SettingsManager, VERSION } from "@earendil-works/pi-coding-agent";
+import {
+  getAgentDir,
+  type ExtensionAPI,
+  SettingsManager,
+  VERSION,
+} from "@earendil-works/pi-coding-agent";
 import * as piAI from "@earendil-works/pi-ai";
 import {
   type ApiKeyAuth,
@@ -23,12 +28,16 @@ import {
 import { openAIResponsesApi } from "@earendil-works/pi-ai/compat";
 import { adoptResponseAncestry, checkpointCandidate, checkpointsEnabled, encodeCheckpointOutput, responseAncestry, type CheckpointOptions,
   type ResponseAncestryState } from "./checkpoint-adapter.ts";
+import { compileCatalogInWorker } from "./metadata-compile.ts";
 import {
-  createMetadataResolver,
-  fetchMetadataSources,
-  neededSites,
-} from "./metadata-sources.ts";
-import { MetadataConfigError, parseMetadataConfig } from "./model-metadata.ts";
+  makeResolver,
+  mergePatch,
+  MetadataConfigError,
+  type CompiledCatalog,
+} from "./model-metadata.ts";
+import { parseMetadataConfig } from "./metadata-config.ts";
+import { renderCompiledCatalog, sanitizeTerminalText } from "./metadata-view.ts";
+import { writeMetadataTempFile } from "./metadata-tmpfile.ts";
 import {
   createResponsesWebSocketBridge,
   getActualResponsesTransport,
@@ -76,6 +85,7 @@ const ENV_BASE_URL = "OPENAI_API_EXTENSION_BASE_URL";
 const ENV_API_KEY = "OPENAI_API_EXTENSION_API_KEY";
 const DEFAULT_BASE_URL = "https://api.openai.com/v1";
 const ERROR_ENTRY = "openai-api-extension.error";
+const NOTE_ENTRY = "openai-api-extension.note";
 const CONNECTION_TIMEOUT_MS = 15_000;
 /** Ported omniroute fallback: gateways may omit limits; never reject the catalog for it. */
 const DEFAULT_CONTEXT_WINDOW = 128_000;
@@ -329,22 +339,21 @@ export type CatalogEnrichment = {
 };
 
 /**
- * The single enriched-catalog path shared by startup prefetch, login
- * validation, refreshModels, and /provider-info. Reads the YAML config once
- * per call, fetches only the sites the resolved chains need (shared per
- * refresh), then maps the upstream catalog.
+ * The single enriched-catalog path shared by login validation,
+ * refreshModels, /provider-info, and /provider-metadata. Reads
+ * the YAML config once per call, compiles config+data inside the Worker, then
+ * maps the upstream catalog against the compiled entries.
  * - Missing config file = empty config (built-in default chain applies).
- * - MetadataConfigError (invalid known values / bad YAML) propagates: callers
- *   keep the previous catalog and must not surface it as an auth failure.
- * - Failed sources degrade to upstream-mapped models with a note.
- * - Caller-abort propagates; a source phase that outlives the caller's
- *   deadline degrades to upstream-only so a slow metadata host never drops
- *   an already-valid gateway catalog.
+ * - MetadataConfigError propagates: callers keep the previous catalog and
+ *   must not surface it as an auth failure.
+ * - Unloadable data packages degrade only their own site's entries.
+ * - Caller-abort propagates; an aborted compile never publishes.
  */
 export async function enrichCatalog(
   entries: readonly unknown[],
   baseUrl: string,
   signal: AbortSignal | undefined,
+  deps?: Parameters<typeof compileCatalogInWorker>[2],
 ): Promise<CatalogEnrichment> {
   let text: string | undefined;
   try {
@@ -355,48 +364,92 @@ export async function enrichCatalog(
     }
   }
   const config = parseMetadataConfig(text);
-  // One aggregated warning per refresh listing every ignored field path.
-  const notes = config.warnings.length > 0
-    ? [`ignored unsupported fields: ${config.warnings.join(", ")}`]
-    : [];
-  const publicIds = entries.flatMap((entry) => {
-    const id =
-      typeof entry === "object" && entry !== null && !Array.isArray(entry)
-        ? entryIdentity(entry as UpstreamModel)?.id
-        : undefined;
-    return id ? [id] : [];
-  });
-  const needed = neededSites(config, publicIds);
-  let records: Awaited<ReturnType<typeof fetchMetadataSources>>["records"] = [];
-  if (needed.size > 0 && !signal?.aborted) {
-    try {
-      const result = await fetchMetadataSources(needed, signal);
-      records = result.records;
-      for (const site of result.failed) notes.push(`metadata source ${site} unavailable; using upstream values`);
-      for (const site of result.malformed) {
-        if (!result.failed.has(site)) notes.push(`metadata source ${site} returned no usable records; using upstream values`);
-      }
-    } catch (error) {
-      if (!signal?.aborted) throw error;
-      // The shared deadline fired inside the source phase: degrade instead of
-      // dropping a verified gateway catalog.
-      notes.push("metadata sources timed out; using upstream values");
+  // Validate identity and filter non-chat entries first so an embedding
+  // model's conflicting creator can't block chat-model compilation.
+  const chatEntries: { entry: unknown; id: string }[] = [];
+  for (const entry of entries) {
+    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+      throw new Error("Model discovery returned an invalid catalog entry");
     }
+    const row = entry as UpstreamModel;
+    const identity = entryIdentity(row);
+    if (!identity) throw new Error("Model discovery returned an invalid catalog entry");
+    if (!isConversationalTextModel(row)) continue;
+    chatEntries.push({ entry, id: identity.id });
   }
-  const resolver = createMetadataResolver(config, records);
-  const models = mapCatalog(entries, baseUrl, resolver.resolve);
-  for (const diagnostic of resolver.diagnostics) {
-    notes.push(`metadata ambiguity: ${diagnostic.detail} (selector ${diagnostic.token}); source skipped`);
+  const publicIds = chatEntries.map((item) => item.id);
+  signal?.throwIfAborted();
+  const compiled = (await compileCatalogInWorker(config, publicIds, deps, signal)).catalog;
+  return mapCompiledCatalog(entries, baseUrl, compiled);
+}
+
+/**
+ * Maps upstream entries against a compiled catalog: metadata merge, mapModel,
+ * then RFC 7396 overrides on the final Pi model.
+ */
+export function mapCompiledCatalog(
+  entries: readonly unknown[],
+  baseUrl: string,
+  compiled: CompiledCatalog,
+): CatalogEnrichment {
+  const resolver = makeResolver(compiled);
+  const models = entries
+    .flatMap((entry) => {
+      if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+        throw new Error("Model discovery returned an invalid catalog entry");
+      }
+      const row = entry as UpstreamModel;
+      const identity = entryIdentity(row);
+      if (!identity) throw new Error("Model discovery returned an invalid catalog entry");
+      if (!isConversationalTextModel(row)) return [];
+      const enriched = resolver.resolve(identity.id, row as Readonly<Record<string, unknown>>);
+      const model = mapModel(entry, baseUrl, enriched);
+      if (!model) throw new Error("Model discovery returned an invalid catalog entry");
+      for (const patch of resolver.overridePatches(identity.id)) {
+        mergePatch(model as unknown as Record<string, unknown>, patch);
+      }
+      return [model];
+    })
+    .sort((left, right) => left.id.localeCompare(right.id));
+  if (models.length === 0) throw new Error("Model discovery returned no usable models");
+  const notes = compiled.warnings.length > 0
+    ? [`ignored unsupported fields: ${compiled.warnings.join(", ")}`]
+    : [];
+  for (const item of compiled.degraded) {
+    notes.push(`metadata source ${item.site} unavailable (${item.reason}); using upstream values`);
+  }
+  const unresolvedModels = compiled.models.filter((model) => model.unresolved.length > 0);
+  if (unresolvedModels.length > 0) {
+    notes.push(
+      `metadata chain entries unresolved for ${unresolvedModels.length} model(s): ` +
+        unresolvedModels.slice(0, 5).map((model) => model.publicId).join(", ") +
+        (unresolvedModels.length > 5 ? ` and ${unresolvedModels.length - 5} more` : ""),
+    );
   }
   return { models, notes };
+}
+
+/**
+ * Per-report note filter: a note identical to one in the immediately previous
+ * report is suppressed; a note that dropped out of a report may reappear.
+ * Returned function is stateful across reports.
+ */
+export function makeConsecutiveNoteDedupe(): (notes: readonly string[]) => string[] {
+  let previous: ReadonlySet<string> = new Set();
+  return (notes) => {
+    const fresh = notes.filter((note) => !previous.has(note));
+    previous = new Set(notes);
+    return fresh;
+  };
 }
 
 export async function fetchEnrichedCatalog(
   baseUrl: string,
   apiKey: string,
   signal: AbortSignal | undefined,
+  deps?: Parameters<typeof compileCatalogInWorker>[2],
 ): Promise<CatalogEnrichment> {
-  return enrichCatalog(await fetchCatalog(baseUrl, apiKey, signal), baseUrl, signal);
+  return enrichCatalog(await fetchCatalog(baseUrl, apiKey, signal), baseUrl, signal, deps);
 }
 
 function credentialBaseUrl(credential: ApiKeyCredential | undefined): string | undefined {
@@ -427,6 +480,7 @@ async function resolveConnection(
 
 function apiKeyAuth(
   onValidated: (baseUrl: string, apiKey: string, models: readonly GatewayModel[]) => void,
+  deps?: Parameters<typeof compileCatalogInWorker>[2],
 ): ApiKeyAuth {
   return {
     name: `${PROVIDER_NAME} connection`,
@@ -449,7 +503,7 @@ function apiKeyAuth(
       interaction.notify({ type: "progress", message: "Validating connection..." });
       const entries = await fetchCatalog(baseUrl, apiKey, interaction.signal);
       try {
-        const { models, notes } = await enrichCatalog(entries, baseUrl, interaction.signal);
+        const { models, notes } = await enrichCatalog(entries, baseUrl, interaction.signal, deps);
         // A cancelled login must not publish the catalogue it fetched.
         interaction.signal.throwIfAborted();
         onValidated(baseUrl, apiKey, models);
@@ -489,6 +543,10 @@ export function createOpenAIApiProvider(
   onCatalogError?: (message: string) => void,
   getRawCheckpointExclude: () => unknown = () => undefined,
   getRawCheckpointMode: () => unknown = () => undefined,
+  /** Called once per report with that report's notes so the caller can
+   *  suppress only repeats of the immediately previous report. */
+  onCatalogNotes?: (notes: readonly string[]) => void,
+  metadataDeps?: Parameters<typeof compileCatalogInWorker>[2],
 ): Provider<"openai-responses"> {
   let models = initialModels;
   let initialModelsPublished = false;
@@ -524,7 +582,7 @@ export function createOpenAIApiProvider(
     auth: {
       apiKey: apiKeyAuth((baseUrl, apiKey, validatedModels) => {
         validatedLogin = { baseUrl, apiKey, models: validatedModels, checkedAt: Date.now() };
-      }),
+      }, metadataDeps),
     },
     getModels: () => models,
     refreshModels: async (context: RefreshModelsContext) => {
@@ -562,14 +620,12 @@ export function createOpenAIApiProvider(
       const apiKey = context.credential.key;
       if (!baseUrl || !apiKey) return;
       try {
-        const { models: refreshed, notes } = await fetchEnrichedCatalog(baseUrl, apiKey, context.signal);
+        const { models: refreshed, notes } = await fetchEnrichedCatalog(baseUrl, apiKey, context.signal, metadataDeps);
         if (context.signal.aborted) return;
-        for (const note of notes) {
-          try {
-            onCatalogError?.(`metadata note: ${note}`);
-          } catch {
-            /* reporter must not mask the refresh */
-          }
+        try {
+          onCatalogNotes?.(notes);
+        } catch {
+          /* reporter must not mask the refresh */
         }
         await context.publish({
           persist: { models: refreshed, checkedAt: Date.now() },
@@ -626,27 +682,47 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     const messages = adoptResponseAncestry(event.messages, ctx.sessionManager);
     return messages ? { messages } : undefined;
   });
-  pi.registerEntryRenderer(ERROR_ENTRY, (entry, _options, theme) => {
-    const message =
-      typeof (entry.data as { message?: unknown } | undefined)?.message === "string"
-        ? (entry.data as { message: string }).message
-        : "catalog refresh failed";
-    return {
-      render(width: number) {
-        const text = `[openai-api-extension] ${message}`;
-        const size = Math.max(width, 1);
-        const lines: string[] = [];
-        for (let i = 0; i < text.length; i += size) lines.push(theme.fg("error", text.slice(i, i + size)));
-        return lines;
-      },
-      invalidate() {},
+  const renderEntry = (style: (text: string) => string) =>
+    (entry: { data?: unknown }, _options: unknown, _theme: unknown) => {
+      const message =
+        typeof (entry.data as { message?: unknown } | undefined)?.message === "string"
+          ? (entry.data as { message: string }).message
+          : "catalog refresh failed";
+      return {
+        render(width: number) {
+          const text = `[openai-api-extension] ${message}`;
+          const size = Math.max(width, 1);
+          const lines: string[] = [];
+          for (let i = 0; i < text.length; i += size) lines.push(style(text.slice(i, i + size)));
+          return lines;
+        },
+        invalidate() {},
+      };
     };
-  });
+  pi.registerEntryRenderer(ERROR_ENTRY, (entry, _options, theme) =>
+    renderEntry((text) => theme.fg("error", text))(entry, _options, theme),
+  );
+  pi.registerEntryRenderer(NOTE_ENTRY, (entry, _options, theme) =>
+    renderEntry((text) => theme.fg("dim", text))(entry, _options, theme),
+  );
   const reportCatalogError = (message: string) => {
     try {
       pi.appendEntry(ERROR_ENTRY, { message });
     } catch {
       console.warn(`[openai-api-extension] ${message}`);
+    }
+  };
+  // Suppress only notes identical to the immediately previous report — login
+  // validation, refreshes and the metadata commands can compile the same
+  // catalog back to back. When a note drops out of a report it may resurface.
+  const noteDedupe = makeConsecutiveNoteDedupe();
+  const reportCatalogNotes = (notes: readonly string[]) => {
+    for (const note of noteDedupe(notes)) {
+      try {
+        pi.appendEntry(NOTE_ENTRY, { message: `metadata note: ${note}` });
+      } catch {
+        console.warn(`[openai-api-extension] metadata note: ${note}`);
+      }
     }
   };
   const getTransport = (ctx: { cwd: string; isProjectTrusted(): boolean }) => {
@@ -707,22 +783,52 @@ export default async function (pi: ExtensionAPI): Promise<void> {
       }
     },
   });
-  const baseUrl = normalizeBaseUrl(process.env[ENV_BASE_URL]);
-  const apiKey = process.env[ENV_API_KEY]?.trim();
-  let models: readonly GatewayModel[] = [];
-  if (!process.env.PI_OFFLINE && baseUrl && apiKey) {
-    try {
-      const enriched = await fetchEnrichedCatalog(baseUrl, apiKey, AbortSignal.timeout(CONNECTION_TIMEOUT_MS));
-      models = enriched.models;
-      for (const note of enriched.notes) console.warn(`[openai-api-extension] ${note}`);
-    } catch (error) {
-      const label = error instanceof MetadataConfigError ? "metadata config" : "model discovery";
-      console.warn(`[openai-api-extension] ${label} failed: ${errorMessage(error)}`);
-    }
-  }
+  // No startup catalog prefetch: Pi restores the persisted catalog offline
+  // after registration and refreshes it in the background once the UI is up.
+  // Without a CLI cache, discovery needs pi --refresh --list-models;
+  // interactive mode discovers models through Pi's own background refresh.
+  pi.registerCommand("provider-metadata", {
+    description: "Show the compiled model-metadata chain for every model",
+    handler: async (_args, ctx) => {
+      const auth = await ctx.modelRegistry.getProviderAuth(PROVIDER);
+      const baseUrl = normalizeBaseUrl(auth?.auth.baseUrl);
+      const apiKey = auth?.auth.apiKey?.trim();
+      if (!baseUrl || !apiKey) {
+        ctx.ui.notify("OpenAI API Extension: not configured", "warning");
+        return;
+      }
+      let text: string;
+      let failed = false;
+      try {
+        const entries = await fetchCatalog(baseUrl, apiKey, AbortSignal.timeout(CONNECTION_TIMEOUT_MS));
+        let yaml: string | undefined;
+        try {
+          yaml = await readFile(join(getAgentDir(), METADATA_CONFIG_FILE), "utf8");
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        }
+        const config = parseMetadataConfig(yaml);
+        const publicIds = entries.flatMap((entry) => {
+          if (typeof entry !== "object" || entry === null || Array.isArray(entry)) return [];
+          const row = entry as UpstreamModel;
+          const id = entryIdentity(row)?.id;
+          return id && isConversationalTextModel(row) ? [id] : [];
+        });
+        const compiled = (await compileCatalogInWorker(config, publicIds)).catalog;
+        text = renderCompiledCatalog(compiled);
+      } catch (error) {
+        failed = true;
+        // A config error still produces a diagnostics file the user can page.
+        const reason = errorMessage(error).split(apiKey).join("[REDACTED]");
+        text = `provider-metadata: ${sanitizeTerminalText(reason)}\n`;
+      }
+      const file = writeMetadataTempFile(text);
+      ctx.ui.notify(file, failed ? "warning" : "info");
+    },
+  });
   let settingsContext: { cwd: string; isProjectTrusted(): boolean } | undefined;
   pi.on("session_start", async (_event, ctx) => { settingsContext = ctx; });
-  pi.registerProvider(createOpenAIApiProvider(models, reportCatalogError, () => {
+  pi.registerProvider(createOpenAIApiProvider([], reportCatalogError, () => {
     try {
       const settings = SettingsManager.create(settingsContext?.cwd ?? process.cwd(), getAgentDir(), {
         projectTrusted: settingsContext?.isProjectTrusted() ?? false,
@@ -745,5 +851,5 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     } catch {
       return "declared"; // Unreadable mode must not widen eligibility.
     }
-  }));
+  }, reportCatalogNotes));
 }

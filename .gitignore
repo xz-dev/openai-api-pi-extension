@@ -2,3 +2,5 @@ node_modules/
 .serena/
 .pi/
 *.log
+package-lock.json
+bun.lock
