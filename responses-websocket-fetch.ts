@@ -489,7 +489,7 @@ function streamResponse(pending: Pending, first: ResponseStreamEvent, signal: Ab
 
 export type ResponsesWebSocketBridge = {
   /** Internal public-payload-hook preparation; no I/O or host guard exemption. */
-  prepare(payload: unknown, prepareRequest?: (payload: unknown) => Promise<Request>): unknown | Promise<unknown>;
+  prepare(payload: unknown): unknown;
   observeProviderEvent(event: unknown): void;
   fetch: typeof globalThis.fetch;
   finish(output: AssistantMessage): Promise<void>;
@@ -512,14 +512,6 @@ export function createResponsesWebSocketBridge(
   let referenceRepairStarted = false;
   let prepared: { full: RequestBody; payload: RequestBody; chain: RequestBody; key: string; scope: string; previous: Continuation;
     connection?: Connection; generation?: object } | undefined;
-  let coldPrepared: { full: RequestBody; payload: RequestBody; plan: NonNullable<Awaited<ReturnType<typeof planCheckpoint>>>;
-    key: string; scopeHash: string; requestUrl: string; candidate: string } | undefined;
-  const coldEligible = (key: string) => {
-    const cooldown = checkpointCooldown.get(key);
-    const fallback = options.transport === "auto" ? autoSseFallback.get(key) : undefined;
-    return options.checkpoints?.enabled === true && (!cooldown || (Date.now() >= cooldown.retryAt && !cooldown.probing))
-      && (!fallback || (!fallback.recovering && Date.now() >= fallback.retryAt));
-  };
   let connectionLimitRetried = false;
   // Compression applies only at the real HTTP send; WS/JSON bridge input stays raw.
   const fallbackFetch = compressionFetch(options.fetch ?? globalThis.fetch);
@@ -623,16 +615,8 @@ export function createResponsesWebSocketBridge(
   };
 
   return {
-    prepare(payload, prepareRequest) {
+    prepare(payload) {
       if (terminalRepairFailure) throw terminalRepairFailure.error;
-      if (coldPrepared) {
-        if (JSON.stringify(payload) === JSON.stringify(coldPrepared.payload)) return payload;
-        if (JSON.stringify(payload) !== JSON.stringify(coldPrepared.full)) {
-          const error = new Error("Prepared continuation changed before transport");
-          terminalRepairFailure = { error };
-          throw error;
-        }
-      }
       if (prepared) {
         if (JSON.stringify(payload) === JSON.stringify(prepared.payload)) return payload;
         if (JSON.stringify(payload) !== JSON.stringify(prepared.full)) {
@@ -664,25 +648,7 @@ export function createResponsesWebSocketBridge(
           chain: JSON.parse(JSON.stringify(chain)), key, scope, previous,
           ...(live ? { connection, generation: connection.anchorGeneration } : {}) };
       }
-      if (!selected) {
-        if (!prepareRequest || full.store !== true || options.checkpoints?.enabled !== true) return payload;
-        return (async () => {
-          const initial = await prepareRequest(full);
-          initial.signal.throwIfAborted();
-          const request = new Request(initial, { headers: effectiveResponseHeaders(model, options, initial.headers) });
-          const key = connectionKey(model, options, request.headers);
-          if (!key || !coldEligible(key) || request.method !== "POST"
-            || !new URL(request.url).pathname.replace(/\/+$/, "").endsWith("/responses")) return payload;
-          const scopeHash = await checkpointScope(model, options, request);
-          const candidate = JSON.stringify(options.checkpoints!.candidate);
-          const plan = await planCheckpoint({ request: full as Record<string, unknown>,
-            candidate: options.checkpoints!.candidate!, scopeHash, now: Date.now(), eligible: true });
-          if (!plan || !coldEligible(key)) return payload;
-          const planned = { ...full, previous_response_id: plan.request.previous_response_id } as RequestBody;
-          coldPrepared = { full, payload: planned, plan, key, scopeHash, requestUrl: request.url, candidate };
-          return JSON.parse(JSON.stringify(planned));
-        })();
-      }
+      if (!selected) return payload;
       prepared = selected;
       // Retain independent snapshots: later payload hooks cannot mutate validation evidence.
       return JSON.parse(JSON.stringify(selected.payload));
@@ -692,28 +658,10 @@ export function createResponsesWebSocketBridge(
       const headers = effectiveResponseHeaders(model, options, request.headers);
       request = new Request(request, { headers });
       const responseRequest = request.method === "POST" && new URL(request.url).pathname.replace(/\/+$/, "").endsWith("/responses");
-      if (!responseRequest && !prepared && !coldPrepared) return fallbackFetch(request.clone());
+      if (!responseRequest && !prepared) return fallbackFetch(request.clone());
       if (terminalRepairFailure) {
         if (terminalRepairFailure.response && !request.signal.aborted) return terminalRepairFailure.response();
         throw terminalRepairFailure.error;
-      }
-      if (coldPrepared) {
-        try {
-          request.signal.throwIfAborted();
-          const received = JSON.parse(await request.clone().text()) as RequestBody;
-          const scopeHash = await checkpointScope(model, options, request);
-          const plan = await planCheckpoint({ request: coldPrepared.full as Record<string, unknown>,
-            candidate: options.checkpoints!.candidate!, scopeHash, now: Date.now(), eligible: true });
-          if (!responseRequest || request.url !== coldPrepared.requestUrl || !coldEligible(coldPrepared.key)
-            || connectionKey(model, options, headers) !== coldPrepared.key || scopeHash !== coldPrepared.scopeHash
-            || JSON.stringify(options.checkpoints?.candidate) !== coldPrepared.candidate
-            || JSON.stringify(received) !== JSON.stringify(coldPrepared.payload)
-            || JSON.stringify(plan) !== JSON.stringify(coldPrepared.plan)) throw new Error("Prepared continuation changed before transport");
-          request = new Request(request, { body: JSON.stringify(coldPrepared.full) });
-        } catch (error) {
-          terminalRepairFailure = { error };
-          throw error;
-        }
       }
       if (prepared) {
         try {
