@@ -10,6 +10,7 @@ import {
 } from "@earendil-works/pi-ai";
 import { createOpenAIApiProvider } from "../index.ts";
 import { readJsonBody } from "./fixtures/wire-decode.ts";
+import { OUTPUT_PREFIX } from "../notification.ts";
 
 const PROVIDER = "openai-api-extension";
 const BASE_URL_ENV = "OPENAI_API_EXTENSION_BASE_URL";
@@ -82,6 +83,7 @@ test("API-key login uses secret prompt, validates, and logout removes the whole 
   const models = createModels({ credentials, modelsStore, authContext: authContext() });
   models.setProvider(createOpenAIApiProvider([], undefined, undefined, undefined, undefined, currentDeps));
   const prompts: AuthPrompt[] = [];
+  const notices: string[] = [];
   const answers = [gatewayServer.baseUrl, "test-key"];
 
   const credential = await models.login(PROVIDER, "api_key", {
@@ -89,13 +91,15 @@ test("API-key login uses secret prompt, validates, and logout removes the whole 
       prompts.push(prompt);
       return answers.shift() ?? "";
     },
-    notify: () => undefined,
+    notify: (event) => { notices.push(event.message); },
   });
 
   assert.deepEqual(
     prompts.map((prompt) => prompt.type),
     ["text", "secret"],
   );
+  assert.ok(prompts.every((prompt) => prompt.message.startsWith(`${OUTPUT_PREFIX} `)));
+  assert.ok(notices.length >= 2 && notices.every((message) => message.startsWith(`${OUTPUT_PREFIX} `)));
   assert.deepEqual(credential, {
     type: "api_key",
     key: "test-key",
@@ -720,21 +724,22 @@ test("unknown config fields warn once and the rest of the config still applies",
 
 type SessionHandler = (event: unknown, ctx: unknown) => unknown;
 
-async function loadExtension() {
+async function loadExtension(dependencies?: Parameters<typeof import("../index.ts").default>[1]) {
   const extension = (await import("../index.ts")).default;
   const handlers = new Map<string, SessionHandler>();
+  const commands = new Map<string, { handler: (args: string, ctx: never) => Promise<void> }>();
   const registered: { provider?: ReturnType<typeof createOpenAIApiProvider> } = {};
   let appended = 0;
   const pi = {
     on: (name: string, handler: SessionHandler) => { handlers.set(name, handler); },
-    registerCommand: () => {},
+    registerCommand: (name: string, command: { handler: (args: string, ctx: never) => Promise<void> }) => { commands.set(name, command); },
     registerProvider: (provider: ReturnType<typeof createOpenAIApiProvider>) => { registered.provider = provider; },
     registerEntryRenderer: () => { throw new Error("entry renderers must not be registered"); },
     appendEntry: () => { appended++; },
   };
-  await extension(pi as never);
+  await extension(pi as never, dependencies);
   assert.ok(registered.provider, "provider registered");
-  return { handlers, provider: registered.provider, appends: () => appended };
+  return { handlers, commands, provider: registered.provider, appends: () => appended };
 }
 
 function notifyContext(hasUI: boolean, sink: { message: string; type?: string }[]) {
@@ -756,6 +761,59 @@ function refreshContext(credential: { key: string; baseUrl: string }, published:
     signal: new AbortController().signal,
   };
 }
+
+test("provider-info prefixes configured and unconfigured connection results", async () => {
+  metadataEnv(undefined);
+  const server = await gateway("info-prefix-model");
+  const { commands, appends } = await loadExtension();
+  const notices: { message: string; type?: string }[] = [];
+  let auth: { auth: { baseUrl: string; apiKey: string } } | undefined;
+  const ctx = {
+    ...notifyContext(true, notices),
+    modelRegistry: { getProviderAuth: async () => auth },
+  };
+  await commands.get("provider-info")!.handler("", ctx as never);
+  assert.equal(notices[0]?.type, "warning");
+  auth = { auth: { baseUrl: server.baseUrl, apiKey: "test-key" } };
+  await commands.get("provider-info")!.handler("", ctx as never);
+  assert.equal(notices[1]?.type, "info");
+  assert.ok(notices.every((notice) => notice.message.startsWith(`${OUTPUT_PREFIX} `)));
+  assert.ok(notices.every((notice) => !notice.message.includes("test-key")));
+  assert.match(notices[1].message, /connected; API key valid/);
+  assert.equal(appends(), 0);
+});
+
+test("automatic package checks start only after accepted network publication and never block it", async () => {
+  metadataEnv(undefined);
+  const server = await gateway("auto-check-model");
+  let release!: () => void;
+  const wait = new Promise<void>((resolve) => { release = resolve; });
+  let checks = 0;
+  const { handlers, provider } = await loadExtension({ metadataCompile: currentDeps, metadataCommands: {
+    getDeps: () => ({ agentDir: "unused", hostRuntime: { bunRuntime: false, bunBinary: false, execPath: process.execPath } }),
+    automaticState: { started: false },
+    check: async () => {
+      checks++;
+      await wait;
+      return { manager: { kind: "npm", reason: "test" }, updateAvailable: false, packages: {
+        "@opencode-ai/models": { status: "up-to-date", localVersion: "1.0.0", latest: "1.0.0" },
+        modelparams: { status: "up-to-date", localVersion: "1.0.0", latest: "1.0.0" },
+      } };
+    },
+  } });
+  const ui: { message: string; type?: string }[] = [];
+  await handlers.get("session_start")?.({}, { ...notifyContext(true, ui), mode: "tui" });
+  const context = refreshContext({ key: "test-key", baseUrl: server.baseUrl });
+  await provider.refreshModels?.({ ...context, allowNetwork: false } as never);
+  await provider.refreshModels?.({ ...context, publish: async () => false } as never);
+  assert.equal(checks, 0);
+  await provider.refreshModels?.(context as never);
+  assert.equal(checks, 1, "refresh returns while registry promise remains pending");
+  await provider.refreshModels?.(context as never);
+  assert.equal(checks, 1);
+  release();
+  await handlers.get("session_shutdown")?.({}, undefined);
+});
 
 test("enrichment keeps the original public id and gateway display name on the wire", { timeout: 10_000 }, async () => {
   // The metadata source renames the model (external `name` + canonical id),
@@ -852,6 +910,7 @@ test("catalog notes notify the live UI context and never append session entries"
   }
   assert.equal(appends(), 0, "no session entries may be appended");
   assert.ok(ui.some((n) => n.type === "info" && /unmatched/.test(n.message)), JSON.stringify(ui));
+  assert.ok(ui.every((notice) => notice.message.startsWith(`${OUTPUT_PREFIX} `)));
   assert.deepEqual(stderr, [], "with UI nothing goes to stderr");
   const categories = ui.find((n) => /metadata match:/.test(n.message))?.message ?? "";
   assert.match(categories, /0 complete, 0 partial-source-missing, 1 unmatched of 1 enabled/);
@@ -878,7 +937,7 @@ test("without UI or context diagnostics go to stderr only, stdout stays clean", 
   assert.equal(appends(), 0);
   assert.deepEqual(ui, [], "non-UI context never calls ui.notify");
   assert.deepEqual(stdout, [], "stdout stays clean");
-  assert.ok(stderr.some((line) => /\[openai-api-extension\]/.test(line) && /unmatched/.test(line)), JSON.stringify(stderr));
+  assert.ok(stderr.some((line) => line.startsWith(`${OUTPUT_PREFIX} `) && /unmatched/.test(line)), JSON.stringify(stderr));
 });
 
 test("session_shutdown clears the context: later diagnostics use stderr", async () => {

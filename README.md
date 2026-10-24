@@ -217,13 +217,12 @@ two public bulk data packages —
 [@opencode-ai/models](https://www.npmjs.com/package/@opencode-ai/models)
 (the [models.dev](https://models.dev) snapshot) and
 [modelparams](https://www.npmjs.com/package/modelparams)
-([modelparams.dev](https://modelparams.dev)) — installed alongside the
-extension with an unpinned `*` range. They refresh when `pi update`
-installs a new extension commit; to bump only the data without waiting
-for a plugin release, run `bun update @opencode-ai/models modelparams`
-inside the extension dir (`~/.pi/agent/git/<host>/<owner>/openai-api-pi-extension`). The whole lookup and merge runs inside a worker thread that
-only returns a compiled result; the ~7 MB snapshot never enters the main
-thread's heap. External sources never decide which models exist; they
+([modelparams.dev](https://modelparams.dev)) — initially installed alongside
+the extension with an unpinned `*` range. Use the plugin's
+[metadata update commands](#check-and-update-metadata-packages) to update
+data independently of plugin releases. The whole lookup and merge runs
+inside a worker thread that only returns a compiled result; the ~7 MB snapshot
+never enters the main thread's heap. External sources never decide which models exist; they
 enrich only models the upstream `/v1/models` catalog already lists.
 
 Config lives at `~/.pi/agent/openai-api-extension.yaml` (Pi's agent dir,
@@ -330,9 +329,10 @@ separately as disabled and never counted as failures. Degraded data
 sources add their own note; the full candidate lists and reasons live
 in `/provider-metadata`, not in the notification.
 
-**Notifications are transient**: metadata notes, degraded-source
-warnings and config errors reach you through Pi's native notify channel
-when a UI is attached, or stderr otherwise — stdout and the session
+**Notifications are transient**: all plugin-owned prompts, progress,
+notifications and errors start with `[openai-api-pi-extension]`. Metadata
+notes, degraded-source warnings and config errors use Pi's native notify
+channel when a UI is attached, or stderr otherwise — stdout and the session
 JSONL stay untouched, and nothing is appended as chat entries. Notes
 identical to the previous report are deduplicated; a superseded or
 cancelled refresh reports nothing.
@@ -360,8 +360,9 @@ Manual `overrides` apply after source merging as one more RFC 7396 patch;
 **Viewing the compiled result**: `/provider-metadata` refreshes the
 upstream catalog, runs the same worker compile, writes the rendered
 text to a private temp file (0700 dir / 0600 file under `os.tmpdir()`),
-and notifies you with the file's absolute path — open it with any
-editor or pager. The file lists the effective config, data versions,
+and notifies you with `[openai-api-pi-extension] <absolute-path>` — the
+prefix is not part of the filename. Open that path with any editor or pager.
+The file's first line also identifies this plugin. It lists the effective config, data versions,
 per-model matched rules, the concrete entries with supplied fields and
 their per-field source (`[canonical]` = unified canonical table,
 unmarked = provider record), the full candidate list with match level
@@ -382,10 +383,63 @@ keeps the persisted catalog. The inference path never reads metadata.
 error that names the exact path and the new equivalent — rewrite them as
 `chain` entries, literal providers, `@creator`, and `models:` rule lists.
 
-**Updating the data**: the packages are unpinned. `pi update` refreshes
-them only when the extension itself gets a new commit; between releases,
-run `bun update @opencode-ai/models modelparams` in the extension dir
-(`~/.pi/agent/git/<host>/<owner>/openai-api-pi-extension`).
+### Check and update metadata packages
+
+```text
+/provider-metadata check    # Compare the active local versions with registry latest
+/provider-metadata update   # Install, validate and activate both data packages
+/provider-metadata          # Keep the existing private diagnostic export
+```
+
+No gateway login is needed to check or update packages. Checks never install;
+only `update` changes data. The first successful online interactive catalog
+publication also schedules one non-blocking check per process. It only notifies
+when a newer stable version exists; automatic failures stay quiet. Offline mode
+(`--offline` / `PI_OFFLINE`) skips automatic checks and refuses explicit checks
+and updates. Compilation and inference never query the registry.
+
+The plugin honors Pi's `npmCommand` configuration, including compatible npm,
+Bun and pnpm argument prefixes. Only compatible option prefixes (for example,
+`npm --registry <url>`) are accepted; `npm exec`, `npm install` and ambiguous
+`bun run` prefixes are rejected before any subprocess starts. Without a setting, a verified xz-dev compiled
+Pi uses its embedded Bun; ordinary Node.js/source installs use npm (including
+Pi source run under Bun). Missing or ambiguous managers fail explicitly;
+the plugin does not install tools, switch managers or bypass registry auth.
+You do not need to choose npm/Bun or find the extension installation directory.
+`pi update`, `pi update --extensions` and repeated `pi install` are not guarantees
+that these transitive data dependencies will refresh.
+
+Updates use private, immutable generations under
+`getAgentDir()/cache/openai-api-pi-extension/metadata/`, not the extension's
+`node_modules` or Pi's shared npm tree. Both exact package versions are validated
+before one atomic activation; a newer local version is never downgraded to an
+older registry `latest`. Even matching versions must load and pass data-shape
+validation before reporting "already current"; broken same-version installations
+are repaired through a new isolated generation. Package install scripts are disabled. The data modules
+are still trusted executable package code, not a security sandbox.
+
+Before the first successful update, the plugin uses its installed dependencies.
+After activation, the private generation takes priority across login, refresh,
+connection status and export. Updating the bundled dependencies directly does
+not replace that active generation. Invalid/incomplete active records warn and
+fall back as a pair. Old and unfinished generations are retained; there is no
+automatic cleanup or rollback command.
+
+A successful activation refreshes only this provider, in the same Pi process.
+If the gateway is unconfigured, unreachable or has invalid metadata config, the
+new data stays installed while the old published catalog stays usable; the
+notification distinguishes those outcomes. In TUI mode, Escape cancels the
+operation and waits for cleanup. Shutdown also aborts and awaits owned work.
+Checks have a 10-second budget; installation/validation share a five-minute
+budget. Timeout/abort leaves the old activation in place if commit has not occurred.
+
+Concurrent updates return busy. A dead update-lock owner can be recovered;
+recovery guards themselves are never stolen because that would recreate the
+stale-lock race. If an interrupted recovery leaves `recovery.lock`, a busy
+notification names its private path for manual inspection. Confirm no updater
+is running before removing a leftover guard. Windows process-tree termination
+has not been verified; the tested process-group cancellation path is POSIX.
+
 
 **Warning**: `fill_missing_only` defaults to `false`, so external values
 *override* the gateway's own limits and may claim a larger context or

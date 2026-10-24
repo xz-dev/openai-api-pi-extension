@@ -39,7 +39,9 @@ import {
   type CompiledModel,
 } from "./model-metadata.ts";
 import { parseMetadataConfig } from "./metadata-config.ts";
-import { renderCompiledCatalog, sanitizeTerminalText } from "./metadata-view.ts";
+import { renderCompiledCatalog } from "./metadata-view.ts";
+import { formatPluginOutput, notifyPlugin } from "./notification.ts";
+import { createMetadataCommands, type MetadataCommandOptions } from "./metadata-commands.ts";
 import { writeMetadataTempFile } from "./metadata-tmpfile.ts";
 import {
   createResponsesWebSocketBridge,
@@ -417,6 +419,7 @@ export function mapCompiledCatalog(
   const notes = compiled.warnings.length > 0
     ? [`ignored unsupported fields: ${compiled.warnings.join(", ")}`]
     : [];
+  if (compiled.sourceWarning) notes.push(`metadata data fallback: ${compiled.sourceWarning}`);
   for (const item of compiled.degraded) {
     const scope = item.scope ? ` ${item.scope}` : "";
     notes.push(`metadata source ${item.site}${scope} unavailable (${item.reason}); using upstream values`);
@@ -542,28 +545,31 @@ function apiKeyAuth(
     login: async (interaction): Promise<ApiKeyCredential> => {
       const enteredBaseUrl = await interaction.prompt({
         type: "text",
-        message: "Gateway base URL",
+        message: formatPluginOutput("Gateway base URL"),
         placeholder: DEFAULT_BASE_URL,
       });
       interaction.signal.throwIfAborted();
       const baseUrl = normalizeBaseUrl(enteredBaseUrl || DEFAULT_BASE_URL);
-      if (!baseUrl) throw new Error("Gateway base URL must be an HTTP(S) URL");
+      if (!baseUrl) throw new Error(formatPluginOutput("Gateway base URL must be an HTTP(S) URL"));
 
       const apiKey = (
-        await interaction.prompt({ type: "secret", message: "Gateway API key", placeholder: "sk-..." })
+        await interaction.prompt({ type: "secret", message: formatPluginOutput("Gateway API key"), placeholder: "sk-..." })
       ).trim();
       interaction.signal.throwIfAborted();
-      if (!apiKey) throw new Error("Gateway API key cannot be empty");
+      if (!apiKey) throw new Error(formatPluginOutput("Gateway API key cannot be empty"));
 
-      interaction.notify({ type: "progress", message: "Validating connection..." });
-      const entries = await fetchCatalog(baseUrl, apiKey, interaction.signal);
+      interaction.notify({ type: "progress", message: formatPluginOutput("Validating connection...") });
+      const entries = await fetchCatalog(baseUrl, apiKey, interaction.signal).catch((error) => {
+        interaction.signal.throwIfAborted();
+        throw new Error(formatPluginOutput(errorMessage(error), [apiKey]), { cause: error });
+      });
       try {
         const { models, notes } = await enrichCatalog(entries, baseUrl, interaction.signal, deps);
         // A cancelled login must not publish the catalogue it fetched.
         interaction.signal.throwIfAborted();
         onValidated(baseUrl, apiKey, models);
-        for (const note of notes) interaction.notify({ type: "info", message: `Metadata: ${note}` });
-        interaction.notify({ type: "info", message: `Found ${models.length} models.` });
+        for (const note of notes) interaction.notify({ type: "info", message: formatPluginOutput(`Metadata: ${note}`, [apiKey]) });
+        interaction.notify({ type: "info", message: formatPluginOutput(`Found ${models.length} models.`) });
       } catch (error) {
         // Caller cancel is not a catalog problem: propagate, never degrade.
         interaction.signal.throwIfAborted();
@@ -573,7 +579,7 @@ function apiKeyAuth(
           error instanceof MetadataConfigError
             ? `Connected, but the metadata config is invalid: ${reason} API key saved; models were not updated.`
             : `Connected, but the model catalog is not usable: ${reason} API key saved; models were not updated.`;
-        interaction.notify({ type: "info", message });
+        interaction.notify({ type: "info", message: formatPluginOutput(message, [apiKey]) });
       }
       return { type: "api_key", key: apiKey, env: { [ENV_BASE_URL]: baseUrl } };
     },
@@ -735,7 +741,11 @@ export function createOpenAIApiProvider(
   return provider;
 }
 
-export default async function (pi: ExtensionAPI): Promise<void> {
+export default async function (pi: ExtensionAPI, dependencies: {
+  metadataCommands?: MetadataCommandOptions;
+  metadataCompile?: Parameters<typeof compileCatalogInWorker>[2];
+} = {}): Promise<void> {
+  const packageCommands = createMetadataCommands(dependencies.metadataCommands);
   pi.on("context", (event, ctx) => {
     const messages = adoptResponseAncestry(event.messages, ctx.sessionManager);
     return messages ? { messages } : undefined;
@@ -745,22 +755,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   // Nothing is appended to the session, and stdout stays protocol-clean.
   let sessionContext: { hasUI: boolean; ui: { notify(message: string, type?: "info" | "warning" | "error"): void } } | undefined;
   const emitDiagnostic = (severity: "info" | "warning" | "error", message: string) => {
-    const text = sanitizeTerminalText(message);
-    try {
-      const ctx = sessionContext;
-      if (ctx?.hasUI) {
-        ctx.ui.notify(text, severity);
-      } else {
-        console.error(`[openai-api-extension] ${text}`);
-      }
-    } catch {
-      // A failing notifier must never hide the original diagnostic.
-      try {
-        console.error(`[openai-api-extension] ${text}`);
-      } catch {
-        /* stderr itself failed; the refresh error still propagates */
-      }
-    }
+    notifyPlugin(sessionContext, message, severity);
   };
   const reportCatalogError = (message: string) => emitDiagnostic("error", message);
   // Suppress only notes identical to the immediately previous report — login
@@ -772,6 +767,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     for (const note of noteDedupe(notes)) {
       emitDiagnostic("info", `metadata note: ${note}`);
     }
+    packageCommands.backgroundCheck();
   };
   const getTransport = (ctx: { cwd: string; isProjectTrusted(): boolean }) => {
     try {
@@ -801,7 +797,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
         `Server: ${baseUrl ?? "not configured"}`,
       ];
       if (!baseUrl || !apiKey) {
-        ctx.ui.notify([
+        notifyPlugin(ctx, [
           ...lines,
           "Connection: ✗ not configured",
           "Models: 0",
@@ -810,24 +806,24 @@ export default async function (pi: ExtensionAPI): Promise<void> {
       }
 
       try {
-        const { models, notes } = await fetchEnrichedCatalog(baseUrl, apiKey, AbortSignal.timeout(CONNECTION_TIMEOUT_MS));
-        ctx.ui.notify([
+        const { models, notes } = await fetchEnrichedCatalog(baseUrl, apiKey, AbortSignal.timeout(CONNECTION_TIMEOUT_MS), dependencies.metadataCompile);
+        notifyPlugin(ctx, [
           ...lines,
           "Connection: ✓ connected; API key valid",
           ...notes.map((note) => `Metadata note: ${note}`),
           `Models: ${models.length}`,
-        ].join("\n"), "info");
+        ].join("\n"), "info", [apiKey]);
       } catch (error) {
         const reason = errorMessage(error).split(apiKey).join("[REDACTED]");
         // A metadata config error is not an auth failure: the key already
         // validated upstream before enrichment ran.
         const configError = error instanceof MetadataConfigError;
-        ctx.ui.notify([
+        notifyPlugin(ctx, [
           ...lines,
           configError ? "Connection: ✓ connected; API key valid" : "Connection: ✗ failed",
           configError ? `Metadata: ✗ config error: ${reason}` : `Reason: ${reason}`,
           "Models: 0",
-        ].join("\n"), configError ? "warning" : "error");
+        ].join("\n"), configError ? "warning" : "error", [apiKey]);
       }
     },
   });
@@ -836,13 +832,14 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   // Without a CLI cache, discovery needs pi --refresh --list-models;
   // interactive mode discovers models through Pi's own background refresh.
   pi.registerCommand("provider-metadata", {
-    description: "Show the compiled model-metadata chain for every model",
-    handler: async (_args, ctx) => {
+    description: "Export compiled metadata, or check/update its data packages",
+    handler: async (args, ctx) => {
+      if (await packageCommands.handle(args, ctx)) return;
       const auth = await ctx.modelRegistry.getProviderAuth(PROVIDER);
       const baseUrl = normalizeBaseUrl(auth?.auth.baseUrl);
       const apiKey = auth?.auth.apiKey?.trim();
       if (!baseUrl || !apiKey) {
-        ctx.ui.notify("OpenAI API Extension: not configured", "warning");
+        notifyPlugin(ctx, "OpenAI API Extension: not configured", "warning");
         return;
       }
       let text: string;
@@ -862,16 +859,16 @@ export default async function (pi: ExtensionAPI): Promise<void> {
           const id = entryIdentity(row)?.id;
           return id && isConversationalTextModel(row) ? [id] : [];
         });
-        const compiled = (await compileCatalogInWorker(config, publicIds)).catalog;
+        const compiled = (await compileCatalogInWorker(config, publicIds, dependencies.metadataCompile)).catalog;
         text = renderCompiledCatalog(compiled);
       } catch (error) {
         failed = true;
         // A config error still produces a diagnostics file the user can page.
         const reason = errorMessage(error).split(apiKey).join("[REDACTED]");
-        text = `provider-metadata: ${sanitizeTerminalText(reason)}\n`;
+        text = `${formatPluginOutput(`provider-metadata: ${reason}`, [apiKey])}\n`;
       }
       const file = writeMetadataTempFile(text);
-      ctx.ui.notify(file, failed ? "warning" : "info");
+      notifyPlugin(ctx, file, failed ? "warning" : "info");
     },
   });
   let settingsContext: { cwd: string; isProjectTrusted(): boolean } | undefined;
@@ -879,9 +876,11 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     settingsContext = ctx;
     // Latest interactive context wins; a stale reference is dropped on shutdown.
     sessionContext = ctx;
+    packageCommands.setSession(ctx);
   });
   pi.on("session_shutdown", async () => {
     sessionContext = undefined;
+    await packageCommands.shutdown();
   });
   pi.registerProvider(createOpenAIApiProvider([], reportCatalogError, () => {
     try {
@@ -906,5 +905,5 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     } catch {
       return "declared"; // Unreadable mode must not widen eligibility.
     }
-  }, reportCatalogNotes));
+  }, reportCatalogNotes, dependencies.metadataCompile));
 }

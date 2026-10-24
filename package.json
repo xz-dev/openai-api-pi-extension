@@ -13,6 +13,9 @@
     "metadata-config.ts",
     "metadata-compile.ts",
     "metadata-compile-worker.mjs",
+    "metadata-packages.ts",
+    "metadata-commands.ts",
+    "notification.ts",
     "metadata-view.ts",
     "metadata-tmpfile.ts",
     "request-compression.ts",
@@ -42,6 +45,7 @@
     "minimatch": "10.2.6",
     "modelparams": "*",
     "openai": "6.40.0",
+    "semver": "^7.8.5",
     "ws": "^8.18.0",
     "yaml": "^2.9.1"
   },

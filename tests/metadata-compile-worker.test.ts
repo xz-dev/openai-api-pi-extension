@@ -5,7 +5,7 @@
  * makes these pass — inherited --inspect-port kills the worker otherwise.
  */
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync, mkdirSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -20,6 +20,7 @@ import {
 } from "../model-metadata.ts";
 import { parseMetadataConfig } from "../metadata-config.ts";
 import type { SourceTables } from "../model-metadata.ts";
+import { metadataRoot } from "../metadata-packages.ts";
 
 const dirs: string[] = [];
 afterEach(async () => {
@@ -33,6 +34,46 @@ function agentDir(yaml?: string): string {
   process.env.PI_CODING_AGENT_DIR = dir;
   return dir;
 }
+
+function activateFixture(agent: string, generation: string, version: string, context: number, delay = 0) {
+  const root = metadataRoot(agent);
+  for (const name of ["@opencode-ai/models", "modelparams"]) {
+    const dir = join(root, "generations", generation, "node_modules", name);
+    mkdirSync(join(dir, "dist"), { recursive: true });
+    writeFileSync(join(dir, "package.json"), JSON.stringify({ name, version, type: "module" }));
+    const models = name === "@opencode-ai/models";
+    writeFileSync(join(dir, "dist", models ? "snapshot.js" : "index.js"), models
+      ? `await new Promise(r => setTimeout(r, ${delay})); export const generatedAt = ${JSON.stringify(version)}; export const providers = {demo:{models:{m:{limit:{context:${context}}}}}}; export const models = {};`
+      : "export const CATALOG = [];");
+  }
+  writeFileSync(join(root, "active.json"), JSON.stringify({ format: 1, generation,
+    versions: { modelsDev: version, modelparams: version } }));
+}
+
+test("real Workers capture one active generation and see later activations in the same process", { timeout: 10_000 }, async () => {
+  const agent = agentDir();
+  const config = parseMetadataConfig('chain: ["models.dev/demo/api_key/m", "modelparams.dev/demo/api_key/m"]');
+  activateFixture(agent, "first", "1.0.0", 11000, 100);
+  const first = compileCatalogInWorker(config, ["m"], { agentDir: agent });
+  activateFixture(agent, "second", "2.0.0", 22000);
+  const second = await compileCatalogInWorker(config, ["m"], { agentDir: agent });
+  const original = await first;
+  assert.equal(original.catalog.dataVersions.modelsDevVersion, "1.0.0");
+  assert.equal(original.catalog.models[0].entries[0].fields.context_window, 11000);
+  assert.equal(second.catalog.dataVersions.modelsDevVersion, "2.0.0");
+  assert.equal(second.catalog.dataVersions.modelparamsVersion, "2.0.0");
+  assert.equal(second.catalog.models[0].entries[0].fields.context_window, 22000);
+});
+
+test("real Worker rejects broken active records as a whole and reports bundled fallback", { timeout: 10_000 }, async () => {
+  const agent = agentDir();
+  mkdirSync(metadataRoot(agent), { recursive: true });
+  writeFileSync(join(metadataRoot(agent), "active.json"), "invalid JSON");
+  const out = await compileCatalogInWorker(parseMetadataConfig(undefined), ["m"], { agentDir: agent });
+  assert.match(out.catalog.sourceWarning ?? "", /active record/);
+  assert.ok(out.catalog.dataVersions.modelsDevVersion);
+  assert.ok(out.catalog.dataVersions.modelparamsVersion);
+});
 
 const CONFLICT_TABLES: SourceTables = {
   degraded: [],

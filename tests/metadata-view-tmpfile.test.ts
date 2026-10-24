@@ -9,6 +9,7 @@ import { afterEach, test } from "node:test";
 
 import { renderCompiledCatalog, sanitizeTerminalText } from "../metadata-view.ts";
 import { writeMetadataTempFile } from "../metadata-tmpfile.ts";
+import { OUTPUT_PREFIX } from "../notification.ts";
 
 const compiled = {
   config: {
@@ -96,6 +97,7 @@ test("renderCompiledCatalog redacts credential-like override fields but keeps ma
 
 test("renderCompiledCatalog shows config, versions, entries, unresolved, overrides — never the API key", () => {
   const text = renderCompiledCatalog(compiled);
+  assert.ok(text.startsWith(`${OUTPUT_PREFIX} `));
   assert.match(text, /== effective config ==/);
   assert.match(text, /models\.dev: 0\.0\.113 \(snapshot 2026-10-23\)/);
   assert.match(text, /degraded: modelparams\.dev: package missing/);
@@ -185,7 +187,7 @@ function agentDir(yaml?: string): string {
   return dir;
 }
 
-test("/provider-metadata writes a retained temp file and notifies only its path", async () => {
+test("/provider-metadata writes a retained temp file and notifies its prefixed path", async () => {
   const gateway = await startGateway({
     data: [{ id: "test-model", name: "test-model", type: "chat", context_window: 128000 }],
   });
@@ -223,13 +225,18 @@ test("/provider-metadata writes a retained temp file and notifies only its path"
     assert.equal(calls.length, 1, "exactly one notification");
     const { message, type } = calls[0];
     assert.equal(type, "info");
-    assert.match(message, /^\/.*metadata-compile\.txt$/, "notification is the absolute file path only");
-    assert.ok(existsSync(message), "file exists after handler returns");
-    const text = await readFile(message, "utf8");
+    assert.ok(message.startsWith(`${OUTPUT_PREFIX} `));
+    const file = message.slice(OUTPUT_PREFIX.length + 1);
+    assert.match(file, /^\/.*metadata-compile\.txt$/, "prefix is not part of the absolute path");
+    assert.ok(existsSync(file), "file exists after handler returns");
+    assert.equal(statSync(file).mode & 0o777, 0o600);
+    assert.equal(statSync(join(file, "..")).mode & 0o777, 0o700);
+    const text = await readFile(file, "utf8");
+    assert.ok(text.startsWith(`${OUTPUT_PREFIX} `));
     assert.match(text, /== effective config ==/);
     assert.match(text, /test-model/);
     assert.doesNotMatch(text, /sk-test-secret/, "no credential in file");
-    dirs.push(join(message, ".."));
+    dirs.push(join(file, ".."));
   } finally {
     await gateway.close();
   }
@@ -266,12 +273,15 @@ test("/provider-metadata config error still yields a diagnostics file + warning 
     assert.equal(calls.length, 1);
     const { message, type } = calls[0];
     assert.equal(type, "warning");
-    assert.match(message, /^\/.*metadata-compile\.txt$/);
-    assert.ok(existsSync(message));
-    const text = await readFile(message, "utf8");
+    assert.ok(message.startsWith(`${OUTPUT_PREFIX} `));
+    const file = message.slice(OUTPUT_PREFIX.length + 1);
+    assert.match(file, /^\/.*metadata-compile\.txt$/);
+    assert.ok(existsSync(file));
+    const text = await readFile(file, "utf8");
+    assert.ok(text.startsWith(`${OUTPUT_PREFIX} `));
     assert.match(text, /source_priority/);
     assert.doesNotMatch(text, /sk-test-secret/);
-    dirs.push(join(message, ".."));
+    dirs.push(join(file, ".."));
   } finally {
     await gateway.close();
   }

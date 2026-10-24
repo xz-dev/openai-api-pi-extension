@@ -7,6 +7,8 @@
  */
 import { classifyModelMatch } from "./model-metadata.ts";
 import type { CompiledCatalog, CompiledModel } from "./model-metadata.ts";
+import { formatPluginOutput } from "./notification.ts";
+export { sanitizeTerminalText } from "./notification.ts";
 
 /**
  * Credential keys redacted wherever they appear; every value under a
@@ -39,17 +41,6 @@ function redact(value: unknown, insideHeaders = false): unknown {
   return insideHeaders ? REDACTED : value;
 }
 const redactJson = (value: unknown) => JSON.stringify(redact(value));
-
-// External strings (model IDs, chain entries, reasons) can contain terminal
-// control sequences; a Text renderer passes them through. Turn C0 (except
-// "\n" — our own line breaks), DEL and C1 into visible escapes at the render
-// boundary so a hostile gateway catalog cannot write OSC/CSI to the terminal.
-export function sanitizeTerminalText(text: string): string {
-  return text.replace(/[\x00-\x09\x0b-\x1f\x7f-\x9f]/g, (c) => {
-    const code = c.charCodeAt(0);
-    return `\\x${code.toString(16).padStart(2, "0")}`;
-  });
-}
 
 function formatEntryFields(model: CompiledModel): string[] {
   return model.entries.map((entry) => {
@@ -95,6 +86,7 @@ export function renderCompiledCatalog(compiled: CompiledCatalog): string {
   }
   lines.push("");
   lines.push("== data versions ==");
+  if (compiled.sourceWarning) lines.push(`data fallback: ${compiled.sourceWarning}`);
   const v = compiled.dataVersions;
   lines.push(`models.dev: ${v.modelsDevVersion ?? "unavailable"}${v.modelsDevGeneratedAt ? ` (snapshot ${v.modelsDevGeneratedAt})` : ""}`);
   lines.push(`modelparams.dev: ${v.modelparamsVersion ?? "unavailable"}`);
@@ -126,5 +118,5 @@ export function renderCompiledCatalog(compiled: CompiledCatalog): string {
     lines.push(...formatCandidates(model));
     if (model.overridePatches.length > 0) lines.push(`  overrides: ${model.overridePatches.map(redactJson).join(" then ")}`);
   }
-  return sanitizeTerminalText(lines.join("\n") + "\n");
+  return formatPluginOutput(lines.join("\n") + "\n");
 }

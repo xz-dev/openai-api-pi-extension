@@ -508,6 +508,8 @@ export type CompiledModel = {
 };
 
 export type CompiledCatalog = {
+  /** Local source fallback, separate from ignored configuration fields. */
+  sourceWarning?: string;
   config: { rootChain: readonly string[]; fillMissingOnly: boolean; rules: readonly ModelRule[] };
   dataVersions: { modelsDevVersion?: string; modelsDevGeneratedAt?: string; modelparamsVersion?: string };
   degraded: DegradedSource[];
