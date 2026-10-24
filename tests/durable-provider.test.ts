@@ -772,6 +772,97 @@ for (const reject of [false, true]) test(`malformed latest fact uses independent
   assert.equal(h.httpFrames.length, 0);
 });
 
+let hostPrepareRequest: Promise<boolean> | undefined;
+function supportsPrepareRequest(t: any): Promise<boolean> {
+  return hostPrepareRequest ??= (async () => {
+    const h = await harness(t);
+    let supported = false;
+    const output = await openAIResponsesApi().stream(h.model, { messages: [user("probe")] }, {
+      ...h.options, transport: "sse",
+      onPayload: (_payload: unknown, _model: unknown, prepareRequest: unknown) => {
+        supported = typeof prepareRequest === "function";
+      },
+    }).result();
+    assert.equal(output.stopReason, "stop", output.errorMessage);
+    return supported;
+  })();
+}
+
+test("cold preparation without a host preparer leaves the payload unchanged", async (t) => {
+  const h = await harness(t);
+  const first: any = await h.makeModels().stream(h.model, { messages: [user("one")] }, h.options).result();
+  assert.ok(first.responseCheckpoint);
+  closeResponsesWebSockets();
+  const bridge = createResponsesWebSocketBridge(h.model, { ...h.options, responseAncestry: "unknown",
+    checkpoints: { enabled: true, candidate: { responseId: first.responseId, responseCheckpoint: first.responseCheckpoint } } });
+  const payload = { store: true, input: [input("two")] };
+  const original = structuredClone(payload);
+  assert.equal(bridge.prepare(payload), payload);
+  assert.deepEqual(payload, original);
+  assert.equal(Object.hasOwn(payload, "previous_response_id"), false);
+  assert.equal(h.frames.length, 1);
+  assert.equal(h.httpFrames.length, 0);
+});
+
+test("provider payload hook forwards the host preparer for cold checkpoint continuation", async (t) => {
+  if (!await supportsPrepareRequest(t)) return t.skip("host lacks prepareRequest");
+  const h = await harness(t);
+  const first: any = await h.makeModels().stream(h.model, { messages: [user("one")] }, h.options).result();
+  assert.ok(first.responseCheckpoint);
+  closeResponsesWebSockets();
+  const second: any = await h.makeModels().stream(h.model,
+    { messages: [user("one"), { ...first, responseAncestry: null }, user("two")] }, h.options).result();
+  assert.equal(second.stopReason, "stop", second.errorMessage);
+  assert.equal(h.frames.length, 2);
+  assert.equal(h.frames[1].previous_response_id, first.responseId);
+  assert.deepEqual(h.frames[1].input, [input("two")]);
+  assert.equal(h.httpFrames.length, 0);
+});
+
+for (const mutation of ["url", "body", "credential", "sdk-header", "candidate", "abort"] as const) {
+  test(`cold preparation rejects late ${mutation} change before any WS/HTTP send`, async (t) => {
+    if (!await supportsPrepareRequest(t)) return t.skip("host lacks prepareRequest");
+    const h = await harness(t);
+    const first: any = await h.makeModels().stream(h.model, { messages: [user("one")] }, h.options).result();
+    assert.ok(first.responseCheckpoint);
+    closeResponsesWebSockets();
+    const candidate = { responseId: first.responseId, responseCheckpoint: structuredClone(first.responseCheckpoint) };
+    const bridge = createResponsesWebSocketBridge(h.model, { ...h.options, responseAncestry: "unknown",
+      checkpoints: { enabled: true, candidate } });
+    let prepared = false;
+    const cancellation = new AbortController();
+    const output: any = await openAIResponsesApi().stream(h.model,
+      { messages: [user("one"), { ...first, responseAncestry: null }, user("two")] } as any, {
+        ...h.options, transport: "sse", signal: cancellation.signal,
+        onPayload: async (payload: any, _model: any, prepareRequest: any) => {
+          payload.store = true;
+          const next: any = await bridge.prepare(payload, prepareRequest);
+          assert.equal(next.previous_response_id, first.responseId, "actual client prepared a valid cold parent");
+          prepared = true;
+          return next;
+        },
+        fetch: async (input: any, init: any) => {
+          let request = new Request(input, init);
+          if (mutation === "url") request = new Request(`${request.url}?changed=1`, request);
+          if (mutation === "body") request = new Request(request, { body: JSON.stringify({ ...await request.clone().json(), instructions: "changed" }) });
+          if (mutation === "credential" || mutation === "sdk-header") {
+            const headers = new Headers(request.headers);
+            headers.set(mutation === "credential" ? "authorization" : "x-stainless-retry-count", mutation === "credential" ? "Bearer other" : "1");
+            request = new Request(request, { headers });
+          }
+          if (mutation === "candidate") candidate.responseCheckpoint.createdAt += 1;
+          if (mutation === "abort") { cancellation.abort(); request = new Request(request, { signal: cancellation.signal }); }
+          return bridge.fetch(request);
+        },
+      }).result();
+    assert.equal(prepared, true);
+    assert.equal(output.stopReason, mutation === "abort" ? "aborted" : "error",
+      JSON.stringify({ stopReason: output.stopReason, error: output.errorMessage, frames: h.frames.length, httpFrames: h.httpFrames.length }));
+    assert.equal(h.frames.length, 1, "no followup frame after preparation evidence changes");
+    assert.equal(h.httpFrames.length, 0, "no HTTP escape");
+  });
+}
+
 for (const method of ["stream", "streamSimple"] as const) test(`${method}: SSE caller dependence survives switching to WS and auto cooldown`, async (t) => {
   const h = await harness(t);
   h.handshakeStatus = 503;
