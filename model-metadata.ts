@@ -154,7 +154,7 @@ export function matchModelPattern(pattern: string, id: string): boolean {
 // ---------------------------------------------------------------------------
 
 const DATE_SUFFIX = /-(?:\d{8}|\d{4}-\d{2}-\d{2})$/;
-const QUERY_SEPARATOR = /[\s._-]+/;
+const QUERY_SEPARATOR_CHAR = /[\s._-]/;
 const REGEX_META = /[.*+?^${}()|[\]\\]/g;
 
 /** The internal query input: text after the last "/" of the public id. */
@@ -163,19 +163,20 @@ export function querySegment(publicId: string): string {
 }
 
 /**
- * Anchored, case-insensitive regex from a query segment: runs of
- * space/underscore/dot/hyphen become an interchangeable separator class,
- * every other character is escaped literally so user input can never be
- * executed as a pattern. Undefined when nothing matchable remains.
+ * Anchored, case-insensitive regex from a query segment: every
+ * space/underscore/dot/hyphen character becomes one optional separator
+ * class (one-to-zero-or-one, never one-to-many), every other character is
+ * escaped literally so user input can never be executed as a pattern.
+ * Undefined when nothing matchable remains.
  */
 function buildQueryRegex(segment: string): RegExp | undefined {
-  // split() emits empty chunks only at the leading/trailing edges of a
-  // separator run. Joining the escaped chunks with the separator class emits
-  // exactly one required class per actual run: ".x" -> "^[\\s._-]+x$" matches
-  // "-x" but never bare "x" (boundary separators are required, not deleted).
-  const chunks = segment.split(QUERY_SEPARATOR);
-  if (chunks.every((chunk) => chunk === "")) return undefined;
-  const body = chunks.map((chunk) => chunk.replace(REGEX_META, "\\$&")).join("[\\s._-]+");
+  // Each separator character keeps its own position and count: "a--b"
+  // compiles to "^a[\\s._-]?[\\s._-]?b$" and matches "ab"/"a_b"/"a_.b" but
+  // never "a---b". Bare queries gain no separator positions.
+  if (![...segment].some((char) => !QUERY_SEPARATOR_CHAR.test(char))) return undefined;
+  const body = [...segment]
+    .map((char) => (QUERY_SEPARATOR_CHAR.test(char) ? "[\\s._-]?" : char.replace(REGEX_META, "\\$&")))
+    .join("");
   return new RegExp(`^${body}$`, "i");
 }
 

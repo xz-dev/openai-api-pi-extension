@@ -933,14 +933,161 @@ test("probe: @creator with literal fourth segment keeps lookup", () => {
   assert.equal(externalFields(m).context_window, 200);
 });
 
-test("probe: separator runs are interchangeable, never removable", () => {
-  const providers = { a: { models: { x: probeRec("a/x", 100) } } };
-  assert.equal(probeModel("-x", { providers }).candidates.length, 0);
-  assert.equal(probeModel(".x", { providers }).candidates.length, 0);
-  assert.equal(probeModel("x", { providers }).candidates.length > 0, true);
-  // A leading separator must match a leading separator, not the bare id.
-  const withDash = { a: { models: { "-x": probeRec("a/-x", 50) } } };
-  assert.ok(probeModel("-x", { providers: withDash }).candidates.length > 0);
+// One separator-class position per query separator character: each may swap
+// to any of space/underscore/dot/hyphen or delete, never multiply.
+const sepTable = (ids: readonly string[], context = 1) =>
+  tables({
+    modelsDev: {
+      providers: {
+        a: { models: Object.fromEntries(ids.map((id) => [id, { limit: { context } }])) },
+      },
+    },
+  });
+const sepCompile = (query: string, ids: readonly string[], context?: number) =>
+  compileCatalog(cfg({ chain: ["models.dev/a/api_key"] }), [query], sepTable(ids, context)).models[0];
+const sepCandidates = (query: string, ids: readonly string[]) =>
+  sepCompile(query, ids).candidates.map((c) => c.sourceId).sort();
+
+const SEP_VARIANTS = ["a b", "a_b", "a.b", "a-b", "ab"];
+
+test("probe: each query separator swaps across the class or deletes", () => {
+  for (const q of ["a b", "a_b", "a.b", "a-b"]) {
+    const model = sepCompile(q, SEP_VARIANTS, 100);
+    assert.deepEqual(model.candidates.map((c) => c.sourceId).sort(), ["a b", "a-b", "a.b", "a_b", "ab"], q);
+    // The literal spelling keeps level 0; every swapped/deleted hit stays level 1.
+    for (const c of model.candidates) assert.equal(c.level, c.sourceId === q ? 0 : 1, `${q} -> ${c.sourceId}`);
+    // Same fields across all aliases: one record still supplies them.
+    assert.equal(externalFields(model).context_window, 100, q);
+  }
+  // "\s" keeps its full whitespace range: a tab separates exactly like space.
+  assert.deepEqual(sepCandidates("a\tb", SEP_VARIANTS), ["a b", "a-b", "a.b", "a_b", "ab"]);
+});
+
+test("probe: separator counts are per-position — no one-to-many, no insertion", () => {
+  // One query separator never swallows a run of two source separators.
+  for (const id of ["a--b", "a_.b", "a  b"]) {
+    assert.deepEqual(sepCandidates("a-b", [id]), [], id);
+  }
+  // Two query separators match 0..2 source separators, never three.
+  assert.deepEqual(sepCandidates("a--b", ["ab", "a_b", "a_.b", "a---b"]), ["a_.b", "a_b", "ab"]);
+  // A separator-free query never gains positions.
+  assert.deepEqual(sepCandidates("ab", ["a-b"]), []);
+  // Boundary runs obey the same per-position cap.
+  assert.deepEqual(sepCandidates("--x", ["x", "-x", ". x", "---x"]), ["-x", ". x", "x"]);
+  assert.deepEqual(sepCandidates("x--", ["x", "x_", "x.-", "x---"]), ["x", "x.-", "x_"]);
+});
+
+test("probe: metacharacters and pure-separator queries stay safe", () => {
+  // Non-separator regex metacharacters stay literal; adjacent separators may
+  // still delete, so "model+(x)1" matches while "modelX1" never does.
+  const m = sepCompile("Model+(X)-1", ["model+(x)1", "modelX1"]);
+  assert.deepEqual(m.candidates.map((c) => c.sourceId), ["model+(x)1"]);
+  // Pure-separator queries produce no regex candidates at all.
+  assert.deepEqual(sepCandidates("_-.", ["x", "___"]), []);
+  const onlyDash = sepCompile("-", ["-", "x"]);
+  assert.deepEqual(onlyDash.candidates.map((c) => c.sourceId), ["-"]);
+});
+
+test("compileCatalog: separator deletion keeps original spelling across all sources", () => {
+  const t = tables({
+    modelsDev: {
+      providers: {
+        maker: { models: { "ClaudeFable51": { canonical_model_id: "maker/ClaudeFable51", limit: { context: 100 } } } },
+        vendor: { models: { "ns/Claude Fable 5.1": { canonical_model_id: "maker/ClaudeFable51", limit: { context: 1 } } } },
+      },
+      models: { "maker/ClaudeFable51": { limit: { context: 100, output: 10 } } },
+    },
+    modelparams: {
+      catalog: [
+        { provider: "maker", authType: "api_key", model: "claude-fable-5-1", params: [{ path: "max_tokens", range: { max: 8192 } }] },
+      ],
+    },
+  });
+  // Mixed-case spaced query deletes every separator position to hit
+  // ClaudeFable51; sources keep their exact spelling everywhere.
+  const model = compileCatalog(cfg(), ["Proxy/Claude Fable 5.1"], t).models[0];
+  assert.equal(model.publicId, "Proxy/Claude Fable 5.1");
+  const makerEntry = model.entries.find((e) => e.provider === "maker" && e.site === "models.dev");
+  assert.equal(makerEntry?.entry, "models.dev/maker/api_key/ClaudeFable51");
+  assert.equal(makerEntry?.fields.context_window, 100);
+  const paramsEntry = model.entries.find((e) => e.site === "modelparams.dev");
+  assert.equal(paramsEntry?.entry, "modelparams.dev/maker/api_key/claude-fable-5-1");
+  assert.equal(paramsEntry?.fields.max_output_tokens, 8192);
+  const namespaced = model.candidates.find((c) => c.provider === "vendor");
+  assert.equal(namespaced?.sourceId, "ns/Claude Fable 5.1");
+  assert.equal(namespaced?.sourceKey, "ns/Claude Fable 5.1");
+  assert.equal(namespaced?.selected, false);
+  // Levels: the exact-spelling namespaced record hits literal level 0 while
+  // the separator-deleted maker/params records stay level 1.
+  const makerCand = model.candidates.find((c) => c.provider === "maker" && c.site === "models.dev");
+  assert.equal(makerCand?.level, 1);
+  assert.equal(makerCand?.sourceId, "ClaudeFable51");
+  const paramsCand = model.candidates.find((c) => c.site === "modelparams.dev");
+  assert.equal(paramsCand?.level, 1);
+  assert.equal(paramsCand?.sourceId, "claude-fable-5-1");
+  // Enumeration order of the source tables cannot change the outcome.
+  const reversed = tables({
+    modelsDev: {
+      providers: Object.fromEntries(Object.entries(t.modelsDev!.providers as Record<string, unknown>).reverse()),
+      models: t.modelsDev!.models,
+    },
+    modelparams: t.modelparams,
+  });
+  assert.deepEqual(compileCatalog(cfg(), ["Proxy/Claude Fable 5.1"], reversed).models[0], model);
+});
+
+test("compileCatalog: separator-deletion hits keep level ordering and literal 4th segment strict", () => {
+  const t = tables({
+    modelsDev: {
+      providers: {
+        a: {
+          models: {
+            "modelx20260101": { limit: { context: 10 } },
+            "ModelX": { limit: { context: 20 } },
+          },
+        },
+      },
+    },
+  });
+  const model = compileCatalog(cfg({ chain: ["models.dev/a/api_key"] }), ["gw/Model-X-20260101"], t).models[0];
+  const byLevel = (id: string) => model.candidates.find((c) => c.sourceId === id)?.level;
+  // Regex hit (separator swaps + delete) stays above the date-fallback hit.
+  assert.equal(byLevel("modelx20260101"), 1);
+  assert.equal(byLevel("ModelX"), 2);
+  assert.equal(model.entries[0].fields.context_window, 10);
+  // The literal 4th segment is still case- and separator-exact.
+  for (const lit of ["model-x", "ModelX"]) {
+    const strict = compileCatalog(
+      cfg({ chain: [`models.dev/a/api_key/${lit}`] }),
+      ["gw/anything"],
+      tables({ modelsDev: { providers: { a: { models: { "Model-X": { limit: { context: 7 } } } } } } }),
+    ).models[0];
+    assert.equal(strict.entries.length, 0, lit);
+  }
+  const exact = compileCatalog(
+    cfg({ chain: ["models.dev/a/api_key/Model-X"] }),
+    ["gw/anything"],
+    tables({ modelsDev: { providers: { a: { models: { "Model-X": { limit: { context: 7 } } } } } } }),
+  ).models[0];
+  assert.equal(exact.entries[0].fields.context_window, 7);
+});
+
+test("compileCatalog: separator-deletion candidates keep existing canonical ambiguity handling", () => {
+  // Both source ids reach the query at regex level 1 via separator swap;
+  // the two distinct creators still conflict on @creator instead of
+  // silently merging or first-wins.
+  const t = tables({
+    modelsDev: {
+      providers: {
+        "vendor-a": { models: { shared_m: { canonical_model_id: "vendor-a/shared-m", limit: { context: 1 } } } },
+        "vendor-b": { models: { "shared m": { canonical_model_id: "vendor-b/shared-m", limit: { context: 2 } } } },
+      },
+    },
+  });
+  assert.throws(() => compileCatalog(cfg(), ["gw/shared-m"], t), MetadataConfigError);
+  const explicit = compileCatalog(cfg({ chain: ["models.dev/vendor-a/api_key"] }), ["gw/shared-m"], t).models[0];
+  assert.deepEqual(explicit.entries.map((e) => e.entry), ["models.dev/vendor-a/api_key/shared_m"]);
+  assert.equal(explicit.entries[0].fields.context_window, 1);
 });
 
 test("probe: canonical-remap selected records remain export candidates", () => {
@@ -1013,24 +1160,19 @@ test("probe: same-owner ambiguity still allows an exact modelparams record", () 
   assert.throws(() => compileCatalog(cfg(), ["sensenova/deepseek-flash"], cross), MetadataConfigError);
 });
 
-test("probe: single boundary separators match, never delete", () => {
-  // One separator class per actual boundary run: ".x" interchanges with
-  // "-x" (one leading separator each) and so do trailing runs.
-  const leading = { a: { models: { "-x": probeRec("a/-x", 50) } } };
-  for (const q of [".x", "-x", " x"]) {
-    const m = compileCatalog(cfg({ chain: ["models.dev/a/api_key"] }), [q], tables({ modelsDev: { providers: leading } })).models[0];
+test("probe: boundary separators swap or delete within their count", () => {
+  // "-x" matches "x" and ".x" but never "--x"; trailing positions alike.
+  assert.deepEqual(sepCandidates("-x", ["x", ".x", "x-", "--x", "x__"]), [".x", "x"]);
+  assert.deepEqual(sepCandidates("x_", ["x", "x-", ".x", "x__", "--x"]), ["x", "x-"]);
+  // Each boundary separator still swaps across the whole class.
+  for (const q of [".x", "-x", " x", "_x"]) {
+    const m = sepCompile(q, ["-x"], 50);
     assert.equal(externalFields(m).context_window, 50, q);
   }
-  const trailing = { a: { models: { "x-": probeRec("a/x-", 60) } } };
-  for (const q of ["x.", "x-", "x_"]) {
-    const m = compileCatalog(cfg({ chain: ["models.dev/a/api_key"] }), [q], tables({ modelsDev: { providers: trailing } })).models[0];
+  for (const q of ["x.", "x-", "x_", "x "]) {
+    const m = sepCompile(q, ["x-"], 60);
     assert.equal(externalFields(m).context_window, 60, q);
   }
-  // Wrong side / missing separators must not match: "x" vs "-x" stays a miss.
-  const bare = compileCatalog(cfg({ chain: ["models.dev/a/api_key"] }), ["x"], tables({ modelsDev: { providers: leading } })).models[0];
-  assert.equal(bare.entries.length, 0);
-  const trailingBare = compileCatalog(cfg({ chain: ["models.dev/a/api_key"] }), ["x"], tables({ modelsDev: { providers: trailing } })).models[0];
-  assert.equal(trailingBare.entries.length, 0);
 });
 
 test("probe: every matched key/id spelling stays in exported candidates", () => {
