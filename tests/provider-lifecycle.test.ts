@@ -9,6 +9,7 @@ import {
   type AuthPrompt,
 } from "@earendil-works/pi-ai";
 import { createOpenAIApiProvider } from "../index.ts";
+import { readJsonBody } from "./fixtures/wire-decode.ts";
 
 const PROVIDER = "openai-api-extension";
 const BASE_URL_ENV = "OPENAI_API_EXTENSION_BASE_URL";
@@ -709,4 +710,305 @@ test("unknown config fields warn once and the rest of the config still applies",
   assert.equal(warnings.length, 1, "one aggregated note line per refresh");
   assert.match(warnings[0] ?? "", /unsupported_gateway_field/);
   assert.match(warnings[0] ?? "", /bogus_rule_field/);
+});
+
+// --- Transient catalog notifications (tasks 4.1-4.3) -------------------------
+// These go through the extension default export's registered handlers: the
+// provider is captured from pi.registerProvider, the session context from the
+// registered session_start/session_shutdown handlers, and refreshModels runs
+// the real fetch->compile->publish path against a loopback gateway.
+
+type SessionHandler = (event: unknown, ctx: unknown) => unknown;
+
+async function loadExtension() {
+  const extension = (await import("../index.ts")).default;
+  const handlers = new Map<string, SessionHandler>();
+  const registered: { provider?: ReturnType<typeof createOpenAIApiProvider> } = {};
+  let appended = 0;
+  const pi = {
+    on: (name: string, handler: SessionHandler) => { handlers.set(name, handler); },
+    registerCommand: () => {},
+    registerProvider: (provider: ReturnType<typeof createOpenAIApiProvider>) => { registered.provider = provider; },
+    registerEntryRenderer: () => { throw new Error("entry renderers must not be registered"); },
+    appendEntry: () => { appended++; },
+  };
+  await extension(pi as never);
+  assert.ok(registered.provider, "provider registered");
+  return { handlers, provider: registered.provider, appends: () => appended };
+}
+
+function notifyContext(hasUI: boolean, sink: { message: string; type?: string }[]) {
+  return {
+    hasUI,
+    ui: { notify: (message: string, type?: string) => sink.push({ message, type }) },
+    sessionManager: { getSessionId: () => "test" },
+    cwd: process.cwd(),
+    isProjectTrusted: () => true,
+  };
+}
+
+function refreshContext(credential: { key: string; baseUrl: string }, published: boolean[] = []) {
+  return {
+    credential: { type: "api_key" as const, key: credential.key, env: { [BASE_URL_ENV]: credential.baseUrl } },
+    stored: undefined,
+    publish: async () => (published.push(true), true),
+    allowNetwork: true,
+    signal: new AbortController().signal,
+  };
+}
+
+test("enrichment keeps the original public id and gateway display name on the wire", { timeout: 10_000 }, async () => {
+  // The metadata source renames the model (external `name` + canonical id),
+  // but the published model and the Responses request model stay the
+  // upstream identity; only capability fields are adopted.
+  const FIXTURE: SourceTables = {
+    modelsDev: {
+      providers: {
+        acme: {
+          models: {
+            "wire-m": {
+              name: "External Display Name",
+              canonical_model_id: "acme/wire-m",
+              limit: { context: 555000, output: 4444 },
+            },
+          },
+        },
+      },
+      models: { "acme/wire-m": { name: "External Display Name", limit: { context: 555000 } } },
+    },
+    modelparams: { catalog: [] },
+    degraded: [],
+  };
+  metadataEnv(undefined, FIXTURE);
+  const bodies: Record<string, unknown>[] = [];
+  const server = createServer(async (request, response) => {
+    if (request.url?.startsWith("/v1/models")) {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({
+        models: [{ slug: "wire-m", name: "Gateway Wire", context_window: 64000 }],
+      }));
+      return;
+    }
+    try {
+      bodies.push(await readJsonBody(request) as Record<string, unknown>);
+      const message = {
+        id: "msg_wire_1", type: "message", role: "assistant", status: "completed",
+        content: [{ type: "output_text", text: "wire ok", annotations: [] }],
+      };
+      response.writeHead(200, { "content-type": "text/event-stream", connection: "close" });
+      for (const event of [
+        { type: "response.created", response: { id: "resp_wire_1" } },
+        { type: "response.output_item.added", output_index: 0, item: message },
+        { type: "response.output_text.delta", output_index: 0, content_index: 0, delta: "wire ok" },
+        { type: "response.output_item.done", output_index: 0, item: message },
+        { type: "response.completed", response: { id: "resp_wire_1", status: "completed", output: [message],
+          usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } } },
+      ]) response.write(`data: ${JSON.stringify(event)}\n\n`);
+      response.end("data: [DONE]\n\n");
+    } catch {
+      response.writeHead(400, { connection: "close" }).end("Invalid request body");
+    }
+  });
+  servers.push(server);
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  const baseUrl = `http://127.0.0.1:${address.port}/v1`;
+  const credentials = new InMemoryCredentialStore();
+  await credentials.modify(PROVIDER, async () => ({
+    type: "api_key", key: "test-key", env: { [BASE_URL_ENV]: baseUrl },
+  }));
+  const models = createModels({ credentials, authContext: authContext() });
+  const provider = createOpenAIApiProvider([], undefined, undefined, undefined, undefined, currentDeps);
+  models.setProvider(provider);
+  const result = await models.refresh();
+  assert.equal(result.errors.size, 0);
+  const model = models.getModel(PROVIDER, "wire-m");
+  assert.ok(model, "public id unchanged");
+  assert.equal(model?.name, "Gateway Wire", "external name must not replace the gateway display name");
+  assert.equal(model?.contextWindow, 555000, "capability fields still merge");
+  assert.equal(models.getModel(PROVIDER, "acme/wire-m"), undefined, "no new public model");
+  const out = await provider.streamSimple(model!, {
+    systemPrompt: "s", messages: [{ role: "user", content: "hi", timestamp: 1 }],
+  }, { transport: "sse", sessionId: "wire-m-session", apiKey: "test-key", maxRetries: 0,
+    signal: AbortSignal.timeout(5_000) }).result();
+  assert.equal(out.stopReason, "stop", out.errorMessage);
+  assert.equal(bodies[0]?.model, "wire-m", "request model is the original public id");
+});
+
+test("catalog notes notify the live UI context and never append session entries", async () => {
+  metadataEnv(undefined);
+  const gatewayServer = await gateway("totally-unmatched-xyz", "test-key", false);
+  const { handlers, provider, appends } = await loadExtension();
+  const ui: { message: string; type?: string }[] = [];
+  handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, notifyContext(true, ui));
+  const stderr: string[] = [];
+  const originalError = console.error;
+  console.error = (...args: unknown[]) => stderr.push(args.join(" "));
+  try {
+    await provider.refreshModels?.(refreshContext({ key: "test-key", baseUrl: gatewayServer.baseUrl }) as never);
+  } finally {
+    console.error = originalError;
+  }
+  assert.equal(appends(), 0, "no session entries may be appended");
+  assert.ok(ui.some((n) => n.type === "info" && /unmatched/.test(n.message)), JSON.stringify(ui));
+  assert.deepEqual(stderr, [], "with UI nothing goes to stderr");
+  const categories = ui.find((n) => /metadata match:/.test(n.message))?.message ?? "";
+  assert.match(categories, /0 complete, 0 partial-source-missing, 1 unmatched of 1 enabled/);
+});
+
+test("without UI or context diagnostics go to stderr only, stdout stays clean", async () => {
+  metadataEnv(undefined);
+  const gatewayServer = await gateway("totally-unmatched-stderr", "test-key", false);
+  const { handlers, provider, appends } = await loadExtension();
+  const ui: { message: string; type?: string }[] = [];
+  handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, notifyContext(false, ui));
+  const stderr: string[] = [];
+  const stdout: string[] = [];
+  const originalError = console.error;
+  const originalLog = console.log;
+  console.error = (...args: unknown[]) => stderr.push(args.join(" "));
+  console.log = (...args: unknown[]) => stdout.push(args.join(" "));
+  try {
+    await provider.refreshModels?.(refreshContext({ key: "test-key", baseUrl: gatewayServer.baseUrl }) as never);
+  } finally {
+    console.error = originalError;
+    console.log = originalLog;
+  }
+  assert.equal(appends(), 0);
+  assert.deepEqual(ui, [], "non-UI context never calls ui.notify");
+  assert.deepEqual(stdout, [], "stdout stays clean");
+  assert.ok(stderr.some((line) => /\[openai-api-extension\]/.test(line) && /unmatched/.test(line)), JSON.stringify(stderr));
+});
+
+test("session_shutdown clears the context: later diagnostics use stderr", async () => {
+  metadataEnv(undefined);
+  const gatewayServer = await gateway("totally-unmatched-shutdown", "test-key", false);
+  const { handlers, provider } = await loadExtension();
+  const ui: { message: string; type?: string }[] = [];
+  handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, notifyContext(true, ui));
+  await handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "quit" }, undefined);
+  const stderr: string[] = [];
+  const originalError = console.error;
+  console.error = (...args: unknown[]) => stderr.push(args.join(" "));
+  try {
+    await provider.refreshModels?.(refreshContext({ key: "test-key", baseUrl: gatewayServer.baseUrl }) as never);
+  } finally {
+    console.error = originalError;
+  }
+  assert.deepEqual(ui, [], "stale UI context must not be reused");
+  assert.ok(stderr.some((line) => /unmatched/.test(line)));
+});
+
+test("superseded publish reports no stale notes; empty report resets dedupe", async () => {
+  metadataEnv(undefined);
+  const gatewayServer = await gateway("totally-unmatched-stale", "test-key", false);
+  const { handlers, provider } = await loadExtension();
+  const ui: { message: string; type?: string }[] = [];
+  handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, notifyContext(true, ui));
+
+  // A publish that returns false (superseded/aborted) must not notify.
+  const rejected = {
+    ...refreshContext({ key: "test-key", baseUrl: gatewayServer.baseUrl }),
+    publish: async () => false,
+  };
+  await provider.refreshModels?.(rejected as never);
+  assert.deepEqual(ui, [], "unpublished refresh must not report notes");
+
+  // Two identical reports: only the first notifies; a clean refresh resets.
+  await provider.refreshModels?.(refreshContext({ key: "test-key", baseUrl: gatewayServer.baseUrl }) as never);
+  const firstCount = ui.length;
+  await provider.refreshModels?.(refreshContext({ key: "test-key", baseUrl: gatewayServer.baseUrl }) as never);
+  assert.equal(ui.length, firstCount, "identical consecutive report is suppressed");
+});
+
+test("a throwing notifier falls back to stderr without hiding the refresh result", async () => {
+  metadataEnv(undefined);
+  const gatewayServer = await gateway("totally-unmatched-throw", "test-key", false);
+  const { handlers, provider } = await loadExtension();
+  handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, {
+    hasUI: true,
+    ui: { notify: () => { throw new Error("notify boom"); } },
+    sessionManager: { getSessionId: () => "test" },
+    cwd: process.cwd(),
+    isProjectTrusted: () => true,
+  });
+  const stderr: string[] = [];
+  const originalError = console.error;
+  console.error = (...args: unknown[]) => stderr.push(args.join(" "));
+  try {
+    // The refresh itself succeeds; the broken notifier must not convert it
+    // into an error and the diagnostic still lands on stderr.
+    await provider.refreshModels?.(refreshContext({ key: "test-key", baseUrl: gatewayServer.baseUrl }) as never);
+  } finally {
+    console.error = originalError;
+  }
+  assert.ok(stderr.some((line) => /unmatched/.test(line)), JSON.stringify(stderr));
+});
+
+test("config error reports an error notification and keeps the old catalog", async () => {
+  metadataEnv("fill_missing_only: maybe");
+  const gatewayServer = await gateway("cfg-model", "test-key");
+  const { handlers, provider, appends } = await loadExtension();
+  const ui: { message: string; type?: string }[] = [];
+  handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, notifyContext(true, ui));
+  await assert.rejects(
+    provider.refreshModels?.(refreshContext({ key: "test-key", baseUrl: gatewayServer.baseUrl }) as never),
+    /fill_missing_only/,
+  );
+  assert.equal(appends(), 0);
+  assert.ok(ui.some((n) => n.type === "error" && /fill_missing_only/.test(n.message)), JSON.stringify(ui));
+  assert.doesNotMatch(ui.map((n) => n.message).join("\n"), /test-key/, "credential must be redacted");
+});
+
+test("matchCategories: mutually exclusive, conservative, name-only is not a hit", async () => {
+  const { matchCategories, mapCompiledCatalog } = await import("../index.ts");
+  const { compileCatalog } = await import("../model-metadata.ts");
+  const { parseMetadataConfig } = await import("../metadata-config.ts");
+  const t = {
+    modelsDev: {
+      providers: {
+        acme: { models: { "full-m": { canonical_model_id: "acme/full-m", limit: { context: 64 } } } },
+      },
+      models: {},
+    },
+    modelparams: { catalog: [] },
+    degraded: [],
+  };
+  const config = parseMetadataConfig(`models:
+  - match: "full-m"
+    chain: ["models.dev/@creator/api_key"]
+  - match: "off-m"
+    chain: []
+  - match: "name-m"
+    chain: ["models.dev/acme/api_key/name-m"]
+`);
+  const compiled = compileCatalog(config, ["full-m", "partial-m", "none-m", "name-m", "off-m"], {
+    ...t,
+    modelsDev: {
+      providers: {
+        acme: {
+          models: {
+            "full-m": { canonical_model_id: "acme/full-m", limit: { context: 64 } },
+            "partial-m": { canonical_model_id: "acme/partial-m", limit: { context: 65 } },
+            "name-m": { name: "Only A Name" },
+          },
+        },
+      },
+      models: {},
+    },
+  });
+  // partial-m: models.dev hits but the modelparams entry stays unresolved.
+  const categories = matchCategories(compiled.models);
+  assert.deepEqual(categories, { complete: 1, partial: 1, unmatched: 2, disabled: 1 });
+  const total = categories.complete + categories.partial + categories.unmatched;
+  assert.equal(total, 4, "enabled models conserve");
+  // Name-only enrichment produces a note counting it as unmatched.
+  const out = mapCompiledCatalog(
+    ["full-m", "partial-m", "none-m", "name-m", "off-m"].map((id) => ({ id })),
+    "http://127.0.0.1:1/v1",
+    compiled,
+  );
+  const note = out.notes.find((n) => /metadata match:/.test(n));
+  assert.match(note ?? "", /1 complete, 1 partial-source-missing, 2 unmatched of 4 enabled \(1 with external chain disabled\)/);
 });

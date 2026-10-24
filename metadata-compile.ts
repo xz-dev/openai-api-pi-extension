@@ -51,8 +51,8 @@ function packageVersion(dir: string): string | undefined {
 
 export type CompileResult = {
   catalog: CompiledCatalog;
-  /** Sites whose package could not be loaded; their chain entries degrade. */
-  degraded: { site: "models.dev" | "modelparams.dev"; reason: string }[];
+  /** Sites/shapes whose package data could not be loaded; those steps degrade. */
+  degraded: { site: "models.dev" | "modelparams.dev"; reason: string; scope?: "providers" | "models" }[];
 };
 
 /** Test seam: supply SourceTables without loading the real packages. */
@@ -67,6 +67,9 @@ export type CompileDeps = {
   loadTables?: TablesLoader;
   /** JSON file the Worker reads instead of the real packages. */
   tablesPath?: string;
+  /** Module path the Worker imports instead of the installed models.dev
+   * snapshot — exercises the real per-shape validation (test-only). */
+  modelsDevSnapshotOverride?: string;
 };
 
 /** Which sites the effective chains need; `null` = nothing needed. */
@@ -135,7 +138,7 @@ export async function compileCatalogInWorker(
     const catalog = compileCatalog(config, publicIds, { degraded: [] });
     return { catalog, degraded: [] };
   }
-  const degraded: { site: "models.dev" | "modelparams.dev"; reason: string }[] = [];
+  const degraded: { site: "models.dev" | "modelparams.dev"; reason: string; scope?: "providers" | "models" }[] = [];
   let modelsDevDir: string | undefined;
   let modelparamsDir: string | undefined;
   // With a tables file the worker reads fixture data instead of packages.
@@ -177,6 +180,7 @@ export async function compileCatalogInWorker(
         publicIds,
         neededSites: [...sites],
         modelsDevSnapshotPath: modelsDevDir ? join(modelsDevDir, "dist", "snapshot.js") : undefined,
+        modelsDevSnapshotOverride: deps?.modelsDevSnapshotOverride,
         modelparamsPath: modelparamsDir ? join(modelparamsDir, "dist", "index.js") : undefined,
         modelsDevVersion: modelsDevDir ? packageVersion(modelsDevDir) : undefined,
         modelparamsVersion: modelparamsDir ? packageVersion(modelparamsDir) : undefined,

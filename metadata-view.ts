@@ -5,6 +5,7 @@
  * unresolved entries, and the final overrides patch. Never prints the API
  * key — callers pass only compiled data and config, not credentials.
  */
+import { classifyModelMatch } from "./model-metadata.ts";
 import type { CompiledCatalog, CompiledModel } from "./model-metadata.ts";
 
 /**
@@ -51,9 +52,31 @@ export function sanitizeTerminalText(text: string): string {
 }
 
 function formatEntryFields(model: CompiledModel): string[] {
-  return model.entries.map(
-    (entry) => `    ${entry.entry} -> ${Object.keys(entry.fields).join(", ") || "(no fields)"}`,
-  );
+  return model.entries.map((entry) => {
+    const fields = Object.entries(entry.fields).map(([key, value]) => {
+      const source = entry.fieldSources?.[key];
+      // undefined = a provider record; unified fills are marked "canonical".
+      return source === "canonical" ? `${key}[canonical]` : key;
+    });
+    return `    ${entry.entry} -> ${fields.join(", ") || "(no fields)"}`;
+  });
+}
+
+function formatCandidates(model: CompiledModel): string[] {
+  if (model.candidates.length === 0) return [];
+  const lines = ["  candidates:"];
+  for (const candidate of model.candidates) {
+    const status = candidate.selected ? "selected" : "skipped";
+    const canonical = candidate.canonical ? ` canonical:${candidate.canonical}` : "";
+    const kind = candidate.kind === "provider" ? "" : ` kind:${candidate.kind}`;
+    const sourceKey = candidate.sourceKey === candidate.sourceId ? "" : ` key:${candidate.sourceKey}`;
+    const reason = candidate.reason ? ` (${candidate.reason})` : "";
+    lines.push(
+      `    ${candidate.site}/${candidate.provider}/${candidate.access}/${candidate.sourceId} ` +
+        `[level ${candidate.level}]${kind}${sourceKey} ${status}${canonical}${reason}`,
+    );
+  }
+  return lines;
 }
 
 export function renderCompiledCatalog(compiled: CompiledCatalog): string {
@@ -78,13 +101,29 @@ export function renderCompiledCatalog(compiled: CompiledCatalog): string {
   for (const item of compiled.degraded) lines.push(`degraded: ${item.site}: ${item.reason}`);
   if (compiled.warnings.length > 0) lines.push(`ignored fields: ${compiled.warnings.join(", ")}`);
   lines.push("");
+  // Hit-classification summary: complete / partial-source-missing /
+  // unmatched over enabled chains, with disabled models listed separately.
+  const counts = { complete: 0, partial: 0, unmatched: 0, disabled: 0 };
+  for (const model of compiled.models) counts[classifyModelMatch(model)] += 1;
+  lines.push("== match summary ==");
+  const enabled = counts.complete + counts.partial + counts.unmatched;
+  lines.push(
+    `complete ${counts.complete}  partial ${counts.partial}  unmatched ${counts.unmatched}` +
+      `  (enabled ${enabled}, disabled ${counts.disabled})`,
+  );
+  lines.push("");
   lines.push("== models ==");
   for (const model of compiled.models) {
     lines.push(`${model.publicId}`);
     lines.push(`  rules: ${model.matchedRules.length > 0 ? model.matchedRules.map((n) => `[${n}]`).join(" ") : "(none)"}  fill_missing_only: ${model.fillMissingOnly}`);
+    if (model.canonical) lines.push(`  canonical: ${model.canonical}`);
     if (model.entries.length === 0 && model.unresolved.length === 0) lines.push("    (no external chain)");
     lines.push(...formatEntryFields(model));
     for (const miss of model.unresolved) lines.push(`    ${miss}  [unresolved]`);
+    for (const skipped of model.skippedEntries ?? []) {
+      lines.push(`    skipped: ${skipped.entry} (${skipped.reason})`);
+    }
+    lines.push(...formatCandidates(model));
     if (model.overridePatches.length > 0) lines.push(`  overrides: ${model.overridePatches.map(redactJson).join(" then ")}`);
   }
   return sanitizeTerminalText(lines.join("\n") + "\n");

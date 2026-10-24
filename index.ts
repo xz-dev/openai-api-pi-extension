@@ -30,10 +30,13 @@ import { adoptResponseAncestry, checkpointCandidate, checkpointsEnabled, encodeC
   type ResponseAncestryState } from "./checkpoint-adapter.ts";
 import { compileCatalogInWorker } from "./metadata-compile.ts";
 import {
+  externalFields,
+  fieldIsMissing,
   makeResolver,
   mergePatch,
   MetadataConfigError,
   type CompiledCatalog,
+  type CompiledModel,
 } from "./model-metadata.ts";
 import { parseMetadataConfig } from "./metadata-config.ts";
 import { renderCompiledCatalog, sanitizeTerminalText } from "./metadata-view.ts";
@@ -84,8 +87,6 @@ const PROVIDER_NAME = "OpenAI API Extension";
 const ENV_BASE_URL = "OPENAI_API_EXTENSION_BASE_URL";
 const ENV_API_KEY = "OPENAI_API_EXTENSION_API_KEY";
 const DEFAULT_BASE_URL = "https://api.openai.com/v1";
-const ERROR_ENTRY = "openai-api-extension.error";
-const NOTE_ENTRY = "openai-api-extension.note";
 const CONNECTION_TIMEOUT_MS = 15_000;
 /** Ported omniroute fallback: gateways may omit limits; never reject the catalog for it. */
 const DEFAULT_CONTEXT_WINDOW = 128_000;
@@ -241,10 +242,11 @@ export function mapModel(
     ),
   );
   const inputModalities = pick("input_modalities");
-  const name = firstString(meta.name, meta.display_name) ?? identity.name;
+  // The display name is always the gateway's own (name/display_name, else id);
+  // external metadata names never replace it — only user overrides can.
   return {
     id: identity.id,
-    name,
+    name: identity.name,
     provider: PROVIDER,
     api: "openai-responses",
     baseUrl,
@@ -416,17 +418,70 @@ export function mapCompiledCatalog(
     ? [`ignored unsupported fields: ${compiled.warnings.join(", ")}`]
     : [];
   for (const item of compiled.degraded) {
-    notes.push(`metadata source ${item.site} unavailable (${item.reason}); using upstream values`);
+    const scope = item.scope ? ` ${item.scope}` : "";
+    notes.push(`metadata source ${item.site}${scope} unavailable (${item.reason}); using upstream values`);
   }
-  const unresolvedModels = compiled.models.filter((model) => model.unresolved.length > 0);
-  if (unresolvedModels.length > 0) {
+  const categories = matchCategories(compiled.models);
+  const enabled = categories.complete + categories.partial + categories.unmatched;
+  if (enabled > 0 && (categories.partial > 0 || categories.unmatched > 0)) {
     notes.push(
-      `metadata chain entries unresolved for ${unresolvedModels.length} model(s): ` +
-        unresolvedModels.slice(0, 5).map((model) => model.publicId).join(", ") +
-        (unresolvedModels.length > 5 ? ` and ${unresolvedModels.length - 5} more` : ""),
+      `metadata match: ${categories.complete} complete, ${categories.partial} partial-source-missing, ` +
+        `${categories.unmatched} unmatched of ${enabled} enabled` +
+        (categories.disabled > 0 ? ` (${categories.disabled} with external chain disabled)` : ""),
     );
   }
   return { models, notes };
+}
+
+/**
+ * Capability keys that count as real external metadata; a `name`-only record
+ * is not a capability hit.
+ */
+const CAPABILITY_KEYS = new Set([
+  "context_window",
+  "max_input_tokens",
+  "max_output_tokens",
+  "supported_reasoning_levels",
+  "default_reasoning_level",
+  "input_modalities",
+  "output_modalities",
+]);
+
+/** True when the compiled model gained at least one valid capability field. */
+function hasCapabilityField(model: CompiledModel): boolean {
+  const fields = externalFields(model);
+  return Object.keys(fields).some(
+    (key) => CAPABILITY_KEYS.has(key) && !fieldIsMissing(key, fields[key]),
+  );
+}
+
+/**
+ * Per-model match categories over the compiled catalog. Models with an
+ * enabled external chain are complete (capability fields, nothing
+ * unresolved), partial-source-missing (capability fields but some entry
+ * unresolved), or fully unmatched (no capability field at all). Models whose
+ * effective chain is empty are counted separately as disabled — never as
+ * match failures. The four buckets are mutually exclusive and conservative.
+ */
+export function matchCategories(models: readonly CompiledModel[]): {
+  complete: number;
+  partial: number;
+  unmatched: number;
+  disabled: number;
+} {
+  const out = { complete: 0, partial: 0, unmatched: 0, disabled: 0 };
+  for (const model of models) {
+    if (model.entries.length === 0 && model.unresolved.length === 0) {
+      out.disabled += 1;
+    } else if (!hasCapabilityField(model)) {
+      out.unmatched += 1;
+    } else if (model.unresolved.length > 0) {
+      out.partial += 1;
+    } else {
+      out.complete += 1;
+    }
+  }
+  return out;
 }
 
 /**
@@ -622,19 +677,22 @@ export function createOpenAIApiProvider(
       try {
         const { models: refreshed, notes } = await fetchEnrichedCatalog(baseUrl, apiKey, context.signal, metadataDeps);
         if (context.signal.aborted) return;
+        // Report only after the publish is accepted: an aborted or superseded
+        // refresh must not surface notes for a catalog that never went live.
+        const published = await context.publish({
+          persist: { models: refreshed, checkedAt: Date.now() },
+          update: () => { models = refreshed; },
+        });
+        if (published === false) return;
         try {
           onCatalogNotes?.(notes);
         } catch {
           /* reporter must not mask the refresh */
         }
-        await context.publish({
-          persist: { models: refreshed, checkedAt: Date.now() },
-          update: () => { models = refreshed; },
-        });
       } catch (error) {
         if (!isAbortError(error, context.signal)) {
           try {
-            onCatalogError?.(errorMessage(error));
+            onCatalogError?.(errorMessage(error).split(apiKey).join("[REDACTED]"));
           } catch {
             /* reporter must not mask the catalog error */
           }
@@ -682,47 +740,37 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     const messages = adoptResponseAncestry(event.messages, ctx.sessionManager);
     return messages ? { messages } : undefined;
   });
-  const renderEntry = (style: (text: string) => string) =>
-    (entry: { data?: unknown }, _options: unknown, _theme: unknown) => {
-      const message =
-        typeof (entry.data as { message?: unknown } | undefined)?.message === "string"
-          ? (entry.data as { message: string }).message
-          : "catalog refresh failed";
-      return {
-        render(width: number) {
-          const text = `[openai-api-extension] ${message}`;
-          const size = Math.max(width, 1);
-          const lines: string[] = [];
-          for (let i = 0; i < text.length; i += size) lines.push(style(text.slice(i, i + size)));
-          return lines;
-        },
-        invalidate() {},
-      };
-    };
-  pi.registerEntryRenderer(ERROR_ENTRY, (entry, _options, theme) =>
-    renderEntry((text) => theme.fg("error", text))(entry, _options, theme),
-  );
-  pi.registerEntryRenderer(NOTE_ENTRY, (entry, _options, theme) =>
-    renderEntry((text) => theme.fg("dim", text))(entry, _options, theme),
-  );
-  const reportCatalogError = (message: string) => {
+  // Catalog diagnostics are transient: with a UI context they go through the
+  // native notify channel; without UI/context they are written to stderr only.
+  // Nothing is appended to the session, and stdout stays protocol-clean.
+  let sessionContext: { hasUI: boolean; ui: { notify(message: string, type?: "info" | "warning" | "error"): void } } | undefined;
+  const emitDiagnostic = (severity: "info" | "warning" | "error", message: string) => {
+    const text = sanitizeTerminalText(message);
     try {
-      pi.appendEntry(ERROR_ENTRY, { message });
+      const ctx = sessionContext;
+      if (ctx?.hasUI) {
+        ctx.ui.notify(text, severity);
+      } else {
+        console.error(`[openai-api-extension] ${text}`);
+      }
     } catch {
-      console.warn(`[openai-api-extension] ${message}`);
+      // A failing notifier must never hide the original diagnostic.
+      try {
+        console.error(`[openai-api-extension] ${text}`);
+      } catch {
+        /* stderr itself failed; the refresh error still propagates */
+      }
     }
   };
+  const reportCatalogError = (message: string) => emitDiagnostic("error", message);
   // Suppress only notes identical to the immediately previous report — login
   // validation, refreshes and the metadata commands can compile the same
-  // catalog back to back. When a note drops out of a report it may resurface.
+  // catalog back to back. When a note drops out of a report it may resurface,
+  // and an empty report clears the dedupe state.
   const noteDedupe = makeConsecutiveNoteDedupe();
   const reportCatalogNotes = (notes: readonly string[]) => {
     for (const note of noteDedupe(notes)) {
-      try {
-        pi.appendEntry(NOTE_ENTRY, { message: `metadata note: ${note}` });
-      } catch {
-        console.warn(`[openai-api-extension] metadata note: ${note}`);
-      }
+      emitDiagnostic("info", `metadata note: ${note}`);
     }
   };
   const getTransport = (ctx: { cwd: string; isProjectTrusted(): boolean }) => {
@@ -827,7 +875,14 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     },
   });
   let settingsContext: { cwd: string; isProjectTrusted(): boolean } | undefined;
-  pi.on("session_start", async (_event, ctx) => { settingsContext = ctx; });
+  pi.on("session_start", async (_event, ctx) => {
+    settingsContext = ctx;
+    // Latest interactive context wins; a stale reference is dropped on shutdown.
+    sessionContext = ctx;
+  });
+  pi.on("session_shutdown", async () => {
+    sessionContext = undefined;
+  });
   pi.registerProvider(createOpenAIApiProvider([], reportCatalogError, () => {
     try {
       const settings = SettingsManager.create(settingsContext?.cwd ?? process.cwd(), getAgentDir(), {

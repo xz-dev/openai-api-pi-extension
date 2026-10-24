@@ -147,3 +147,124 @@ test("real Worker: empty chain never spawns and yields a no-entry catalog", asyn
   assert.equal(degraded.length, 0);
   assert.equal(catalog.models[0].entries.length, 0);
 });
+
+// --- dual-shape models.dev data (fix-metadata-query-expansion, task 2.3) -----
+
+const UNIFIED_ONLY_TABLES: SourceTables = {
+  degraded: [],
+  // No providers shape at all: only the unified canonical models table.
+  modelsDev: {
+    models: {
+      "openai/gpt-5-codex": { name: "GPT-5 Codex", limit: { context: 400000, input: 272000, output: 128000 } },
+    },
+  },
+  modelparams: { catalog: [] },
+};
+
+test("real Worker: canonical-only tables still enrich through the worker channel", async () => {
+  const dir = agentDir(undefined);
+  const fixture = join(dir, "tables.json");
+  writeFileSync(fixture, JSON.stringify(UNIFIED_ONLY_TABLES));
+  const { catalog } = await compileCatalogInWorker(
+    parseMetadataConfig(undefined),
+    ["gw/gpt-5-codex"],
+    { tablesPath: fixture },
+  );
+  const model = catalog.models[0];
+  const entry = model.entries.find((e) => e.site === "models.dev");
+  assert.ok(entry, JSON.stringify(model));
+  assert.equal(entry.entry, "models.dev/openai/api_key/gpt-5-codex");
+  assert.equal(entry.fields.context_window, 400000);
+  assert.equal(entry.fieldSources?.context_window, "canonical");
+}, { timeout: 60_000 });
+
+test("real Worker: providers shape missing degrades independently", async () => {
+  const dir = agentDir(undefined);
+  const fixture = join(dir, "tables.json");
+  writeFileSync(fixture, JSON.stringify({
+    ...UNIFIED_ONLY_TABLES,
+    degraded: [{ site: "models.dev", reason: "providers shape invalid", scope: "providers" }],
+  }));
+  const { catalog } = await compileCatalogInWorker(
+    parseMetadataConfig(undefined),
+    ["gw/gpt-5-codex"],
+    { tablesPath: fixture },
+  );
+  assert.ok(catalog.degraded.some((d) => d.site === "models.dev" && d.scope === "providers"));
+  const entry = catalog.models[0].entries.find((e) => e.site === "models.dev");
+  assert.ok(entry, "unified canonical data still enriches without providers");
+  assert.equal(entry.fields.context_window, 400000);
+}, { timeout: 60_000 });
+
+test("real Worker: compiled result carries candidates and field provenance", async () => {
+  const dir = agentDir(undefined);
+  const fixture = join(dir, "tables.json");
+  writeFileSync(fixture, JSON.stringify({
+    degraded: [],
+    modelsDev: {
+      providers: {
+        strictai: { models: { "cap-m": { canonical_model_id: "strictai/cap-m", limit: { context: 200000 } } } },
+      },
+      models: { "strictai/cap-m": { limit: { context: 1000000, output: 64000 } } },
+    },
+    modelparams: { catalog: [] },
+  }));
+  const { catalog } = await compileCatalogInWorker(
+    parseMetadataConfig(undefined),
+    ["gw/cap-m"],
+    { tablesPath: fixture },
+  );
+  const model = catalog.models[0];
+  const entry = model.entries.find((e) => e.site === "models.dev");
+  assert.ok(entry);
+  assert.equal(entry.fields.context_window, 200000);
+  assert.equal(entry.fields.max_output_tokens, 64000);
+  assert.equal(entry.fieldSources?.context_window, "provider");
+  assert.equal(entry.fieldSources?.max_output_tokens, "canonical");
+  assert.ok(model.candidates.some((c) => c.sourceId === "cap-m" && c.selected));
+}, { timeout: 60_000 });
+
+test("real Worker: array-valued providers/models are degraded via the module path", async () => {
+  // A fake snapshot module exercises the REAL shape-validation path inside
+  // the worker (tablesPath would bypass it). Array providers degrade while
+  // the valid models shape still enriches, and vice versa.
+  const dir = agentDir(undefined);
+  const fixture = join(dir, "snapshot.mjs");
+  writeFileSync(
+    fixture,
+    `export const generatedAt = "2026-10-24";\n` +
+      `export const providers = [];\n` +
+      `export const models = { "openai/gpt-5-codex": { name: "GPT-5 Codex", limit: { context: 400000, output: 128000 } } };\n`,
+  );
+  const { catalog, degraded } = await compileCatalogInWorker(
+    parseMetadataConfig("chain: [\"models.dev/@creator/api_key\"]"),
+    ["gw/gpt-5-codex"],
+    { modelsDevSnapshotOverride: fixture },
+  );
+  assert.ok(
+    catalog.degraded.some((d) => d.site === "models.dev" && d.scope === "providers"),
+    JSON.stringify(catalog.degraded),
+  );
+  const entry = catalog.models[0].entries.find((e) => e.site === "models.dev");
+  assert.ok(entry, "valid models shape stays usable when providers is an array");
+  assert.equal(entry.fields.context_window, 400000);
+  assert.equal(entry.fieldSources?.context_window, "canonical");
+
+  // Inverse: valid providers + array models still use provider records.
+  const fixture2 = join(dir, "snapshot2.mjs");
+  writeFileSync(
+    fixture2,
+    `export const providers = { a: { models: { x: { canonical_model_id: "a/x", limit: { context: 42 } } } } };\n` +
+      `export const models = [];\n`,
+  );
+  const { catalog: catalog2 } = await compileCatalogInWorker(
+    parseMetadataConfig("chain: [\"models.dev/@creator/api_key\"]"),
+    ["x"],
+    { modelsDevSnapshotOverride: fixture2 },
+  );
+  assert.ok(catalog2.degraded.some((d) => d.site === "models.dev" && d.scope === "models"));
+  const entry2 = catalog2.models[0].entries.find((e) => e.site === "models.dev");
+  assert.ok(entry2, "provider records stay usable when models is an array");
+  assert.equal(entry2.fields.context_window, 42);
+  assert.equal(entry2.fieldSources?.context_window, "provider");
+}, { timeout: 60_000 });

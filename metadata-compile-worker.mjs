@@ -1,9 +1,11 @@
 /**
  * Worker body: imports the two metadata packages by explicit file path
  * (bare subpath imports do not resolve the extension's node_modules under
- * the Bun-compiled Pi host), rebuilds SourceTables, runs compileCatalog, and
- * posts back only the compiled result. The 6.9 MB snapshot and its object
- * graph die with this worker; the main thread never imports either package.
+ * the Bun-compiled Pi host), rebuilds SourceTables — the models.dev
+ * provider records AND the canonical-keyed unified model data, each
+ * validated independently — runs compileCatalog, and posts back only the
+ * compiled result. The 6.9 MB snapshot and its object graph die with this
+ * worker; the main thread never imports either package.
  */
 import { parentPort, workerData } from "node:worker_threads";
 
@@ -12,6 +14,10 @@ const {
   publicIds,
   neededSites = ["models.dev", "modelparams.dev"],
   modelsDevSnapshotPath,
+  // Test seam: a module path standing in for the installed snapshot module
+  // exercises the REAL shape-validation path (arrays/nulls degrade) without
+  // bypassing it via a pre-built tables file.
+  modelsDevSnapshotOverride,
   modelparamsPath,
   modelsDevVersion,
   modelparamsVersion,
@@ -26,8 +32,8 @@ if (workerData.tablesPath) {
   // Fixture channel: read SourceTables JSON inside the worker so tests
   // exercise the real spawn + compile path with deterministic data.
   const { readFileSync } = await import("node:fs");
-  tables = { ...JSON.parse(readFileSync(workerData.tablesPath, "utf8")), degraded };
-  tables.degraded = [...(tables.degraded ?? []), ...degraded];
+  const fixture = JSON.parse(readFileSync(workerData.tablesPath, "utf8"));
+  tables = { ...fixture, degraded: [...(fixture.degraded ?? []), ...degraded] };
 }
 
 // Only load the sites the effective chains actually need.
@@ -36,13 +42,27 @@ try {
     // skipped
   } else if (!modelsDevSnapshotPath) throw new Error("@opencode-ai/models package not installed");
   else {
-    const snapshot = await import(modelsDevSnapshotPath);
-    if (snapshot && typeof snapshot.providers === "object" && snapshot.providers !== null) {
-      tables.modelsDev = { providers: snapshot.providers };
+    const snapshot = await import(modelsDevSnapshotOverride ?? modelsDevSnapshotPath);
+    // providers and models are validated independently: one bad shape must
+    // not take down the other (provider records vs unified canonical data).
+    const modelsDev = {};
+    let usable = false;
+    if (snapshot && typeof snapshot.providers === "object" && snapshot.providers !== null && !Array.isArray(snapshot.providers)) {
+      modelsDev.providers = snapshot.providers;
+      usable = true;
+    } else {
+      degraded.push({ site: "models.dev", scope: "providers", reason: "snapshot did not expose a providers object" });
+    }
+    if (snapshot && typeof snapshot.models === "object" && snapshot.models !== null && !Array.isArray(snapshot.models)) {
+      modelsDev.models = snapshot.models;
+      usable = true;
+    } else {
+      degraded.push({ site: "models.dev", scope: "models", reason: "snapshot did not expose a models object" });
+    }
+    if (usable) {
+      tables.modelsDev = modelsDev;
       tables.modelsDevVersion = modelsDevVersion;
       tables.modelsDevGeneratedAt = typeof snapshot.generatedAt === "string" ? snapshot.generatedAt : undefined;
-    } else {
-      degraded.push({ site: "models.dev", reason: "snapshot did not expose a providers object" });
     }
   }
 } catch (error) {

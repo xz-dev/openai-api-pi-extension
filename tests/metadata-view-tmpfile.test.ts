@@ -24,6 +24,7 @@ const compiled = {
       publicId: "claude-fable-5-1",
       matchedRules: [1],
       fillMissingOnly: false,
+      externalChain: true,
       entries: [
         {
           entry: "models.dev/anthropic/api_key/claude-fable-5-1",
@@ -31,10 +32,40 @@ const compiled = {
           provider: "anthropic",
           access: "api_key" as const,
           modelId: "claude-fable-5-1",
-          fields: { context_window: 1000000 },
+          fields: { context_window: 1000000, max_output_tokens: 128000 },
+          canonical: "anthropic/claude-fable-5-1",
+          fieldSources: { context_window: "provider" as const, max_output_tokens: "canonical" as const },
         },
       ],
       unresolved: ["modelparams.dev/@creator/api_key: provider unresolved"],
+      candidates: [
+        {
+          site: "models.dev" as const,
+          provider: "anthropic",
+          access: "api_key" as const,
+          kind: "provider" as const,
+          sourceId: "claude-fable-5-1",
+          sourceKey: "claude-fable-5-1",
+          level: 1 as const,
+          canonical: "anthropic/claude-fable-5-1",
+          selected: true,
+          reason: "selected source record",
+        },
+        {
+          site: "models.dev" as const,
+          provider: "llmgateway-providers",
+          access: "catalog" as const,
+          kind: "provider" as const,
+          sourceId: "anthropic/claude-fable-5-1",
+          sourceKey: "anthropic/claude-fable-5-1",
+          level: 1 as const,
+          canonical: "anthropic/claude-fable-5-1",
+          selected: false,
+          reason: "identity evidence only",
+        },
+      ],
+      canonical: "anthropic/claude-fable-5-1",
+      skippedEntries: [{ entry: "modelparams.dev/@creator/api_key/@id", reason: "no creator record" }],
       overridePatches: [{ contextWindow: 200000 }],
     },
   ],
@@ -68,10 +99,15 @@ test("renderCompiledCatalog shows config, versions, entries, unresolved, overrid
   assert.match(text, /== effective config ==/);
   assert.match(text, /models\.dev: 0\.0\.113 \(snapshot 2026-10-23\)/);
   assert.match(text, /degraded: modelparams\.dev: package missing/);
-  assert.match(text, /models\.dev\/anthropic\/api_key\/claude-fable-5-1 -> context_window/);
+  assert.match(text, /models\.dev\/anthropic\/api_key\/claude-fable-5-1 -> context_window, max_output_tokens\[canonical\]/);
   assert.match(text, /modelparams\.dev\/@creator\/api_key: provider unresolved  \[unresolved\]/);
+  assert.match(text, /canonical: anthropic\/claude-fable-5-1/);
+  assert.match(text, /candidates:/);
+  assert.match(text, /models\.dev\/anthropic\/api_key\/claude-fable-5-1 \[level 1\] selected canonical:anthropic\/claude-fable-5-1 \(selected source record\)/);
+  assert.match(text, /models\.dev\/llmgateway-providers\/catalog\/anthropic\/claude-fable-5-1 \[level 1\] skipped.*identity evidence only/);
+  assert.match(text, /skipped: modelparams\.dev\/@creator\/api_key\/@id \(no creator record\)/);
   assert.match(text, /overrides: \{"contextWindow":200000\}/);
-  assert.doesNotMatch(text, /api key|api_key=|bearer|token/i, "rendered view must not contain a credential");
+  assert.doesNotMatch(text, /api key|api_key=|bearer|\btoken\b/i, "rendered view must not contain a credential");
 });
 
 test("writeMetadataTempFile creates a 0600 file inside a 0700 pid-prefixed dir", () => {

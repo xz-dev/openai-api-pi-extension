@@ -203,9 +203,12 @@ last verified list. `/login` is not blocked by catalog quality: only
 connection failures (unreachable gateway, invalid API key, non-models
 payload) fail login. If the gateway connects but the catalog is unusable,
 the key is saved and the problem is reported where it belongs — model-list
-refresh. Pi's `/model` overlay only names the provider; this extension also
-appends a TUI-only chat entry with the real discovery error (HTTP status and
-a short body, no URL or API key).
+refresh. Pi's `/model` overlay only names the provider; catalog and metadata
+diagnostics surface as transient native notifications (or stderr without a
+UI) — never as session entries. The same applies to `/login`: only
+connection failures fail login; if the gateway connects but the catalog is
+unusable, the key is saved and the problem is reported where it belongs —
+model-list refresh.
 
 ### Metadata compile chain
 
@@ -262,14 +265,19 @@ declared label), and an optional 4th segment pins the literal query ID
 `models.dev/llmgateway-providers/api_key/anthropic/claude-fable-5-1`.
 Wildcards (`*`) are not allowed anywhere in a chain entry.
 
-**`@creator`** resolves the model's creator at compile time, in four steps:
+**`@creator`** resolves the model's full canonical identity at compile
+time, in four steps:
 
-1. Take the `@id` candidates of the public ID's last `/` segment.
-2. Look them up across all models.dev provider records and read the
-   `<creator>/` prefix of their `canonical_model_id`.
+1. Collect the `@id` query hits for the public ID's last `/` segment
+   across all models.dev provider records and the unified canonical
+   table.
+2. Read the `canonical_model_id` of the identity-bearing hits — unified
+   table entries carry their full `creator/model` key.
 3. Collapse creators through the built-in ordered alias groups
-   (`zhipuai|zai|z-ai`, `moonshotai|moonshot`, `thinkingmachines|thinking-machines`)
-   and expand the result to the group members that exist on each site.
+   (`zhipuai|zai|z-ai`, `moonshotai|moonshot`, `thinkingmachines|thinking-machines`),
+   keep the full canonical model (renames like `deepseek-v4-flash-fast`
+   still resolve to the creator's real model id), and expand the
+   creator to the group members that exist on each site.
 4. Read fields only from those concrete provider tables. Other providers'
    records (for example aggregators such as `llmgateway-providers`) help
    identify the creator but never supply fields.
@@ -280,10 +288,54 @@ upstream value is kept. Only creators from *different* alias groups for the
 same model are a config error; name the provider literally in a rule to
 resolve it.
 
-**`@id`** queries `modelId` candidates derived from the public ID in a
-fixed order — as-is, lowercased, digits' `.`↔`-` swaps, then
-date-suffix-stripped variants — first hit wins. The default chain uses
-`@creator` with an implicit `@id` model query.
+**`@id`** queries source records by the public ID's last `/` segment.
+At compile time the segment becomes an anchored, escaped,
+case-insensitive pattern: the literal string is tried first, then every
+record whose id differs only by runs of space/underscore/dot/hyphen or
+case is collected, then a date-suffix-stripped fallback
+(`-YYYYMMDD` / `-YYYY-MM-DD`). All literal matches are kept as
+inspectable candidates — regex input is never executed, channel
+prefixes do not change the query, and a literal 4th chain segment
+always stays an exact lookup. The default chain uses `@creator` with an
+implicit `@id` model query.
+
+**Canonical identity** is resolved from the collected hits: full
+`creator/model` canonical IDs (not bare creator prefixes) are compared
+through the alias groups; records carrying distinct canonical creators
+are a config error on `@creator` chains, and same-creator hits naming
+distinct canonical models are marked ambiguous and skipped — never
+merged or order-picked. Same-level aliases whose capability fields
+conflict are skipped the same way, and compilation continues with the
+next source. A unified canonical models table (the snapshot's
+`models` shape) supplies identity evidence and, only for the automatic
+`@creator/api_key` path, fills fields a concrete creator record left
+missing — the provider's own record always wins where it has a valid
+value, and unified data can form a logical entry when no provider
+record exists at all. Explicit providers, literal model segments and
+`subscription` entries never get that fallback; aggregator records only
+contribute canonical hints, never fields.
+
+**Original display**: enrichment only supplies capability fields. The
+published model keeps its upstream public ID and gateway display name
+(`name`/`display_name`); internal query strings, canonical IDs and
+source record names never replace them — only explicit `overrides` and
+Pi `models.json` `modelOverrides` can rename a model.
+
+**Match summary**: after each refresh the extension reports one short
+line classifying every model with an enabled external chain as
+complete (capability fields, nothing unresolved), partial-source-missing
+(some entries unresolved), or unmatched (no capability field — a
+name-only record does not count); models with `chain: []` are listed
+separately as disabled and never counted as failures. Degraded data
+sources add their own note; the full candidate lists and reasons live
+in `/provider-metadata`, not in the notification.
+
+**Notifications are transient**: metadata notes, degraded-source
+warnings and config errors reach you through Pi's native notify channel
+when a UI is attached, or stderr otherwise — stdout and the session
+JSONL stay untouched, and nothing is appended as chat entries. Notes
+identical to the previous report are deduplicated; a superseded or
+cancelled refresh reports nothing.
 
 **`@default`** inside a rule's `chain` splices the *root* chain at that
 position; in the root chain it is a config error.
@@ -310,16 +362,18 @@ upstream catalog, runs the same worker compile, writes the rendered
 text to a private temp file (0700 dir / 0600 file under `os.tmpdir()`),
 and notifies you with the file's absolute path — open it with any
 editor or pager. The file lists the effective config, data versions,
-and per model the matched rules, concrete entries with supplied
-fields, `[unresolved]` markers, and final overrides — never the API
-key. Files are retained for your session and reclaimed by the system
-temp cleaner.
+per-model matched rules, the concrete entries with supplied fields and
+their per-field source (`[canonical]` = unified canonical table,
+unmarked = provider record), the full candidate list with match level
+and selection/skip reasons, `[unresolved]` markers, and final
+overrides — never the API key. Files are retained for your session and
+reclaimed by the system temp cleaner.
 
 **Opt out** of all external enrichment with a root `chain: []` (and no
 rule chains), then refresh. Offline restore and `allowNetwork: false`
 refreshes read no config and touch no data. If a data package is missing
 or malformed, that site degrades — the upstream-mapped catalog still
-publishes with a note entry; if the upstream catalog itself fails, Pi
+publishes with a transient note; if the upstream catalog itself fails, Pi
 keeps the persisted catalog. The inference path never reads metadata.
 
 **Legacy fields** from the old selector design are gone: `source_priority`,
