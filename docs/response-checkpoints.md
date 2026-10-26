@@ -302,5 +302,5 @@ upstream. These are historical validation receipts, not a deployment guarantee.
 
 </details>
 
-Return to [setup and transports](../README.md), or read the
+Return to [setup](../README.md) or [transports](transports.md), or read the
 [paired Pi checkpoint documentation](https://github.com/xz-dev/pi/blob/main/docs/downstream-changes.md#response-checkpoints).

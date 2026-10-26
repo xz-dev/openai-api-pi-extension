@@ -82,5 +82,5 @@ When development dependencies predate the host exports, set
 preload loads its sibling `websocket-compression.ts` and `event-stream.ts` as well. This is not a
 production fallback; no machine-specific path is embedded in the package.
 
-Return to [setup and transport selection](../README.md), or read
+Return to [setup](../README.md) or [transport selection](transports.md), or read
 [Pi's HTTP fallback and WebSocket policy](https://github.com/xz-dev/pi/blob/main/docs/request-compression.md).
