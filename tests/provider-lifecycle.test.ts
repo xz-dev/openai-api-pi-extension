@@ -663,9 +663,9 @@ test("cancelled login during enrichment never publishes or persists its catalog"
   );
 });
 
-test("chain: [] opts out of all metadata reads", async () => {
+test("chain: [\"@self\"] opts out of all external metadata reads", async () => {
   const gatewayServer = await gateway("optout-model", "test-key", false);
-  const { hits } = metadataEnv("chain: []");
+  const { hits } = metadataEnv("chain: [\"@self\"]");
   const credentials = new InMemoryCredentialStore();
   await credentials.modify(PROVIDER, async () => ({
     type: "api_key", key: "test-key", env: { [BASE_URL_ENV]: gatewayServer.baseUrl },
@@ -676,7 +676,27 @@ test("chain: [] opts out of all metadata reads", async () => {
   const result = await models.refresh();
   assert.equal(result.errors.size, 0);
   assert.equal(models.getModel(PROVIDER, "optout-model")?.contextWindow, 128_000);
-  assert.deepEqual(hits, {}, "explicit empty chain must not fetch");
+  assert.deepEqual(hits, {}, "upstream-only chain must not fetch external data");
+});
+
+test("explicit empty chain is a config error, not an opt-out", async () => {
+  const gatewayServer = await gateway("empty-chain-model", "test-key", false);
+  const { hits } = metadataEnv("chain: []");
+  const credentials = new InMemoryCredentialStore();
+  await credentials.modify(PROVIDER, async () => ({
+    type: "api_key", key: "test-key", env: { [BASE_URL_ENV]: gatewayServer.baseUrl },
+  }));
+  const reported: string[] = [];
+  const models = createModels({ credentials, authContext: authContext() });
+  models.setProvider(createOpenAIApiProvider([], (m) => reported.push(m), undefined, undefined, undefined, currentDeps));
+
+  const result = await models.refresh();
+  assert.equal(result.errors.size, 1);
+  const message = result.errors.get(PROVIDER)?.message ?? "";
+  assert.match(message, /chain/);
+  assert.match(message, /@self/, "error must suggest the upstream-only chain");
+  assert.equal(models.getModel(PROVIDER, "empty-chain-model"), undefined, "invalid config publishes nothing");
+  assert.deepEqual(hits, {}, "config error must not reach the sources");
 });
 
 test("legacy config fields are config errors with a migration hint", async () => {
@@ -1038,7 +1058,7 @@ test("matchCategories: mutually exclusive, conservative, name-only is not a hit"
   - match: "full-m"
     chain: ["models.dev/@creator/api_key"]
   - match: "off-m"
-    chain: []
+    chain: ["@self"]
   - match: "name-m"
     chain: ["models.dev/acme/api_key/name-m"]
 `);

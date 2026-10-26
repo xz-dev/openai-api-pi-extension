@@ -6,7 +6,7 @@
  * key — callers pass only compiled data and config, not credentials.
  */
 import { classifyModelMatch } from "./model-metadata.ts";
-import type { CompiledCatalog, CompiledModel } from "./model-metadata.ts";
+import type { CompiledCatalog, CompiledModel, MetadataFields } from "./model-metadata.ts";
 import { formatPluginOutput } from "./notification.ts";
 export { sanitizeTerminalText } from "./notification.ts";
 
@@ -42,9 +42,16 @@ function redact(value: unknown, insideHeaders = false): unknown {
 }
 const redactJson = (value: unknown) => JSON.stringify(redact(value));
 
-function formatEntryFields(model: CompiledModel): string[] {
-  return model.entries.map((entry) => {
-    const fields = Object.entries(entry.fields).map(([key, value]) => {
+function formatEntryFields(model: CompiledModel, upstream?: Readonly<Record<string, MetadataFields>>): string[] {
+  return model.plan.map((node) => {
+    if (node.kind === "upstream") {
+      // The upstream node shows the fields the model's own row CAN provide
+      // at this position — never claimed to be the final adopted values.
+      const keys = Object.keys(upstream?.[node.modelId] ?? {});
+      return `    upstream ${node.modelId} -> ${keys.join(", ") || "(no capability fields)"}`;
+    }
+    const entry = node.entry;
+    const fields = Object.entries(entry.fields).map(([key]) => {
       const source = entry.fieldSources?.[key];
       // undefined = a provider record; unified fills are marked "canonical".
       return source === "canonical" ? `${key}[canonical]` : key;
@@ -70,17 +77,18 @@ function formatCandidates(model: CompiledModel): string[] {
   return lines;
 }
 
-export function renderCompiledCatalog(compiled: CompiledCatalog): string {
+export function renderCompiledCatalog(
+  compiled: CompiledCatalog,
+  upstream?: Readonly<Record<string, MetadataFields>>,
+): string {
   const lines: string[] = [];
   lines.push("== effective config ==");
   lines.push(`chain: ${JSON.stringify(compiled.config.rootChain)}`);
-  lines.push(`fill_missing_only: ${compiled.config.fillMissingOnly}`);
   if (compiled.config.rules.length > 0) {
     lines.push("rules:");
     compiled.config.rules.forEach((rule, index) => {
       lines.push(`  [${index + 1}] match: ${rule.match}`);
       if (rule.chain !== undefined) lines.push(`      chain: ${JSON.stringify(rule.chain)}`);
-      if (rule.fillMissingOnly !== undefined) lines.push(`      fill_missing_only: ${rule.fillMissingOnly}`);
       if (rule.overrides !== undefined) lines.push(`      overrides: ${redactJson(rule.overrides)}`);
     });
   }
@@ -107,10 +115,10 @@ export function renderCompiledCatalog(compiled: CompiledCatalog): string {
   lines.push("== models ==");
   for (const model of compiled.models) {
     lines.push(`${model.publicId}`);
-    lines.push(`  rules: ${model.matchedRules.length > 0 ? model.matchedRules.map((n) => `[${n}]`).join(" ") : "(none)"}  fill_missing_only: ${model.fillMissingOnly}`);
+    lines.push(`  rules: ${model.matchedRules.length > 0 ? model.matchedRules.map((n) => `[${n}]`).join(" ") : "(none)"}`);
     if (model.canonical) lines.push(`  canonical: ${model.canonical}`);
-    if (model.entries.length === 0 && model.unresolved.length === 0) lines.push("    (no external chain)");
-    lines.push(...formatEntryFields(model));
+    if (model.plan.length === 0 && model.unresolved.length === 0) lines.push("    (no sources)");
+    lines.push(...formatEntryFields(model, upstream));
     for (const miss of model.unresolved) lines.push(`    ${miss}  [unresolved]`);
     for (const skipped of model.skippedEntries ?? []) {
       lines.push(`    skipped: ${skipped.entry} (${skipped.reason})`);

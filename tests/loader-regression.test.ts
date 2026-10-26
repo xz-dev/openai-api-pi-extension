@@ -205,6 +205,8 @@ test("real Pi runtime lets process environment override stored fields independen
 
     const agentDir = await mkdtemp(join(tmpdir(), "openai-api-extension-runtime-"));
     tempDirs.push(agentDir);
+    // Keep metadata config reads inside this test's isolated agent dir.
+    process.env.PI_CODING_AGENT_DIR = agentDir;
     const storedCredential = envBaseUrl
       ? { type: "api_key", key: "current-key", env: { OPENAI_API_EXTENSION_BASE_URL: "http://127.0.0.1:1/v1" } }
       : { type: "api_key", key: "stored-key", env: { OPENAI_API_EXTENSION_BASE_URL: expectedBaseUrl } };
@@ -358,7 +360,7 @@ test("models.json modelOverrides still apply last over enriched catalog", async 
   delete process.env.PI_OFFLINE;
   // Gateway catalog + a models.dev-shaped metadata source; the extension reads
   // the config from PI_CODING_AGENT_DIR and the loopback SOURCE_URLS are not
-  // injectable at this level, so use an explicit empty chain plus a manual
+  // injectable at this level, so use an upstream-only chain plus a manual
   // override to prove ordering: external chain disabled, manual override via
   // models.json still lands on top of enrichment output.
   const server = createServer((request, response) => {
@@ -378,7 +380,7 @@ test("models.json modelOverrides still apply last over enriched catalog", async 
   tempDirs.push(agentDir);
   process.env.PI_CODING_AGENT_DIR = agentDir;
   await writeFile(join(agentDir, "openai-api-extension.yaml"),
-    "chain: []\nmodels:\n  - match: override-model\n    overrides:\n      contextWindow: 111000\n");
+    "chain: [\"@self\"]\nmodels:\n  - match: override-model\n    overrides:\n      contextWindow: 111000\n");
   await writeFile(join(agentDir, "models.json"), JSON.stringify({
     providers: {
       "openai-api-extension": { modelOverrides: { "override-model": { contextWindow: 32000 } } },

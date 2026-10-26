@@ -6,11 +6,12 @@ import {
   externalFields,
   idCandidates,
   matchModelPattern,
-  mergeMetadata,
   mergePatch,
   MetadataConfigError,
   normalizeFields,
   parseChainEntry,
+  resolveChainFields,
+  type CompiledModel,
   type SourceTables,
 } from "../model-metadata.ts";
 import { parseMetadataConfig } from "../metadata-config.ts";
@@ -69,29 +70,46 @@ test("parseMetadataConfig: missing file yields empty config", () => {
   assert.equal(parsed.chain, undefined);
 });
 
-test("parseMetadataConfig: valid config with chain, mode, ordered rules", () => {
+test("parseMetadataConfig: valid config with chain, @self and ordered rules", () => {
   const parsed = parseMetadataConfig(`
-chain: ["models.dev/@creator/api_key"]
-fill_missing_only: true
+chain: ["models.dev/@creator/api_key", "@self"]
 models:
   - match: "proxy/*"
-    fill_missing_only: true
+    chain: ["@self", "@default"]
     overrides:
       contextWindow: 200000
   - match: "proxy/claude"
     chain: ["models.dev/anthropic/api_key/claude-sonnet-4-5"]
 `);
-  assert.equal(parsed.fillMissingOnly, true);
-  assert.deepEqual(parsed.chain, ["models.dev/@creator/api_key"]);
+  assert.deepEqual(parsed.chain, ["models.dev/@creator/api_key", "@self"]);
   assert.equal(parsed.models?.length, 2);
   assert.equal(parsed.models?.[1].match, "proxy/claude");
+  assert.deepEqual(parsed.models?.[0].chain, ["@self", "@default"]);
   assert.deepEqual(parsed.models?.[0].overrides, { contextWindow: 200000 });
 });
 
-test("parseMetadataConfig: invalid YAML, bad chain, non-bool mode are config errors", () => {
+test("parseMetadataConfig: explicit empty chain is a config error at root and rule level", () => {
+  for (const yaml of ["chain: []", "models:\n  - match: m\n    chain: []"]) {
+    assert.throws(() => parseMetadataConfig(yaml), (e: unknown) => {
+      assert.ok(e instanceof MetadataConfigError);
+      assert.match((e as MetadataConfigError).path, /chain/);
+      assert.match((e as Error).message, /@self/);
+      return true;
+    }, yaml);
+  }
+});
+
+test("parseMetadataConfig: @default is rejected in the root chain", () => {
+  assert.throws(
+    () => parseMetadataConfig('chain: ["@default"]'),
+    (e: unknown) => e instanceof MetadataConfigError && /@default/.test((e as Error).message),
+  );
+});
+
+test("parseMetadataConfig: invalid YAML, bad chain, non-list chain are config errors", () => {
   assert.throws(() => parseMetadataConfig("a: ["), MetadataConfigError);
   assert.throws(() => parseMetadataConfig("chain: [\"bogus-site/x/api_key\"]"), MetadataConfigError);
-  assert.throws(() => parseMetadataConfig("fill_missing_only: yes_please"), MetadataConfigError);
+  assert.throws(() => parseMetadataConfig('chain: ["@selfish"]'), MetadataConfigError);
   assert.throws(() => parseMetadataConfig("models:\n  - match: a\n    chain: \"notalist\""), MetadataConfigError);
 });
 
@@ -109,6 +127,10 @@ for (const [field, yaml] of [
   ["models_dev_subscription", "models_dev_subscription:\n  add: [x]"],
   ["channels", "channels:\n  chan:\n    source_priority: []"],
   ["global_fallback", "global_fallback: true"],
+  // fill_missing_only is legacy even when combined with @self in the chain.
+  ["fill_missing_only", "fill_missing_only: false"],
+  ["fill_missing_only", 'chain: ["@self", "models.dev/@creator/api_key"]\nfill_missing_only: true'],
+  ["fill_missing_only", "models:\n  - match: m\n    fill_missing_only: true"],
 ]) {
   test(`parseMetadataConfig: legacy field ${field} errors with migration hint`, () => {
     assert.throws(() => parseMetadataConfig(yaml), (e: unknown) => {
@@ -342,7 +364,7 @@ test("compileCatalog: claude-fable-5-1 aggregator variants resolve to anthropic"
 });
 
 test("compileCatalog: default chain order and structure", () => {
-  assert.deepEqual([...DEFAULT_CHAIN], ["models.dev/@creator/api_key", "modelparams.dev/@creator/api_key"]);
+  assert.deepEqual([...DEFAULT_CHAIN], ["models.dev/@creator/api_key", "modelparams.dev/@creator/api_key", "@self"]);
 });
 
 test("compileCatalog: alias group expands per-site to existing members", () => {
@@ -440,30 +462,66 @@ test("compileCatalog: @default expands root chain in place", () => {
 test("compileCatalog: rule layering — later rules override per field, overrides merge", () => {
   const config = cfg({
     models: [
-      { match: "*", fillMissingOnly: false, overrides: { contextWindow: 200000, compat: { a: 1 } } },
-      { match: "proxy/*", fillMissingOnly: true, overrides: { compat: { b: 2 } } },
-      { match: "proxy/claude", chain: [] },
+      { match: "*", chain: ["models.dev/a/api_key"], overrides: { contextWindow: 200000, compat: { a: 1 } } },
+      { match: "proxy/*", chain: ["models.dev/b/api_key"], overrides: { compat: { b: 2 } } },
+      { match: "proxy/claude", chain: ["@self"] },
     ],
   });
   const compiled = compileCatalog(config, ["proxy/claude", "other/claude"], tables());
   const proxy = compiled.models[0];
   const other = compiled.models[1];
-  assert.equal(proxy.fillMissingOnly, true); // proxy/* rule wins over * rule
-  assert.equal(other.fillMissingOnly, false);
+  // proxy/* chain (models.dev/b) wins over * (models.dev/a); the exact rule
+  // then replaces the whole chain with the upstream-only @self chain.
+  assert.deepEqual(proxy.plan, [{ kind: "upstream", modelId: "proxy/claude" }]);
+  assert.equal(proxy.externalChain, false, "upstream-only chain is not an external chain");
+  assert.deepEqual(other.plan.map((n) => (n.kind === "external" ? n.entry.entry : n.kind)), []);
+  assert.equal(other.externalChain, true, "models.dev/a is declared for other/claude");
+  assert.deepEqual(other.unresolved, ["models.dev/a/api_key/@id"]);
   assert.deepEqual(proxy.overridePatches, [{ contextWindow: 200000, compat: { a: 1 } }, { compat: { b: 2 } }]);
   assert.deepEqual(proxy.matchedRules, [1, 2, 3]);
-  assert.deepEqual(proxy.entries, []); // later exact rule set chain: []
 });
 
 test("compileCatalog: exact match pattern gets no extra priority (declaration order wins)", () => {
   const config = cfg({
     models: [
-      { match: "proxy/claude", fillMissingOnly: true },
-      { match: "*", fillMissingOnly: false },
+      { match: "proxy/claude", chain: ["@self"] },
+      { match: "*", chain: ["models.dev/a/api_key"] },
     ],
   });
   const compiled = compileCatalog(config, ["proxy/claude"], tables());
-  assert.equal(compiled.models[0].fillMissingOnly, false);
+  // The later, broader rule replaces the chain — @self is gone; the declared
+  // external entry is unresolved against empty tables.
+  assert.deepEqual(compiled.models[0].plan, []);
+  assert.deepEqual(compiled.models[0].unresolved, ["models.dev/a/api_key/@id"]);
+  assert.equal(compiled.models[0].externalChain, true);
+});
+
+test("compileCatalog: @self compiles to a concrete upstream node per model, never shared", () => {
+  const t = tables({
+    modelsDev: {
+      providers: {
+        a: { models: { m1: { limit: { context: 11 } }, m2: { limit: { context: 22 } } } },
+      },
+    },
+  });
+  const config = cfg({ chain: ["@self", "models.dev/a/api_key"] });
+  const compiled = compileCatalog(config, ["m1", "ns/m2"], t);
+  for (const model of compiled.models) {
+    // First node is THIS model's own upstream source; no keyword remains.
+    assert.deepEqual(model.plan[0], { kind: "upstream", modelId: model.publicId }, JSON.stringify(model.plan));
+    assert.equal(model.plan[1]?.kind, "external");
+  }
+  const m1 = compiled.models[0];
+  const m2 = compiled.models[1];
+  assert.equal((m1.plan[1] as { entry: { entry: string } }).entry.entry, "models.dev/a/api_key/m1");
+  assert.equal((m2.plan[1] as { entry: { entry: string } }).entry.entry, "models.dev/a/api_key/m2");
+  assert.equal(m1.externalChain, true);
+  const onlyUpstream = compileCatalog(cfg({ chain: ["@self"] }), ["m"], tables()).models[0];
+  assert.deepEqual(onlyUpstream.plan, [{ kind: "upstream", modelId: "m" }]);
+  assert.equal(onlyUpstream.externalChain, false);
+  assert.deepEqual(onlyUpstream.entries, []);
+  assert.deepEqual(onlyUpstream.unresolved, []);
+  assert.deepEqual(onlyUpstream.candidates, []);
 });
 
 test("compileCatalog: modelparams entries filtered by authType access", () => {
@@ -533,52 +591,86 @@ test("compileCatalog: records data versions and generatedAt", () => {
 
 // --- execution: merge + fields ----------------------------------------------
 
-test("mergeMetadata: external overwrites upstream by default", () => {
-  const merged = mergeMetadata({ context_window: 500000 }, { context_window: 1000000 }, false);
-  assert.equal(merged.context_window, 1000000);
+// Plan-based first-valid resolution replaces the old mergeMetadata boolean.
+// Helper: one compiled model whose plan is the given ordered nodes.
+const planModel = (plan: CompiledModel["plan"]): CompiledModel => ({
+  publicId: "m",
+  matchedRules: [],
+  plan,
+  entries: plan.flatMap((node) => (node.kind === "external" ? [node.entry] : [])),
+  unresolved: [],
+  candidates: [],
+  externalChain: plan.some((node) => node.kind === "external"),
+  overridePatches: [],
+});
+const extNode = (fields: Record<string, unknown>): CompiledModel["plan"][number] => ({
+  kind: "external",
+  entry: {
+    entry: "models.dev/a/api_key/m",
+    site: "models.dev" as const,
+    provider: "a",
+    access: "api_key" as const,
+    modelId: "m",
+    fields,
+  },
+});
+const selfNode = { kind: "upstream" as const, modelId: "m" };
+
+test("resolveChainFields: external before @self overrides upstream, fills gaps", () => {
+  const model = planModel([extNode({ context_window: 1000000 }), selfNode]);
+  const fields = resolveChainFields(model, { context_window: 500000, max_output_tokens: 64000 });
+  assert.equal(fields.context_window, 1000000);
+  assert.equal(fields.max_output_tokens, 64000);
 });
 
-test("mergeMetadata: fill_missing_only keeps upstream, fills gaps", () => {
-  const merged = mergeMetadata(
-    { context_window: 128000 },
-    { context_window: 1000000, max_output_tokens: 128000 },
-    true,
-  );
-  assert.equal(merged.context_window, 128000);
-  assert.equal(merged.max_output_tokens, 128000);
+test("resolveChainFields: @self first keeps upstream, external fills gaps", () => {
+  const model = planModel([selfNode, extNode({ context_window: 1000000, max_output_tokens: 128000 })]);
+  const fields = resolveChainFields(model, { context_window: 128000 });
+  assert.equal(fields.context_window, 128000);
+  assert.equal(fields.max_output_tokens, 128000);
 });
 
-test("mergeMetadata: alias does not bypass fill-only protection", () => {
-  const merged = mergeMetadata(
-    { context_length: 128000 },
-    { context_window: 1000000 },
-    true,
-  );
-  assert.equal(merged.context_window, 128000);
+test("resolveChainFields: upstream alias cannot bypass an earlier @self", () => {
+  const model = planModel([selfNode, extNode({ context_window: 1000000 })]);
+  const fields = resolveChainFields(model, { context_length: 128000 });
+  assert.equal(fields.context_window, 128000);
 });
 
-test("mergeMetadata: explicit empty effort array is not missing", () => {
-  const merged = mergeMetadata(
-    { supported_reasoning_levels: [] },
-    { supported_reasoning_levels: ["low", "high"] },
-    true,
-  );
-  assert.deepEqual(merged.supported_reasoning_levels, []);
+test("resolveChainFields: explicit empty upstream effort array is not missing", () => {
+  const model = planModel([selfNode, extNode({ supported_reasoning_levels: ["low", "high"] })]);
+  const fields = resolveChainFields(model, { supported_reasoning_levels: [] });
+  assert.deepEqual(fields.supported_reasoning_levels, []);
 });
 
-test("mergeMetadata: defaults do not mask real missing values", () => {
-  const merged = mergeMetadata({}, { context_window: 64000 }, true);
-  assert.equal(merged.context_window, 64000);
+test("resolveChainFields: missing upstream fields fall through to later sources", () => {
+  const model = planModel([selfNode, extNode({ context_window: 64000 })]);
+  const fields = resolveChainFields(model, {});
+  assert.equal(fields.context_window, 64000);
 });
 
-test("externalFields: first valid value wins across the chain", () => {
-  const model = {
-    publicId: "m", matchedRules: [], fillMissingOnly: false, overridePatches: [], unresolved: [],
-    entries: [
-      { entry: "e1", site: "models.dev" as const, provider: "a", access: "api_key" as const, modelId: "m", fields: { context_window: 1 } },
-      { entry: "e2", site: "modelparams.dev" as const, provider: "b", access: "api_key" as const, modelId: "m", fields: { context_window: 2, supported_reasoning_levels: ["low"] } },
-    ],
-  };
+test("resolveChainFields: no @self means upstream fields are never read", () => {
+  const model = planModel([extNode({ context_window: 1000000 })]);
+  const fields = resolveChainFields(model, {
+    context_window: 500000,
+    max_output_tokens: 64000,
+    capabilities: { effort_tiers: ["low", "high"] },
+  });
+  assert.equal(fields.context_window, 1000000);
+  assert.equal(fields.max_output_tokens, undefined);
+  assert.equal(fields.supported_reasoning_levels, undefined);
+});
+
+test("resolveChainFields: repeated @self nodes are idempotent (first valid wins)", () => {
+  const model = planModel([selfNode, selfNode, extNode({ max_output_tokens: 10 })]);
+  const fields = resolveChainFields(model, { context_window: 32000 });
+  assert.equal(fields.context_window, 32000);
+  assert.equal(fields.max_output_tokens, 10);
+});
+
+test("externalFields: first valid value wins across external entries only", () => {
+  const e1 = { entry: "e1", site: "models.dev" as const, provider: "a", access: "api_key" as const, modelId: "m", fields: { context_window: 1 } };
+  const e2 = { entry: "e2", site: "modelparams.dev" as const, provider: "b", access: "api_key" as const, modelId: "m", fields: { context_window: 2, supported_reasoning_levels: ["low"] } };
+  const model = planModel([{ kind: "external", entry: e1 }, selfNode, { kind: "external", entry: e2 }]);
   const fields = externalFields(model);
   assert.equal(fields.context_window, 1);
   assert.deepEqual(fields.supported_reasoning_levels, ["low"]);

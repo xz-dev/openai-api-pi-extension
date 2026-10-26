@@ -11,10 +11,20 @@ import { renderCompiledCatalog, sanitizeTerminalText } from "../metadata-view.ts
 import { writeMetadataTempFile } from "../metadata-tmpfile.ts";
 import { OUTPUT_PREFIX } from "../notification.ts";
 
+const claudeEntry = {
+  entry: "models.dev/anthropic/api_key/claude-fable-5-1",
+  site: "models.dev" as const,
+  provider: "anthropic",
+  access: "api_key" as const,
+  modelId: "claude-fable-5-1",
+  fields: { context_window: 1000000, max_output_tokens: 128000 },
+  canonical: "anthropic/claude-fable-5-1",
+  fieldSources: { context_window: "provider" as const, max_output_tokens: "canonical" as const },
+};
+
 const compiled = {
   config: {
-    rootChain: ["models.dev/@creator/api_key"],
-    fillMissingOnly: false,
+    rootChain: ["models.dev/@creator/api_key", "@self"],
     rules: [{ match: "claude-*", overrides: { contextWindow: 200000 } }],
   },
   dataVersions: { modelsDevVersion: "0.0.113", modelsDevGeneratedAt: "2026-10-23", modelparamsVersion: "0.0.72" },
@@ -24,20 +34,12 @@ const compiled = {
     {
       publicId: "claude-fable-5-1",
       matchedRules: [1],
-      fillMissingOnly: false,
-      externalChain: true,
-      entries: [
-        {
-          entry: "models.dev/anthropic/api_key/claude-fable-5-1",
-          site: "models.dev" as const,
-          provider: "anthropic",
-          access: "api_key" as const,
-          modelId: "claude-fable-5-1",
-          fields: { context_window: 1000000, max_output_tokens: 128000 },
-          canonical: "anthropic/claude-fable-5-1",
-          fieldSources: { context_window: "provider" as const, max_output_tokens: "canonical" as const },
-        },
+      plan: [
+        { kind: "external" as const, entry: claudeEntry },
+        { kind: "upstream" as const, modelId: "claude-fable-5-1" },
       ],
+      entries: [claudeEntry],
+      externalChain: true,
       unresolved: ["modelparams.dev/@creator/api_key: provider unresolved"],
       candidates: [
         {
@@ -95,13 +97,26 @@ test("renderCompiledCatalog redacts credential-like override fields but keeps ma
   assert.match(text, /\[REDACTED\]/);
 });
 
-test("renderCompiledCatalog shows config, versions, entries, unresolved, overrides — never the API key", () => {
-  const text = renderCompiledCatalog(compiled);
+test("renderCompiledCatalog shows config, versions, entries, upstream node, unresolved, overrides — never the API key", () => {
+  const text = renderCompiledCatalog(compiled, {
+    "claude-fable-5-1": { context_window: 500000, input_modalities: ["text"] },
+  });
   assert.ok(text.startsWith(`${OUTPUT_PREFIX} `));
   assert.match(text, /== effective config ==/);
+  assert.match(text, /chain: \["models\.dev\/@creator\/api_key","@self"\]/);
+  assert.doesNotMatch(text, /fill_missing_only/, "old boolean mode is not shown");
   assert.match(text, /models\.dev: 0\.0\.113 \(snapshot 2026-10-23\)/);
   assert.match(text, /degraded: modelparams\.dev: package missing/);
   assert.match(text, /models\.dev\/anthropic\/api_key\/claude-fable-5-1 -> context_window, max_output_tokens\[canonical\]/);
+  // The upstream node shows the concrete public id and fields it can provide
+  // at its declared position — after the external entry, no @self keyword.
+  assert.match(text, /upstream claude-fable-5-1 -> context_window, input_modalities/);
+  const upstreamLine = text.indexOf("upstream claude-fable-5-1");
+  const externalLine = text.indexOf("models.dev/anthropic/api_key/claude-fable-5-1 ->");
+  assert.ok(externalLine >= 0 && upstreamLine > externalLine, "upstream node keeps its declared position");
+  // Config keeps the literal tokens; the fixed plan must not echo keywords.
+  const planLines = text.split("\n").filter((line) => /^    \S+ -> /.test(line));
+  assert.ok(planLines.every((line) => !line.includes("@self") && !line.includes("@default")), planLines.join("\n"));
   assert.match(text, /modelparams\.dev\/@creator\/api_key: provider unresolved  \[unresolved\]/);
   assert.match(text, /canonical: anthropic\/claude-fable-5-1/);
   assert.match(text, /candidates:/);

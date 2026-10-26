@@ -35,8 +35,10 @@ import {
   makeResolver,
   mergePatch,
   MetadataConfigError,
+  normalizeFields,
   type CompiledCatalog,
   type CompiledModel,
+  type MetadataFields,
 } from "./model-metadata.ts";
 import { parseMetadataConfig } from "./metadata-config.ts";
 import { renderCompiledCatalog } from "./metadata-view.ts";
@@ -235,13 +237,15 @@ export function mapModel(
   const maxTokens = num(pick("max_output_tokens", "max_completion_tokens", "max_tokens"));
   // Ported omniroute semantics: a gateway entry without declared limits uses the
   // default context window instead of rejecting the whole catalog. Defaults fill
-  // last so fill_missing_only can see real missing values upstream.
+  // last so source ordering sees real missing values.
   const resolvedMaxTokens = maxTokens ?? contextWindow;
+  // capabilities.effort_tiers is raw UPSTREAM data: only the unenriched
+  // direct-mapping path may read it. A resolved chain without @self must not
+  // recover upstream capability fields through this nested back door.
+  const effortTiers =
+    enriched === undefined && isRecord(row.capabilities) ? row.capabilities.effort_tiers : undefined;
   const map = thinkingLevelMap(
-    parseEfforts(
-      pick("supported_reasoning_levels") ??
-        (isRecord(row.capabilities) ? row.capabilities.effort_tiers : undefined),
-    ),
+    parseEfforts(pick("supported_reasoning_levels") ?? effortTiers),
   );
   const inputModalities = pick("input_modalities");
   // The display name is always the gateway's own (name/display_name, else id);
@@ -422,7 +426,7 @@ export function mapCompiledCatalog(
   if (compiled.sourceWarning) notes.push(`metadata data fallback: ${compiled.sourceWarning}`);
   for (const item of compiled.degraded) {
     const scope = item.scope ? ` ${item.scope}` : "";
-    notes.push(`metadata source ${item.site}${scope} unavailable (${item.reason}); using upstream values`);
+    notes.push(`metadata source ${item.site}${scope} unavailable (${item.reason}); its declared entries were skipped`);
   }
   const categories = matchCategories(compiled.models);
   const enabled = categories.complete + categories.partial + categories.unmatched;
@@ -460,11 +464,13 @@ function hasCapabilityField(model: CompiledModel): boolean {
 
 /**
  * Per-model match categories over the compiled catalog. Models with an
- * enabled external chain are complete (capability fields, nothing
- * unresolved), partial-source-missing (capability fields but some entry
- * unresolved), or fully unmatched (no capability field at all). Models whose
- * effective chain is empty are counted separately as disabled — never as
- * match failures. The four buckets are mutually exclusive and conservative.
+ * enabled external chain are complete (external capability fields, nothing
+ * unresolved), partial-source-missing (external capability fields but some
+ * entry unresolved), or fully unmatched (no external capability field at
+ * all). Upstream (@self) values never count as an external hit. Models whose
+ * effective chain declares no external source are counted separately as
+ * disabled — never as match failures. The four buckets are mutually
+ * exclusive and conservative.
  */
 export function matchCategories(models: readonly CompiledModel[]): {
   complete: number;
@@ -474,7 +480,7 @@ export function matchCategories(models: readonly CompiledModel[]): {
 } {
   const out = { complete: 0, partial: 0, unmatched: 0, disabled: 0 };
   for (const model of models) {
-    if (model.entries.length === 0 && model.unresolved.length === 0) {
+    if (!model.externalChain) {
       out.disabled += 1;
     } else if (!hasCapabilityField(model)) {
       out.unmatched += 1;
@@ -860,7 +866,17 @@ export default async function (pi: ExtensionAPI, dependencies: {
           return id && isConversationalTextModel(row) ? [id] : [];
         });
         const compiled = (await compileCatalogInWorker(config, publicIds, dependencies.metadataCompile)).catalog;
-        text = renderCompiledCatalog(compiled);
+        // Minimal read-only upstream context for the view: the same fetch's
+        // rows normalized through the capability whitelist — never raw rows
+        // or credentials.
+        const upstreamFields: Record<string, MetadataFields> = {};
+        for (const entry of entries) {
+          if (typeof entry !== "object" || entry === null || Array.isArray(entry)) continue;
+          const row = entry as UpstreamModel;
+          const id = entryIdentity(row)?.id;
+          if (id && isConversationalTextModel(row)) upstreamFields[id] = normalizeFields(row as Readonly<Record<string, unknown>>);
+        }
+        text = renderCompiledCatalog(compiled, upstreamFields);
       } catch (error) {
         failed = true;
         // A config error still produces a diagnostics file the user can page.

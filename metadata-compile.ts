@@ -17,6 +17,7 @@ import { selectDataSource } from "./metadata-packages.ts";
 import { fileURLToPath } from "node:url";
 import {
   compileCatalog,
+  DEFAULT_CHAIN,
   matchModelPattern,
   MetadataConfigError,
   type CompiledCatalog,
@@ -78,12 +79,9 @@ export function neededSites(
   return sites;
 }
 
-/** Root chain if defined, else default; then per-model rule layering. */
+/** Root chain if defined, else the shared default; then per-model rule layering. */
 function effectiveChainFor(config: MetadataConfig, publicId: string): string[] {
-  const root = config.chain ?? [
-    "models.dev/@creator/api_key",
-    "modelparams.dev/@creator/api_key",
-  ];
+  const root = config.chain ?? DEFAULT_CHAIN;
   let chain: string[] | undefined;
   for (const rule of config.models ?? []) {
     if (!matchModelPattern(rule.match, publicId)) continue;

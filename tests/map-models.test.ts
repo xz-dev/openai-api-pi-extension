@@ -86,6 +86,24 @@ test("mapModel copies Codex reasoning levels and image input", () => {
   assert.deepEqual(model?.input, ["text", "image"]);
 });
 
+test("mapModel with resolved fields never falls back to raw capabilities.effort_tiers", () => {
+  // Strict replacement: an enriched result that lacks reasoning levels must
+  // not recover upstream effort_tiers through the nested capabilities door.
+  const row = {
+    slug: "strict-m",
+    context_window: 64000,
+    capabilities: { effort_tiers: ["low", "high"] },
+  };
+  const enriched = mapModel(row, "http://x/v1", { context_window: 1000000 });
+  assert.equal(enriched?.reasoning, false);
+  assert.equal(enriched?.thinkingLevelMap, undefined);
+  assert.equal(enriched?.contextWindow, 1000000);
+  // Without enrichment the direct upstream row path still reads effort_tiers.
+  const direct = mapModel(row);
+  assert.equal(direct?.reasoning, true);
+  assert.equal(direct?.thinkingLevelMap?.high, "high");
+});
+
 test("mapModel accepts OmniRoute effort_tiers and fails closed for none-only", () => {
   const glm = mapModel({
     slug: "glm-5.3",

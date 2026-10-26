@@ -21,9 +21,11 @@ const LEGACY_ROOT_FIELDS: Readonly<Record<string, string>> = {
   models_dev_subscription: "delete it; models.dev `access` is now a declared label and no naming rule applies",
   channels: "use `- match: \"<prefix>/*\"` rules; append the global chain with @default when needed",
   global_fallback: "write the rule's `chain` explicitly; @default inserts the root chain in place",
+  fill_missing_only:
+    "delete it and place @self in `chain` instead: external entries before @self replace the old `false`, @self before external entries replaces the old `true`",
 };
-const KNOWN_ROOT_KEYS = new Set(["chain", "fill_missing_only", "models"]);
-const KNOWN_RULE_KEYS = new Set(["match", "chain", "fill_missing_only", "overrides"]);
+const KNOWN_ROOT_KEYS = new Set(["chain", "models"]);
+const KNOWN_RULE_KEYS = new Set(["match", "chain", "overrides"]);
 // Every removed field errors at rule level too — same migration hints as root.
 const LEGACY_RULE_FIELDS: Readonly<Record<string, string>> = LEGACY_ROOT_FIELDS;
 const FORBIDDEN_OVERRIDE_KEYS = new Set(["id", "provider", "api", "baseUrl"]);
@@ -32,16 +34,16 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function readBool(value: unknown, path: string): boolean | undefined {
-  if (value === undefined) return undefined;
-  if (typeof value !== "boolean") throw new MetadataConfigError(path, "expected a boolean");
-  return value;
-}
-
 function readChain(value: unknown, path: string): readonly string[] | undefined {
   if (value === undefined) return undefined;
   if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
     throw new MetadataConfigError(path, "expected a list of chain entry strings");
+  }
+  if (value.length === 0) {
+    throw new MetadataConfigError(
+      path,
+      'an explicit empty chain is not allowed; use ["@self"] for upstream-only metadata or omit `chain` to inherit',
+    );
   }
   for (const token of value as string[]) {
     if (token !== "@default") parseChainEntry(token, `${path} item ${JSON.stringify(token)}`);
@@ -76,7 +78,6 @@ function readModelRule(value: unknown, index: number, warnings: string[]): Model
   return {
     match,
     chain: readChain(value.chain, `${path}.chain`),
-    fillMissingOnly: readBool(value.fill_missing_only, `${path}.fill_missing_only`),
     overrides: readOverrides(value.overrides, `${path}.overrides`),
   };
 }
@@ -124,10 +125,12 @@ export function parseMetadataConfig(yamlText: string | undefined): MetadataConfi
     }
     models = root.models.map((rule, index) => readModelRule(rule, index, warnings));
   }
-  return {
-    chain: readChain(root.chain, "chain"),
-    fillMissingOnly: readBool(root.fill_missing_only, "fill_missing_only"),
-    models,
-    warnings,
-  };
+  const chain = readChain(root.chain, "chain");
+  if (chain?.includes("@default")) {
+    throw new MetadataConfigError(
+      'chain item "@default"',
+      "@default expands the root chain and is only allowed inside model rules",
+    );
+  }
+  return { chain, models, warnings };
 }

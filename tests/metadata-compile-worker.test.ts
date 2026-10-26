@@ -86,8 +86,8 @@ const CONFLICT_TABLES: SourceTables = {
   modelparams: { catalog: [] },
 };
 
-test("neededSites: empty chains load nothing; per-site chains load only their site", () => {
-  assert.equal(neededSites(parseMetadataConfig("chain: []"), ["m"]).size, 0);
+test("neededSites: @self-only chains load nothing; per-site chains load only their site", () => {
+  assert.equal(neededSites(parseMetadataConfig("chain: [\"@self\"]"), ["m"]).size, 0);
   assert.deepEqual(
     [...neededSites(parseMetadataConfig(undefined), ["m"])].sort(),
     ["modelparams.dev", "models.dev"],
@@ -102,7 +102,7 @@ test("neededSites: empty chains load nothing; per-site chains load only their si
     [...neededSites(parseMetadataConfig("chain: [\"modelparams.dev/z-ai/api_key\"]"), ["m"])],
     ["modelparams.dev"],
   );
-  const rule = parseMetadataConfig("models:\n  - match: m\n    chain: []");
+  const rule = parseMetadataConfig("models:\n  - match: m\n    chain: [\"@self\"]");
   assert.equal(neededSites(rule, ["m"]).size, 0);
 });
 
@@ -179,14 +179,15 @@ test("modelparams-only @creator chain resolves glm-5.1 through models.dev discov
   );
 }, { timeout: 60_000 });
 
-test("real Worker: empty chain never spawns and yields a no-entry catalog", async () => {
+test("real Worker: @self-only chain never spawns and yields an upstream-only catalog", async () => {
   agentDir(undefined);
   const { catalog, degraded } = await compileCatalogInWorker(
-    parseMetadataConfig("chain: []"),
+    parseMetadataConfig("chain: [\"@self\"]"),
     ["anything"],
   );
   assert.equal(degraded.length, 0);
   assert.equal(catalog.models[0].entries.length, 0);
+  assert.deepEqual(catalog.models[0].plan, [{ kind: "upstream", modelId: "anything" }]);
 });
 
 // --- dual-shape models.dev data (fix-metadata-query-expansion, task 2.3) -----
