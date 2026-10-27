@@ -17,11 +17,19 @@ embedding/image/video/audio kinds and non-text outputs while retaining
 image-input vision models.
 
 Every model is registered with the fixed `openai-api-extension` provider and
-`api: "openai-responses"`. Public IDs and gateway display names
-(`name`/`display_name`) come from the upstream row; the base URL comes from
-the effective connection configuration, not the model row. The source chain
-only selects capability fields and never changes authentication or routing.
-Only explicit `overrides` and Pi `models.json` `modelOverrides` can rename a model.
+`api: "openai-responses"`. Public IDs come from the upstream row; the base
+URL comes from the effective connection configuration, not the model row. The
+source chain selects fields and never changes the public ID, authentication or
+routing.
+
+The display name is a chain field like any other: `name` (aliases
+`name`/`display_name`) takes the first valid value in effective-chain order.
+`@self` supplies the gateway's own name at its position, and external entries
+supply their record name. With the default chain (external sources before
+`@self`) a model shows the source's name, for example `Claude Fable 5.1`;
+put `@self` first, or use `["@self"]`, to keep the gateway's name. When no
+chain entry supplies a name, the public ID is used. Rule `overrides` and Pi
+`models.json` `modelOverrides` still apply last.
 
 ## Final default values
 

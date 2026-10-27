@@ -250,11 +250,11 @@ export function mapModel(
     parseEfforts(pick("supported_reasoning_levels") ?? effortTiers),
   );
   const inputModalities = pick("input_modalities");
-  // The display name is always the gateway's own (name/display_name, else id);
-  // external metadata names never replace it — only user overrides can.
+  // The display name follows the chain like any field (`name` = name/display_name);
+  // without a chain-selected name it falls back to the public id. Overrides apply later.
   return {
     id: identity.id,
-    name: identity.name,
+    name: firstString(pick("name", "display_name")) ?? identity.id,
     provider: PROVIDER,
     api: "openai-responses",
     baseUrl,

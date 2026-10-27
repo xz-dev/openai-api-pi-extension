@@ -811,6 +811,38 @@ test("query expansion: regex collects every alias, literal first", () => {
   assert.equal(model.canonical, "anthropic/claude-fable-5-1");
 });
 
+// --- display name follows the chain (select-display-name-by-chain) -----------
+
+const FABLE_ROW = { id: "proxy/Claude Fable 5.1", name: "My Fable", type: "chat", context_window: 64000 };
+
+async function fableName(yaml: string, row: Record<string, unknown> = FABLE_ROW): Promise<{ id: string; name: string }> {
+  const { mapCompiledCatalog } = await import("../index.ts");
+  const compiled = compileCatalog(parseMetadataConfig(yaml), [row.id as string], EXPANSION_TABLES);
+  const model = mapCompiledCatalog([row], "http://127.0.0.1:1/v1", compiled).models[0];
+  return { id: model.id, name: model.name };
+}
+
+test("display name: regex query renames by the chain but never the public id", async () => {
+  // Default chain: models.dev ahead of @self, so the source's record name wins.
+  assert.deepEqual(await fableName(""), { id: "proxy/Claude Fable 5.1", name: "Claude Fable 5.1" });
+});
+
+test("display name: @self first keeps the gateway name", async () => {
+  assert.equal((await fableName(`chain: ["@self", "models.dev/@creator/api_key"]\n`)).name, "My Fable");
+  assert.equal((await fableName(`chain: ["@self"]\n`)).name, "My Fable");
+});
+
+test("display name: strict chain without @self and without a source name falls back to the id", async () => {
+  const row = { id: "caselab-m", display_name: "Gateway Name", type: "chat", context_window: 64000 };
+  const { name } = await fableName(`chain: ["models.dev/caselab/api_key"]\n`, row);
+  assert.equal(name, "caselab-m");
+});
+
+test("display name: explicit overrides still win over the chain", async () => {
+  const yaml = `models:\n  - match: "proxy/**"\n    overrides: {name: Work Model}\n`;
+  assert.equal((await fableName(yaml)).name, "Work Model");
+});
+
 test("query expansion: channel prefix does not change candidates", () => {
   const bare = compileCatalog(cfg(), ["claude-fable-5-1"], EXPANSION_TABLES).models[0];
   const deep = compileCatalog(cfg(), ["proxy/vendor/claude-fable-5-1"], EXPANSION_TABLES).models[0];

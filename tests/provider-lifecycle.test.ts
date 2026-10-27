@@ -835,10 +835,10 @@ test("automatic package checks start only after accepted network publication and
   await handlers.get("session_shutdown")?.({}, undefined);
 });
 
-test("enrichment keeps the original public id and gateway display name on the wire", { timeout: 10_000 }, async () => {
-  // The metadata source renames the model (external `name` + canonical id),
-  // but the published model and the Responses request model stay the
-  // upstream identity; only capability fields are adopted.
+test("enrichment keeps the original public id on the wire; display name follows the chain", { timeout: 10_000 }, async () => {
+  // The metadata source names the model (external `name` + canonical id):
+  // the display name follows the chain, but the published model and the
+  // Responses request model stay the upstream identity.
   const FIXTURE: SourceTables = {
     modelsDev: {
       providers: {
@@ -903,7 +903,7 @@ test("enrichment keeps the original public id and gateway display name on the wi
   assert.equal(result.errors.size, 0);
   const model = models.getModel(PROVIDER, "wire-m");
   assert.ok(model, "public id unchanged");
-  assert.equal(model?.name, "Gateway Wire", "external name must not replace the gateway display name");
+  assert.equal(model?.name, "External Display Name", "the default chain puts the source ahead of @self");
   assert.equal(model?.contextWindow, 555000, "capability fields still merge");
   assert.equal(models.getModel(PROVIDER, "acme/wire-m"), undefined, "no new public model");
   const out = await provider.streamSimple(model!, {
