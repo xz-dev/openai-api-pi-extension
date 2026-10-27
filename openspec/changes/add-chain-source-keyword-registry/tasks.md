@@ -36,4 +36,4 @@
 ## 7. 收尾验证
 
 - [x] 7.1 运行 `npm run check` 与 `openspec validate add-chain-source-keyword-registry --strict`；验证：两者均通过
-- [ ] 7.2 在 AI-gateway 侧用 submodule 指向该提交，用 esbuild 打包宿主中立入口与 worker；验证：打包成功且产物不含 Pi 包引用（与网关任务 2.x 联动）
+- [x] 7.2 在 AI-gateway 侧用 submodule 指向该提交，用 esbuild 打包宿主中立入口与 worker；验证：打包成功且产物不含 Pi 包引用（与网关任务 2.x 联动）
