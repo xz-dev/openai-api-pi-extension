@@ -3,6 +3,13 @@
 Credentials, base URL, catalog refresh, and per-model overrides for the
 `openai-api-extension` provider.
 
+The extension registers a complete Pi-native provider. Pi owns credentials,
+model refresh, persistence, offline restore, cancellation, and request-time
+endpoint selection. Models are discovered from `GET {baseUrl}/models` on Pi's
+provider refresh: `/login`, interactive background refresh, or
+`pi --refresh --list-models`. Which models are registered is described in
+[model metadata](model-metadata.md#upstream-catalog-and-registration).
+
 ## Credentials
 
 ### `/login` (recommended)
