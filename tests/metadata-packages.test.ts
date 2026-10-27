@@ -28,7 +28,7 @@ import {
   type MetadataPackagesDeps,
   type ProcessRunner,
   type RunResult,
-} from "../metadata-packages.ts";
+} from "../src/metadata-packages.ts";
 
 const dirs: string[] = [];
 afterEach(async () => {
@@ -382,7 +382,7 @@ test("manager: unconfigured defaults — npm for node, embedded bun only for sta
 // ---------------------------------------------------------------------------
 
 test("runner: no shell, bounded argv, private cwd/env, timeout + abort kill", async () => {
-  const { execFileRunner } = await import("../metadata-packages.ts");
+  const { execFileRunner } = await import("../src/metadata-packages.ts");
   const dir = tempDir();
   const res = await execFileRunner({
     command: "node",
@@ -1082,7 +1082,7 @@ test("f5: a healthy command is not killed by the cancellation grace timer", { ti
 });
 
 test("f5: pre-aborted signal rejects before spawn; descendants die with wrapper", async () => {
-  const { execFileRunner } = await import("../metadata-packages.ts");
+  const { execFileRunner } = await import("../src/metadata-packages.ts");
   const dir = tempDir();
   // Pre-abort: the runner must not even spawn.
   const pre = new AbortController();

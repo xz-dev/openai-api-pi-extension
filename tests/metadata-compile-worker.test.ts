@@ -14,13 +14,13 @@ import { afterEach, test } from "node:test";
 import {
   compileCatalogInWorker,
   neededSites,
-} from "../metadata-compile.ts";
+} from "../src/metadata-compile.ts";
 import {
   MetadataConfigError,
-} from "../model-metadata.ts";
-import { parseMetadataConfig } from "../metadata-config.ts";
-import type { SourceTables } from "../model-metadata.ts";
-import { metadataRoot } from "../metadata-packages.ts";
+} from "../src/model-metadata.ts";
+import { parseMetadataConfig } from "../src/metadata-config.ts";
+import type { SourceTables } from "../src/model-metadata.ts";
+import { metadataRoot } from "../src/metadata-packages.ts";
 
 const dirs: string[] = [];
 afterEach(async () => {

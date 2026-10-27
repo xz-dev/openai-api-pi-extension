@@ -39,7 +39,7 @@ configuration. The host must meet the
 The bridge uses Pi's existing request builder and response parser through its
 public `fetch` injection point; it does not copy Pi's Responses protocol code.
 [Provider entry](../index.ts) explicitly selects SSE **inside the SDK**, so newer
-hosts cannot bypass the [bridge](../responses-websocket-fetch.ts) with a second
+hosts cannot bypass the [bridge](../src/responses-websocket-fetch.ts) with a second
 native WebSocket planner. The bridge keeps the caller's requested transport.
 Only explicit `sse` keeps the direct HTTP path and hard-disables checkpoints.
 Where the host exposes `onTransport(transport, model)`, bridge requests report

@@ -13,31 +13,35 @@ For older development dependencies, see the
 
 ## Implementation entry points
 
+`index.ts` stays at the repository root as the Pi extension entry
+(`package.json` `pi.extensions`); every other source file lives in `src/`.
+Analysis drafts are kept in [`records/`](records/).
+
 - [`index.ts`](../index.ts) — provider entry: registration, `/login`,
   `/provider-info`, `/provider-metadata`, catalog mapping, transport selection.
-- [`model-metadata.ts`](../model-metadata.ts) — chain parsing, compile plan,
+- [`model-metadata.ts`](../src/model-metadata.ts) — chain parsing, compile plan,
   per-field source selection, `DEFAULT_CHAIN`.
-- [`metadata-config.ts`](../metadata-config.ts) — YAML config, legacy-field and
+- [`metadata-config.ts`](../src/metadata-config.ts) — YAML config, legacy-field and
   empty-chain errors. Split from `model-metadata.ts` so the compile worker keeps
   an import graph of only relative paths and `node:` builtins.
-- [`metadata-core.ts`](../metadata-core.ts) — host-neutral compile entry (no Pi
+- [`metadata-core.ts`](../src/metadata-core.ts) — host-neutral compile entry (no Pi
   imports): config parsing, `include_models` selection, record-source
   registration, Worker compile with a caller-supplied worker file or
   `tablesPath`, field resolution, and SourceTables conversion for hosts such
   as the AI-gateway models-enricher.
-- [`metadata-glob.ts`](../metadata-glob.ts) — the shared standard-glob matcher
+- [`metadata-glob.ts`](../src/metadata-glob.ts) — the shared standard-glob matcher
   for `match` and `include_models`; runs on the host thread only.
-- [`metadata-worker.ts`](../metadata-worker.ts) /
-  [`metadata-tables.ts`](../metadata-tables.ts) — Worker body and per-shape
+- [`metadata-worker.ts`](../src/metadata-worker.ts) /
+  [`metadata-tables.ts`](../src/metadata-tables.ts) — Worker body and per-shape
   SourceTables validation shared by every host's Worker entry.
-- [`metadata-compile.ts`](../metadata-compile.ts) / `metadata-compile-worker.mjs`
+- [`metadata-compile.ts`](../src/metadata-compile.ts) / `metadata-compile-worker.mjs`
   — Pi adapter: active data-package selection and the plugin's Worker entry.
-- [`metadata-view.ts`](../metadata-view.ts) — `/provider-metadata` rendering.
-- [`responses-websocket-fetch.ts`](../responses-websocket-fetch.ts) — Responses
+- [`metadata-view.ts`](../src/metadata-view.ts) — `/provider-metadata` rendering.
+- [`responses-websocket-fetch.ts`](../src/responses-websocket-fetch.ts) — Responses
   WebSocket bridge; see [transports](transports.md).
-- [`request-compression.ts`](../request-compression.ts) — shared compression
+- [`request-compression.ts`](../src/request-compression.ts) — shared compression
   policy bridge; see [request compression](request-compression.md).
-- [`response-checkpoints.ts`](../response-checkpoints.ts) /
+- [`response-checkpoints.ts`](../src/response-checkpoints.ts) /
   `checkpoint-adapter.ts` — checkpoint policy and storage; see
   [response checkpoints](response-checkpoints.md).
 

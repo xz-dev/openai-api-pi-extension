@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { formatPluginOutput, notifyPlugin, OUTPUT_PREFIX } from "../notification.ts";
+import { formatPluginOutput, notifyPlugin, OUTPUT_PREFIX } from "../src/notification.ts";
 
 test("plugin prefix is exact, idempotent and only on the first line", () => {
   const text = formatPluginOutput("first\nsecond");

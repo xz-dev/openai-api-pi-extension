@@ -249,9 +249,9 @@ Explicit SSE and allowed auto WS-to-SSE fallback never carry policy
 
 ## Source and validation scope
 
-- [Provider entry](../index.ts), [policy/host adapter](../checkpoint-adapter.ts),
-  [WS bridge](../responses-websocket-fetch.ts) and
-  [portable kernel](../response-checkpoints.ts).
+- [Provider entry](../index.ts), [policy/host adapter](../src/checkpoint-adapter.ts),
+  [WS bridge](../src/responses-websocket-fetch.ts) and
+  [portable kernel](../src/response-checkpoints.ts).
 - [Durable-provider tests](../tests/durable-provider.test.ts),
   [policy tests](../tests/checkpoint-policy.test.ts),
   [cooldown tests](../tests/checkpoint-cooldown.test.ts),

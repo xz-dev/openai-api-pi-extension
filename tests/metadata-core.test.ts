@@ -11,7 +11,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, test } from "node:test";
 
-import { buildSourceTables, parseMetadataConfig, runCompileWorker } from "../metadata-core.ts";
+import { buildSourceTables, parseMetadataConfig, runCompileWorker } from "../src/metadata-core.ts";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const WORKER = join(ROOT, "tests", "fixtures", "core-worker.mjs");
@@ -30,7 +30,7 @@ function scratch(): string {
 test("metadata-core static import graph has no Pi host package", () => {
   const seen = new Set<string>();
   const bare = new Set<string>();
-  const queue = [join(ROOT, "metadata-core.ts")];
+  const queue = [join(ROOT, "src", "metadata-core.ts")];
   while (queue.length > 0) {
     const file = queue.shift()!;
     if (seen.has(file)) continue;
@@ -65,7 +65,7 @@ registerHooks({ resolve(specifier, context, next) {
   if (specifier.startsWith("@earendil-works/")) throw new Error("Pi import: " + specifier);
   return next(specifier, context);
 } });
-const core = await import(${JSON.stringify(pathToFileURL(join(ROOT, "metadata-core.ts")).href)});
+const core = await import(${JSON.stringify(pathToFileURL(join(ROOT, "src", "metadata-core.ts")).href)});
 const config = core.parseMetadataConfigValue(
   { chain: ["@probe", "models.dev/anthropic/api_key"], include_models: ["**", "!hidden/**"] },
   { pathPrefix: "metadata", recordSources: ["@self", "@probe"] },

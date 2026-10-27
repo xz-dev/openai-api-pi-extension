@@ -7,7 +7,7 @@ import { createServer, type Server } from "node:http";
 import { WebSocketServer } from "ws";
 import type { Message } from "@earendil-works/pi-ai";
 import { createOpenAIApiProvider } from "../index.ts";
-import { closeResponsesWebSockets, createResponsesWebSocketBridge, getActualResponsesTransport } from "../responses-websocket-fetch.ts";
+import { closeResponsesWebSockets, createResponsesWebSocketBridge, getActualResponsesTransport } from "../src/responses-websocket-fetch.ts";
 
 const servers: Array<Server | WebSocketServer> = [];
 

@@ -12,9 +12,9 @@ import {
   resolveChainFields,
   type CompiledModel,
   type SourceTables,
-} from "../model-metadata.ts";
-import { parseMetadataConfig } from "../metadata-config.ts";
-import { matchRules, modelGlobMatches } from "../metadata-glob.ts";
+} from "../src/model-metadata.ts";
+import { parseMetadataConfig } from "../src/metadata-config.ts";
+import { matchRules, modelGlobMatches } from "../src/metadata-glob.ts";
 
 const cfg = (overrides: Record<string, unknown> = {}) => ({ warnings: [], ...overrides });
 // Rule matching is host-side; tests compute it the way the host does.

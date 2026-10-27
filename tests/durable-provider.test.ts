@@ -8,7 +8,7 @@ import { WebSocketServer } from "ws";
 import { createModels, InMemoryCredentialStore } from "@earendil-works/pi-ai";
 import { discoverAndLoadExtensions, ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
 import { createOpenAIApiProvider } from "../index.ts";
-import { closeResponsesWebSockets, createResponsesWebSocketBridge } from "../responses-websocket-fetch.ts";
+import { closeResponsesWebSockets, createResponsesWebSocketBridge } from "../src/responses-websocket-fetch.ts";
 import { openAIResponsesApi } from "@earendil-works/pi-ai/compat";
 import { readJsonBody } from "./fixtures/wire-decode.ts";
 

@@ -4,7 +4,7 @@ import type { Server } from "node:http";
 import { WebSocketServer } from "ws";
 import type { Message } from "@earendil-works/pi-ai";
 import { createOpenAIApiProvider } from "../index.ts";
-import { closeResponsesWebSockets } from "../responses-websocket-fetch.ts";
+import { closeResponsesWebSockets } from "../src/responses-websocket-fetch.ts";
 import { readJsonBody } from "./fixtures/wire-decode.ts";
 
 const servers: Array<Server | WebSocketServer> = [];

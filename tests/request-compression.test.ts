@@ -4,7 +4,7 @@ import { createServer, type IncomingMessage, type Server } from "node:http";
 import { afterEach, test } from "node:test";
 import { WebSocketServer } from "ws";
 import { createOpenAIApiProvider } from "../index.ts";
-import { closeResponsesWebSockets } from "../responses-websocket-fetch.ts";
+import { closeResponsesWebSockets } from "../src/responses-websocket-fetch.ts";
 
 const servers: Array<Server | WebSocketServer> = [];
 

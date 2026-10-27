@@ -49,7 +49,7 @@ function walkImportGraph(entry: string): { bare: { file: string; specifier: stri
 test("worker import graph: no bare package specifiers", () => {
   // Root: the .mjs entry statically imports the host-neutral body and the
   // compiler — the whole graph must stay relative + node: builtins.
-  const roots = [join(ROOT, "metadata-compile-worker.mjs")];
+  const roots = [join(ROOT, "src", "metadata-compile-worker.mjs")];
   const bare: { file: string; specifier: string }[] = [];
   const files: string[] = [];
   for (const root of roots) {

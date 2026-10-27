@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { adoptResponseAncestry, checkpointsEnabled, responseAncestry } from "../checkpoint-adapter.ts";
+import { adoptResponseAncestry, checkpointsEnabled, responseAncestry } from "../src/checkpoint-adapter.ts";
 import extension from "../index.ts";
 
 test("checkpoint policy: raw validation and minimatch identity/segment semantics", () => {

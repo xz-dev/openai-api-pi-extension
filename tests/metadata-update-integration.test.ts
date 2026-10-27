@@ -5,8 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import extension, { type createOpenAIApiProvider } from "../index.ts";
-import { MANAGED_PACKAGES, type ProcessRunner } from "../metadata-packages.ts";
-import { OUTPUT_PREFIX } from "../notification.ts";
+import { MANAGED_PACKAGES, type ProcessRunner } from "../src/metadata-packages.ts";
+import { OUTPUT_PREFIX } from "../src/notification.ts";
 
 test("update command activates data then refreshes, queries and exports the same versions", { timeout: 20_000 }, async () => {
   const agent = mkdtempSync(join(tmpdir(), "oapi-update-integration-"));

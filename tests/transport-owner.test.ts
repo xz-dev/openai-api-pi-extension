@@ -5,7 +5,7 @@ import { WebSocketServer } from "ws";
 import { createModels, InMemoryCredentialStore } from "@earendil-works/pi-ai";
 import * as responses from "@earendil-works/pi-ai/api/openai-responses";
 import { createOpenAIApiProvider } from "../index.ts";
-import { closeResponsesWebSockets, getActualResponsesTransport } from "../responses-websocket-fetch.ts";
+import { closeResponsesWebSockets, getActualResponsesTransport } from "../src/responses-websocket-fetch.ts";
 import { readJsonBody } from "./fixtures/wire-decode.ts";
 
 function events(id: string) {

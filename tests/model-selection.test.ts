@@ -8,16 +8,16 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, test } from "node:test";
 
-import { parseMetadataConfig, parseMetadataConfigValue } from "../metadata-config.ts";
-import { matchRules, selectModels } from "../metadata-glob.ts";
-import { renderCompiledCatalog } from "../metadata-view.ts";
+import { parseMetadataConfig, parseMetadataConfigValue } from "../src/metadata-config.ts";
+import { matchRules, selectModels } from "../src/metadata-glob.ts";
+import { renderCompiledCatalog } from "../src/metadata-view.ts";
 import {
   classifyModelMatch,
   compileCatalog,
   makeResolver,
   MetadataConfigError,
   type SourceTables,
-} from "../model-metadata.ts";
+} from "../src/model-metadata.ts";
 
 const EMPTY: SourceTables = { modelsDev: { providers: {} }, modelparams: { catalog: [] }, degraded: [] };
 

@@ -7,9 +7,9 @@ import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { afterEach, test } from "node:test";
 
-import { renderCompiledCatalog, sanitizeTerminalText } from "../metadata-view.ts";
-import { writeMetadataTempFile } from "../metadata-tmpfile.ts";
-import { OUTPUT_PREFIX } from "../notification.ts";
+import { renderCompiledCatalog, sanitizeTerminalText } from "../src/metadata-view.ts";
+import { writeMetadataTempFile } from "../src/metadata-tmpfile.ts";
+import { OUTPUT_PREFIX } from "../src/notification.ts";
 
 const claudeEntry = {
   entry: "models.dev/anthropic/api_key/claude-fable-5-1",
@@ -160,7 +160,7 @@ test("writeMetadataTempFile creates a 0600 file inside a 0700 pid-prefixed dir",
 test("writeMetadataTempFile returns an absolute path with a relative TMPDIR", () => {
   const dir = mkdtempSync(join(tmpdir(), "metadata-relative-tmp-"));
   dirs.push(dir);
-  const moduleUrl = new URL("../metadata-tmpfile.ts", import.meta.url).href;
+  const moduleUrl = new URL("../src/metadata-tmpfile.ts", import.meta.url).href;
   const result = spawnSync(process.execPath, ["--input-type=module", "-e",
     `import { writeMetadataTempFile } from ${JSON.stringify(moduleUrl)}; console.log(writeMetadataTempFile("hello"));`], {
     cwd: dir,

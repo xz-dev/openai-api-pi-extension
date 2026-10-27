@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { afterEach, test } from "node:test";
-import { createMetadataCommands, metadataHostRuntime, metadataOffline, type MetadataCommandOptions } from "../metadata-commands.ts";
-import { MANAGED_PACKAGES, type CheckResult, type UpdateResult } from "../metadata-packages.ts";
-import { OUTPUT_PREFIX } from "../notification.ts";
+import { createMetadataCommands, metadataHostRuntime, metadataOffline, type MetadataCommandOptions } from "../src/metadata-commands.ts";
+import { MANAGED_PACKAGES, type CheckResult, type UpdateResult } from "../src/metadata-packages.ts";
+import { OUTPUT_PREFIX } from "../src/notification.ts";
 
 const originalOffline = process.env.PI_OFFLINE;
 afterEach(() => {

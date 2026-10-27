@@ -11,7 +11,7 @@ import {
   fieldIsMissing,
   type CompiledModel,
   type SourceTables,
-} from "../model-metadata.ts";
+} from "../src/model-metadata.ts";
 import { matchCategories } from "../index.ts";
 
 /**

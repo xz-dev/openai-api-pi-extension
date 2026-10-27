@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { once } from "node:events";
 import { test, type TestContext } from "node:test";
 import { WebSocketServer, type WebSocket } from "ws";
-import { createResponsesWebSocketBridge, closeResponsesWebSockets } from "../responses-websocket-fetch.ts";
+import { createResponsesWebSocketBridge, closeResponsesWebSockets } from "../src/responses-websocket-fetch.ts";
 
 const user = (content: string) => ({ role: "user", content });
 const assistant = (id: string) => ({ type: "message", id: `msg_${id}`, role: "assistant", status: "completed",

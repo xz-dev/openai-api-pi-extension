@@ -16,7 +16,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 const [root, gateDir, tag, registryLatest] = process.argv.slice(2);
-const { updateMetadataPackages } = await import(new URL("../../metadata-packages.ts", import.meta.url).href);
+const { updateMetadataPackages } = await import(new URL("../../src/metadata-packages.ts", import.meta.url).href);
 
 const ok = (stdout = "") => ({ code: 0, signal: null, stdout, stderr: "" });
 const PACKAGES = ["@opencode-ai/models", "modelparams"];

@@ -27,7 +27,7 @@ import {
 	responseEventOutput,
 	responseOutputItemsCapturable,
 	sha256Hex,
-} from "../response-checkpoints.ts";
+} from "../src/response-checkpoints.ts";
 
 const NOW = 1_760_000_000_000;
 const SCOPE_A = "a".repeat(64);

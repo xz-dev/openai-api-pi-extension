@@ -10,7 +10,7 @@ import {
 } from "@earendil-works/pi-ai";
 import { createOpenAIApiProvider } from "../index.ts";
 import { readJsonBody } from "./fixtures/wire-decode.ts";
-import { OUTPUT_PREFIX } from "../notification.ts";
+import { OUTPUT_PREFIX } from "../src/notification.ts";
 
 const PROVIDER = "openai-api-extension";
 const BASE_URL_ENV = "OPENAI_API_EXTENSION_BASE_URL";
@@ -399,8 +399,8 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { SourceTables } from "../model-metadata.ts";
-import type { CompileDeps } from "../metadata-compile.ts";
+import type { SourceTables } from "../src/model-metadata.ts";
+import type { CompileDeps } from "../src/metadata-compile.ts";
 
 const metadataDirs: string[] = [];
 const realFetch = globalThis.fetch;
@@ -1042,9 +1042,9 @@ test("config error reports an error notification and keeps the old catalog", asy
 
 test("matchCategories: mutually exclusive, conservative, name-only is not a hit", async () => {
   const { matchCategories, mapCompiledCatalog } = await import("../index.ts");
-  const { compileCatalog } = await import("../model-metadata.ts");
-  const { matchRules } = await import("../metadata-glob.ts");
-  const { parseMetadataConfig } = await import("../metadata-config.ts");
+  const { compileCatalog } = await import("../src/model-metadata.ts");
+  const { matchRules } = await import("../src/metadata-glob.ts");
+  const { parseMetadataConfig } = await import("../src/metadata-config.ts");
   const t = {
     modelsDev: {
       providers: {

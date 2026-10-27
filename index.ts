@@ -27,8 +27,8 @@ import {
 } from "@earendil-works/pi-ai";
 import { openAIResponsesApi } from "@earendil-works/pi-ai/compat";
 import { adoptResponseAncestry, checkpointCandidate, checkpointsEnabled, encodeCheckpointOutput, responseAncestry, type CheckpointOptions,
-  type ResponseAncestryState } from "./checkpoint-adapter.ts";
-import { compileCatalogInWorker } from "./metadata-compile.ts";
+  type ResponseAncestryState } from "./src/checkpoint-adapter.ts";
+import { compileCatalogInWorker } from "./src/metadata-compile.ts";
 import {
   externalFields,
   fieldIsMissing,
@@ -40,20 +40,20 @@ import {
   type CompiledModel,
   type MetadataFields,
   type ModelSelection,
-} from "./model-metadata.ts";
-import { parseMetadataConfig } from "./metadata-config.ts";
-import { selectModels } from "./metadata-glob.ts";
-import { renderCompiledCatalog } from "./metadata-view.ts";
-import { formatPluginOutput, notifyPlugin } from "./notification.ts";
-import { createMetadataCommands, type MetadataCommandOptions } from "./metadata-commands.ts";
-import { writeMetadataTempFile } from "./metadata-tmpfile.ts";
+} from "./src/model-metadata.ts";
+import { parseMetadataConfig } from "./src/metadata-config.ts";
+import { selectModels } from "./src/metadata-glob.ts";
+import { renderCompiledCatalog } from "./src/metadata-view.ts";
+import { formatPluginOutput, notifyPlugin } from "./src/notification.ts";
+import { createMetadataCommands, type MetadataCommandOptions } from "./src/metadata-commands.ts";
+import { writeMetadataTempFile } from "./src/metadata-tmpfile.ts";
 import {
   createResponsesWebSocketBridge,
   getActualResponsesTransport,
   redactAssistantStream,
   type ResponsesWebSocketBridge,
   wrapResponsesWebSocketStream,
-} from "./responses-websocket-fetch.ts";
+} from "./src/responses-websocket-fetch.ts";
 
 const PROVIDER = "openai-api-extension";
 // Newer hosts require transcript-normalized tools/system messages; stock has no normalizer.

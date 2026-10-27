@@ -9,7 +9,7 @@ import { registerHooks } from "node:module";
 import { WebSocketServer } from "ws";
 import { discoverAndLoadExtensions, ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
 import { openAIResponsesApi } from "@earendil-works/pi-ai/compat";
-import { encodeCheckpointOutput } from "../checkpoint-adapter.ts";
+import { encodeCheckpointOutput } from "../src/checkpoint-adapter.ts";
 import { readJsonBody } from "./fixtures/wire-decode.ts";
 
 const project = resolve(dirname(fileURLToPath(import.meta.url)), "..");

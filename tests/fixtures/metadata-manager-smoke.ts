@@ -1,8 +1,8 @@
 // Test-only --help probe: no registry, installation, model request or session entry.
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { metadataPackageDeps } from "../../metadata-commands.ts";
-import { execFileRunner, selectPackageManager } from "../../metadata-packages.ts";
-import { formatPluginOutput } from "../../notification.ts";
+import { metadataPackageDeps } from "../../src/metadata-commands.ts";
+import { execFileRunner, selectPackageManager } from "../../src/metadata-packages.ts";
+import { formatPluginOutput } from "../../src/notification.ts";
 
 export default async function (_pi: ExtensionAPI) {
   const deps = metadataPackageDeps({ cwd: process.cwd(), isProjectTrusted: () => false });
