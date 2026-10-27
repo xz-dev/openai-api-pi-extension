@@ -48,7 +48,7 @@
     "@opencode-ai/models": "*",
     "minimatch": "10.2.6",
     "modelparams": "*",
-    "openai": "6.40.0",
+    "openai": "7.43.0",
     "semver": "^7.8.5",
     "ws": "^8.18.0",
     "yaml": "^2.9.1"
