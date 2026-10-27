@@ -36,7 +36,7 @@ const compiled = {
       matchedRules: [1],
       plan: [
         { kind: "external" as const, entry: claudeEntry },
-        { kind: "upstream" as const, modelId: "claude-fable-5-1" },
+        { kind: "record" as const, keyword: "@self", modelId: "claude-fable-5-1" },
       ],
       entries: [claudeEntry],
       externalChain: true,
@@ -125,6 +125,27 @@ test("renderCompiledCatalog shows config, versions, entries, upstream node, unre
   assert.match(text, /skipped: modelparams\.dev\/@creator\/api_key\/@id \(no creator record\)/);
   assert.match(text, /overrides: \{"contextWindow":200000\}/);
   assert.doesNotMatch(text, /api key|api_key=|bearer|\btoken\b/i, "rendered view must not contain a credential");
+});
+
+test("renderCompiledCatalog lists include_models-hidden models with the deciding entry", () => {
+  const text = renderCompiledCatalog(compiled, undefined, {
+    kept: ["claude-fable-5-1"],
+    hidden: [
+      { id: "codex/gpt-image-1", ruleIndex: 1, pattern: "!**/gpt-image-*" },
+      { id: "other/m", ruleIndex: null },
+    ],
+  });
+  assert.match(text, /== include_models ==\nkept 1  hidden 2/);
+  assert.match(text, /\n  codex\/gpt-image-1  include_models\[1\] !\*\*\/gpt-image-\*\n/);
+  assert.match(text, /\n  other\/m  无规则命中/);
+  // Hidden models were never compiled: no model section for them.
+  const models = text.slice(text.indexOf("== models =="));
+  assert.doesNotMatch(models, /gpt-image-1|other\/m/);
+});
+
+test("renderCompiledCatalog has no hidden section without include_models", () => {
+  const text = renderCompiledCatalog(compiled);
+  assert.doesNotMatch(text, /include_models|hidden/);
 });
 
 test("writeMetadataTempFile creates a 0600 file inside a 0700 pid-prefixed dir", () => {

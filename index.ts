@@ -39,8 +39,10 @@ import {
   type CompiledCatalog,
   type CompiledModel,
   type MetadataFields,
+  type ModelSelection,
 } from "./model-metadata.ts";
 import { parseMetadataConfig } from "./metadata-config.ts";
+import { selectModels } from "./metadata-glob.ts";
 import { renderCompiledCatalog } from "./metadata-view.ts";
 import { formatPluginOutput, notifyPlugin } from "./notification.ts";
 import { createMetadataCommands, type MetadataCommandOptions } from "./metadata-commands.ts";
@@ -339,11 +341,15 @@ export async function fetchModels(
 }
 
 const METADATA_CONFIG_FILE = "openai-api-extension.yaml";
+/** Record sources the Pi plugin registers: `@self` = the model's upstream row. */
+const PI_RECORD_SOURCES = ["@self"] as const;
 
 export type CatalogEnrichment = {
   models: GatewayModel[];
   /** Human-readable one-line notes: ignored config fields and degraded sources. */
   notes: string[];
+  /** Warning-level notes (e.g. include_models hid every model). */
+  warnings: string[];
 };
 
 /**
@@ -371,7 +377,7 @@ export async function enrichCatalog(
       throw new MetadataConfigError(METADATA_CONFIG_FILE, errorMessage(error));
     }
   }
-  const config = parseMetadataConfig(text);
+  const config = parseMetadataConfig(text, { recordSources: PI_RECORD_SOURCES });
   // Validate identity and filter non-chat entries first so an embedding
   // model's conflicting creator can't block chat-model compilation.
   const chatEntries: { entry: unknown; id: string }[] = [];
@@ -385,22 +391,30 @@ export async function enrichCatalog(
     if (!isConversationalTextModel(row)) continue;
     chatEntries.push({ entry, id: identity.id });
   }
-  const publicIds = chatEntries.map((item) => item.id);
+  // include_models runs before compilation: hidden ids never reach the
+  // Worker and their upstream rows are never read.
+  const selection = selectModels(config, chatEntries.map((item) => item.id));
   signal?.throwIfAborted();
-  const compiled = (await compileCatalogInWorker(config, publicIds, deps, signal)).catalog;
-  return mapCompiledCatalog(entries, baseUrl, compiled);
+  const compiled = (await compileCatalogInWorker(config, selection.kept, deps, signal)).catalog;
+  return mapCompiledCatalog(entries, baseUrl, compiled, selection);
 }
 
 /**
  * Maps upstream entries against a compiled catalog: metadata merge, mapModel,
- * then RFC 7396 overrides on the final Pi model.
+ * then RFC 7396 overrides on the final Pi model. Ids hidden by `selection`
+ * are skipped; when every model is hidden the empty catalog is valid and a
+ * warning says so.
  */
 export function mapCompiledCatalog(
   entries: readonly unknown[],
   baseUrl: string,
   compiled: CompiledCatalog,
+  selection?: ModelSelection,
 ): CatalogEnrichment {
-  const resolver = makeResolver(compiled);
+  const hidden = new Set(selection?.hidden.map((item) => item.id));
+  // `@self` reads the model's own upstream row by reference; no copies.
+  const rows = new Map<string, Readonly<Record<string, unknown>>>();
+  const resolver = makeResolver(compiled, { "@self": (publicId) => rows.get(publicId) });
   const models = entries
     .flatMap((entry) => {
       if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
@@ -409,8 +423,9 @@ export function mapCompiledCatalog(
       const row = entry as UpstreamModel;
       const identity = entryIdentity(row);
       if (!identity) throw new Error("Model discovery returned an invalid catalog entry");
-      if (!isConversationalTextModel(row)) return [];
-      const enriched = resolver.resolve(identity.id, row as Readonly<Record<string, unknown>>);
+      if (!isConversationalTextModel(row) || hidden.has(identity.id)) return [];
+      rows.set(identity.id, row as Readonly<Record<string, unknown>>);
+      const enriched = resolver.resolve(identity.id) ?? normalizeFields(row as Readonly<Record<string, unknown>>);
       const model = mapModel(entry, baseUrl, enriched);
       if (!model) throw new Error("Model discovery returned an invalid catalog entry");
       for (const patch of resolver.overridePatches(identity.id)) {
@@ -419,7 +434,12 @@ export function mapCompiledCatalog(
       return [model];
     })
     .sort((left, right) => left.id.localeCompare(right.id));
-  if (models.length === 0) throw new Error("Model discovery returned no usable models");
+  rows.clear();
+  const warnings: string[] = [];
+  if (models.length === 0) {
+    if (hidden.size === 0) throw new Error("Model discovery returned no usable models");
+    warnings.push(`include_models hid all ${hidden.size} models; the published catalog is empty`);
+  }
   const notes = compiled.warnings.length > 0
     ? [`ignored unsupported fields: ${compiled.warnings.join(", ")}`]
     : [];
@@ -437,7 +457,7 @@ export function mapCompiledCatalog(
         (categories.disabled > 0 ? ` (${categories.disabled} with external chain disabled)` : ""),
     );
   }
-  return { models, notes };
+  return { models, notes, warnings };
 }
 
 /**
@@ -570,11 +590,14 @@ function apiKeyAuth(
         throw new Error(formatPluginOutput(errorMessage(error), [apiKey]), { cause: error });
       });
       try {
-        const { models, notes } = await enrichCatalog(entries, baseUrl, interaction.signal, deps);
+        const { models, notes, warnings } = await enrichCatalog(entries, baseUrl, interaction.signal, deps);
         // A cancelled login must not publish the catalogue it fetched.
         interaction.signal.throwIfAborted();
         onValidated(baseUrl, apiKey, models);
         for (const note of notes) interaction.notify({ type: "info", message: formatPluginOutput(`Metadata: ${note}`, [apiKey]) });
+        for (const warning of warnings) {
+          interaction.notify({ type: "info", message: formatPluginOutput(`Metadata warning: ${warning}`, [apiKey]) });
+        }
         interaction.notify({ type: "info", message: formatPluginOutput(`Found ${models.length} models.`) });
       } catch (error) {
         // Caller cancel is not a catalog problem: propagate, never degrade.
@@ -610,9 +633,9 @@ export function createOpenAIApiProvider(
   onCatalogError?: (message: string) => void,
   getRawCheckpointExclude: () => unknown = () => undefined,
   getRawCheckpointMode: () => unknown = () => undefined,
-  /** Called once per report with that report's notes so the caller can
-   *  suppress only repeats of the immediately previous report. */
-  onCatalogNotes?: (notes: readonly string[]) => void,
+  /** Called once per report with that report's notes (and warning-level
+   *  notes) so the caller can suppress only repeats of the previous report. */
+  onCatalogNotes?: (notes: readonly string[], warnings: readonly string[]) => void,
   metadataDeps?: Parameters<typeof compileCatalogInWorker>[2],
 ): Provider<"openai-responses"> {
   let models = initialModels;
@@ -687,7 +710,7 @@ export function createOpenAIApiProvider(
       const apiKey = context.credential.key;
       if (!baseUrl || !apiKey) return;
       try {
-        const { models: refreshed, notes } = await fetchEnrichedCatalog(baseUrl, apiKey, context.signal, metadataDeps);
+        const { models: refreshed, notes, warnings } = await fetchEnrichedCatalog(baseUrl, apiKey, context.signal, metadataDeps);
         if (context.signal.aborted) return;
         // Report only after the publish is accepted: an aborted or superseded
         // refresh must not surface notes for a catalog that never went live.
@@ -697,7 +720,7 @@ export function createOpenAIApiProvider(
         });
         if (published === false) return;
         try {
-          onCatalogNotes?.(notes);
+          onCatalogNotes?.(notes, warnings);
         } catch {
           /* reporter must not mask the refresh */
         }
@@ -769,10 +792,11 @@ export default async function (pi: ExtensionAPI, dependencies: {
   // catalog back to back. When a note drops out of a report it may resurface,
   // and an empty report clears the dedupe state.
   const noteDedupe = makeConsecutiveNoteDedupe();
-  const reportCatalogNotes = (notes: readonly string[]) => {
+  const reportCatalogNotes = (notes: readonly string[], warnings: readonly string[] = []) => {
     for (const note of noteDedupe(notes)) {
       emitDiagnostic("info", `metadata note: ${note}`);
     }
+    for (const warning of warnings) emitDiagnostic("warning", `metadata warning: ${warning}`);
     packageCommands.backgroundCheck();
   };
   const getTransport = (ctx: { cwd: string; isProjectTrusted(): boolean }) => {
@@ -812,13 +836,14 @@ export default async function (pi: ExtensionAPI, dependencies: {
       }
 
       try {
-        const { models, notes } = await fetchEnrichedCatalog(baseUrl, apiKey, AbortSignal.timeout(CONNECTION_TIMEOUT_MS), dependencies.metadataCompile);
+        const { models, notes, warnings } = await fetchEnrichedCatalog(baseUrl, apiKey, AbortSignal.timeout(CONNECTION_TIMEOUT_MS), dependencies.metadataCompile);
         notifyPlugin(ctx, [
           ...lines,
           "Connection: ✓ connected; API key valid",
           ...notes.map((note) => `Metadata note: ${note}`),
+          ...warnings.map((warning) => `Metadata warning: ${warning}`),
           `Models: ${models.length}`,
-        ].join("\n"), "info", [apiKey]);
+        ].join("\n"), warnings.length > 0 ? "warning" : "info", [apiKey]);
       } catch (error) {
         const reason = errorMessage(error).split(apiKey).join("[REDACTED]");
         // A metadata config error is not an auth failure: the key already
@@ -858,25 +883,27 @@ export default async function (pi: ExtensionAPI, dependencies: {
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
         }
-        const config = parseMetadataConfig(yaml);
+        const config = parseMetadataConfig(yaml, { recordSources: PI_RECORD_SOURCES });
         const publicIds = entries.flatMap((entry) => {
           if (typeof entry !== "object" || entry === null || Array.isArray(entry)) return [];
           const row = entry as UpstreamModel;
           const id = entryIdentity(row)?.id;
           return id && isConversationalTextModel(row) ? [id] : [];
         });
-        const compiled = (await compileCatalogInWorker(config, publicIds, dependencies.metadataCompile)).catalog;
+        const selection = selectModels(config, publicIds);
+        const compiled = (await compileCatalogInWorker(config, selection.kept, dependencies.metadataCompile)).catalog;
         // Minimal read-only upstream context for the view: the same fetch's
-        // rows normalized through the capability whitelist — never raw rows
-        // or credentials.
+        // kept rows normalized through the capability whitelist — never raw
+        // rows, hidden models or credentials.
+        const kept = new Set(selection.kept);
         const upstreamFields: Record<string, MetadataFields> = {};
         for (const entry of entries) {
           if (typeof entry !== "object" || entry === null || Array.isArray(entry)) continue;
           const row = entry as UpstreamModel;
           const id = entryIdentity(row)?.id;
-          if (id && isConversationalTextModel(row)) upstreamFields[id] = normalizeFields(row as Readonly<Record<string, unknown>>);
+          if (id && kept.has(id) && isConversationalTextModel(row)) upstreamFields[id] = normalizeFields(row as Readonly<Record<string, unknown>>);
         }
-        text = renderCompiledCatalog(compiled, upstreamFields);
+        text = renderCompiledCatalog(compiled, upstreamFields, config.includeModels ? selection : undefined);
       } catch (error) {
         failed = true;
         // A config error still produces a diagnostics file the user can page.

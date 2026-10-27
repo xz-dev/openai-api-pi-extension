@@ -187,7 +187,7 @@ test("real Worker: @self-only chain never spawns and yields an upstream-only cat
   );
   assert.equal(degraded.length, 0);
   assert.equal(catalog.models[0].entries.length, 0);
-  assert.deepEqual(catalog.models[0].plan, [{ kind: "upstream", modelId: "anything" }]);
+  assert.deepEqual(catalog.models[0].plan, [{ kind: "record", keyword: "@self", modelId: "anything" }]);
 });
 
 // --- dual-shape models.dev data (fix-metadata-query-expansion, task 2.3) -----

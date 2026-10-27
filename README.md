@@ -59,8 +59,8 @@ and the persisted catalog restores offline. On a fresh install, run
 
 - [Configuration](docs/configuration.md) — credentials, environment variables,
   first refresh, per-model overrides, `/provider-info`.
-- [Model metadata](docs/model-metadata.md) — source chains and `@self`, rules,
-  real default values, migration, `/provider-metadata` export, data packages.
+- [Model metadata](docs/model-metadata.md) — source chains and `@self`, glob
+  rules and `include_models`, real default values, migration, `/provider-metadata` export, data packages.
 - [Transports](docs/transports.md) — `sse`/`websocket`/`websocket-cached`/`auto`,
   recovery limits, wire credentials.
 - [Request compression](docs/request-compression.md) — host requirement and

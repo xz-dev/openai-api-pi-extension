@@ -47,9 +47,9 @@ function walkImportGraph(entry: string): { bare: { file: string; specifier: stri
 }
 
 test("worker import graph: no bare package specifiers", () => {
-  // Roots: the .mjs body plus the compile module the worker imports
-  // dynamically via workerData.compileModulePath — same resolution domain.
-  const roots = [join(ROOT, "metadata-compile-worker.mjs"), join(ROOT, "model-metadata.ts")];
+  // Root: the .mjs entry statically imports the host-neutral body and the
+  // compiler — the whole graph must stay relative + node: builtins.
+  const roots = [join(ROOT, "metadata-compile-worker.mjs")];
   const bare: { file: string; specifier: string }[] = [];
   const files: string[] = [];
   for (const root of roots) {

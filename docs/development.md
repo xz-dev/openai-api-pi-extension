@@ -20,8 +20,18 @@ For older development dependencies, see the
 - [`metadata-config.ts`](../metadata-config.ts) — YAML config, legacy-field and
   empty-chain errors. Split from `model-metadata.ts` so the compile worker keeps
   an import graph of only relative paths and `node:` builtins.
+- [`metadata-core.ts`](../metadata-core.ts) — host-neutral compile entry (no Pi
+  imports): config parsing, `include_models` selection, record-source
+  registration, Worker compile with a caller-supplied worker file or
+  `tablesPath`, field resolution, and SourceTables conversion for hosts such
+  as the AI-gateway models-enricher.
+- [`metadata-glob.ts`](../metadata-glob.ts) — the shared standard-glob matcher
+  for `match` and `include_models`; runs on the host thread only.
+- [`metadata-worker.ts`](../metadata-worker.ts) /
+  [`metadata-tables.ts`](../metadata-tables.ts) — Worker body and per-shape
+  SourceTables validation shared by every host's Worker entry.
 - [`metadata-compile.ts`](../metadata-compile.ts) / `metadata-compile-worker.mjs`
-  — per-site loading, worker orchestration, per-model rule layering.
+  — Pi adapter: active data-package selection and the plugin's Worker entry.
 - [`metadata-view.ts`](../metadata-view.ts) — `/provider-metadata` rendering.
 - [`responses-websocket-fetch.ts`](../responses-websocket-fetch.ts) — Responses
   WebSocket bridge; see [transports](transports.md).

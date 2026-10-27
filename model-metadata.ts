@@ -39,8 +39,8 @@ export type AccessType = "subscription" | "api_key";
 const ACCESS_TYPES: ReadonlySet<string> = new Set(["subscription", "api_key"]);
 
 /**
- * One parsed chain entry: either an external source query or the ordered
- * upstream source `@self`. `model` is the literal 4th segment when present,
+ * One parsed chain entry: either an external source query or a host-registered
+ * record source (`@self` in Pi). `model` is the literal 4th segment when present,
  * otherwise "@id" meaning "use the model's own query candidates". The 4th
  * segment may itself contain "/"; parsing splits on the FIRST three slashes
  * only, so `models.dev/openai/api_key/openai/gpt-5` has model
@@ -55,10 +55,14 @@ export type ExternalChainEntry = {
   token: string; // original text
 };
 
-/** `@self`: the model's own upstream capability data at this position. */
-export type UpstreamChainEntry = { kind: "upstream"; token: "@self" };
+/**
+ * A host-registered record source keyword (Pi: `@self`, the model's own
+ * upstream row) at this position. Only the keyword crosses into the Worker;
+ * the host resolves the record on its own thread.
+ */
+export type RecordChainEntry = { kind: "record"; keyword: string };
 
-export type ChainEntry = ExternalChainEntry | UpstreamChainEntry;
+export type ChainEntry = ExternalChainEntry | RecordChainEntry;
 
 export const DEFAULT_CHAIN: readonly string[] = [
   "models.dev/@creator/api_key",
@@ -66,14 +70,49 @@ export const DEFAULT_CHAIN: readonly string[] = [
   "@self",
 ];
 
+/** Record sources registered when a host passes none (the Pi plugin's set). */
+export const DEFAULT_RECORD_SOURCES: readonly string[] = ["@self"];
+const RECORD_KEYWORD = /^@[a-z0-9-]+$/;
+const RESERVED_KEYWORDS: ReadonlySet<string> = new Set(["@default", "@creator", "@id"]);
+
+/**
+ * Validates a host's record-source registration. Invalid or reserved names
+ * are a host programming error, not a user config error.
+ */
+export function validateRecordSources(keywords: readonly string[]): readonly string[] {
+  if (!Array.isArray(keywords)) throw new TypeError("record sources must be a list of keywords");
+  const seen = new Set<string>();
+  for (const keyword of keywords) {
+    if (typeof keyword !== "string" || !RECORD_KEYWORD.test(keyword)) {
+      throw new TypeError(`invalid record source keyword ${JSON.stringify(keyword)}: expected @ followed by [a-z0-9-]`);
+    }
+    if (RESERVED_KEYWORDS.has(keyword)) {
+      throw new TypeError(`record source keyword ${keyword} is reserved`);
+    }
+    if (seen.has(keyword)) throw new TypeError(`record source keyword ${keyword} registered twice`);
+    seen.add(keyword);
+  }
+  return keywords;
+}
+
 /** Parses one chain entry; "@default" is expanded by the caller, not here. */
-export function parseChainEntry(token: string, path: string): ChainEntry {
+export function parseChainEntry(
+  token: string,
+  path: string,
+  recordSources: readonly string[] = DEFAULT_RECORD_SOURCES,
+): ChainEntry {
   if (typeof token !== "string" || token.trim() !== token || token === "") {
     throw new MetadataConfigError(path, "chain entries must be non-empty strings");
   }
-  if (token === "@self") return { kind: "upstream", token: "@self" };
   if (token === "@default") {
     throw new MetadataConfigError(path, "@default is expanded before entry parsing and must not reach parseChainEntry");
+  }
+  if (token.startsWith("@")) {
+    if (recordSources.includes(token)) return { kind: "record", keyword: token };
+    throw new MetadataConfigError(
+      path,
+      `unknown record source ${JSON.stringify(token)}; available: ${recordSources.length > 0 ? recordSources.join(", ") : "(none)"}`,
+    );
   }
   // Split on the first three "/" only so a literal model id may contain "/".
   const first = token.indexOf("/");
@@ -99,14 +138,19 @@ export function parseChainEntry(token: string, path: string): ChainEntry {
 }
 
 /** Config-facing chain read: "@default" expands the root effective chain. */
-function expandChain(tokens: readonly string[], rootChain: readonly string[], path: string): ChainEntry[] {
+function expandChain(
+  tokens: readonly string[],
+  rootChain: readonly string[],
+  path: string,
+  recordSources: readonly string[],
+): ChainEntry[] {
   const out: string[] = [];
   for (const token of tokens) {
     if (token === "@default") out.push(...rootChain);
     else out.push(token);
   }
   const entries: ChainEntry[] = [];
-  for (const token of out) entries.push(parseChainEntry(token, `${path} item ${JSON.stringify(token)}`));
+  for (const token of out) entries.push(parseChainEntry(token, `${path} item ${JSON.stringify(token)}`, recordSources));
   return entries;
 }
 
@@ -115,46 +159,46 @@ function expandChain(tokens: readonly string[], rootChain: readonly string[], pa
 // ---------------------------------------------------------------------------
 
 export type ModelRule = {
-  match: string;
+  match: string; // standard glob; matched on the host thread (metadata-glob.ts)
   chain?: readonly string[]; // raw tokens; may contain "@default"
   overrides?: Readonly<Record<string, unknown>>;
+};
+
+/** One `include_models` entry: `!` prefix hides, otherwise keeps. */
+export type IncludeRule = {
+  /** The entry exactly as written, including any leading `!`. */
+  raw: string;
+  exclude: boolean;
+  /** The glob after removing a leading `!`. */
+  glob: string;
 };
 
 export type MetadataConfig = {
   /** undefined = absent (use DEFAULT_CHAIN); an explicit [] is a config error. */
   chain?: readonly string[];
   models?: readonly ModelRule[];
+  /** undefined = absent (keep every model); an explicit [] is a config error. */
+  includeModels?: readonly IncludeRule[];
+  /** Host-registered record source keywords; undefined = DEFAULT_RECORD_SOURCES. */
+  recordSources?: readonly string[];
   warnings: readonly string[];
 };
 
 
 // ---------------------------------------------------------------------------
-// Glob matching on the public id (plain string; `*` spans "/").
+// Model selection results (matching itself lives in metadata-glob.ts).
 // ---------------------------------------------------------------------------
 
-/**
- * Plain-string glob match: `*` matches zero or more of any character
- * (including `/`), everything else is literal. Anchored, case-sensitive.
- */
-export function matchModelPattern(pattern: string, id: string): boolean {
-  const chunks = pattern.split("*");
-  if (chunks.length === 1) return pattern === id;
-  const first = chunks[0];
-  if (first !== "" && !id.startsWith(first)) return false;
-  const last = chunks[chunks.length - 1];
-  if (last !== "" && !id.endsWith(last)) return false;
-  if (id.length < first.length + last.length) return false;
-  let pos = first.length;
-  const end = id.length - last.length;
-  for (let index = 1; index < chunks.length - 1; index++) {
-    const chunk = chunks[index];
-    if (chunk === "") continue;
-    const found = id.indexOf(chunk, pos);
-    if (found === -1 || found + chunk.length > end) return false;
-    pos = found + chunk.length;
-  }
-  return true;
-}
+export type HiddenModel = {
+  id: string;
+  /** 0-based include_models index that hid the model; null = no entry matched. */
+  ruleIndex: number | null;
+  /** The deciding entry as written (with `!`), when one matched. */
+  pattern?: string;
+};
+
+export type ModelSelection = { kept: string[]; hidden: HiddenModel[] };
+
 
 // ---------------------------------------------------------------------------
 // Internal query expansion (last `/` segment only).
@@ -497,14 +541,14 @@ export type QueryCandidate = {
 /** One node of the fixed execution chain, in declared order. */
 export type CompiledPlanNode =
   | { kind: "external"; entry: CompiledEntry }
-  | { kind: "upstream"; modelId: string };
+  | { kind: "record"; keyword: string; modelId: string };
 
 export type CompiledModel = {
   publicId: string;
   /** Index (1-based) into config.models of rules that matched, in order. */
   matchedRules: number[];
   /** The fixed execution chain in order: concrete external entries and
-   * upstream nodes bound to this model's public id. No keywords remain. */
+   * record-source nodes bound to this model's public id. No pending keywords remain. */
   plan: CompiledPlanNode[];
   /** Concrete external entries in order; unresolved entries are absent. */
   entries: CompiledEntry[];
@@ -1309,14 +1353,24 @@ function buildCandidates(hits: readonly IndexedHit[], marks: HitMarks, canonical
  * Compiles config + catalog + external data into per-model concrete chains.
  * Throws MetadataConfigError only for @creator conflict on models whose
  * effective chain uses @creator.
+ *
+ * `ruleMatches[i]` lists the 0-based `config.models` indices matching
+ * `publicIds[i]`, computed on the host thread with the standard glob matcher
+ * (metadata-glob.ts `matchRules`) — this module and the Worker never import
+ * minimatch. It is required whenever the config declares rules.
  */
 export function compileCatalog(
   config: MetadataConfig,
   publicIds: readonly string[],
   tables: SourceTables,
+  ruleMatches?: readonly (readonly number[])[],
 ): CompiledCatalog {
+  if ((config.models?.length ?? 0) > 0 && ruleMatches?.length !== publicIds.length) {
+    throw new TypeError("compileCatalog: rule matches must be computed on the host for every public id");
+  }
   const data = indexData(tables);
   const rootChain = config.chain ?? DEFAULT_CHAIN;
+  const recordSources = config.recordSources ?? DEFAULT_RECORD_SOURCES;
   const degraded = tables.degraded ?? [];
   // Whole-site degradation skips its chain entries; a degraded models.dev
   // shape (providers or models) only disables the steps needing that shape.
@@ -1324,12 +1378,12 @@ export function compileCatalog(
   const models: CompiledModel[] = [];
   const queryCache = new Map<string, IndexedHit[]>();
 
-  for (const publicId of publicIds) {
+  for (const [position, publicId] of publicIds.entries()) {
     // Ordered layering: every matching rule applies, later wins per field.
     const matched: { index: number; rule: ModelRule }[] = [];
-    config.models?.forEach((rule, index) => {
-      if (matchModelPattern(rule.match, publicId)) matched.push({ index, rule });
-    });
+    if (config.models) {
+      for (const index of ruleMatches?.[position] ?? []) matched.push({ index, rule: config.models[index] });
+    }
     let effectiveChain: readonly string[] = rootChain;
     // Ordered patches: applied one by one to the final Pi model so `null`
     // deletes and full-object resets keep their RFC 7396 meaning — merging
@@ -1340,7 +1394,7 @@ export function compileCatalog(
       if (rule.overrides) overridePatches.push({ ...rule.overrides });
     }
     // Expand @default against the root effective chain.
-    const parsed = expandChain(effectiveChain, rootChain, `models match ${JSON.stringify(publicId)} chain`);
+    const parsed = expandChain(effectiveChain, rootChain, `models match ${JSON.stringify(publicId)} chain`, recordSources);
     const usesCreator = parsed.some((entry) => entry.kind === "external" && entry.provider === "@creator");
     // One query per distinct last segment, reused by every chain entry.
     const segment = querySegment(publicId);
@@ -1358,10 +1412,10 @@ export function compileCatalog(
     const skippedEntries: { entry: string; reason: string }[] = [];
     const conflicts: string[] = [];
     for (const entry of parsed) {
-      if (entry.kind === "upstream") {
-        // The upstream source binds to this model's own public id at this
+      if (entry.kind === "record") {
+        // A record source binds to this model's own public id at this
         // position; no external site, provider or candidate is involved.
-        plan.push({ kind: "upstream", modelId: publicId });
+        plan.push({ kind: "record", keyword: entry.keyword, modelId: publicId });
         continue;
       }
       if (degradedSites.has(entry.site)) {
@@ -1487,7 +1541,7 @@ export function classifyModelMatch(model: CompiledModel): MatchClass {
 }
 
 /**
- * Fields supplied by EXTERNAL plan nodes only — upstream nodes never count
+ * Fields supplied by EXTERNAL plan nodes only — record-source nodes never count
  * as external capability hits (match classification, candidate evidence).
  */
 export function externalFields(compiled: CompiledModel): MetadataFields {
@@ -1504,23 +1558,40 @@ export function externalFields(compiled: CompiledModel): MetadataFields {
 }
 
 /**
+ * Host-side record providers: keyword -> raw capability row of a public
+ * model, or undefined when the source has no record for it. Providers stay
+ * on the host thread; only keywords reach the compile Worker.
+ */
+export type RecordSourceProviders = Readonly<
+  Record<string, (publicId: string) => Readonly<Record<string, unknown>> | undefined>
+>;
+
+/**
  * Ordered per-model field selection: every plan node contributes its
  * normalized capability fields and each field takes the first valid value.
- * Upstream nodes read the model's own raw row through `normalizeFields`;
- * models without an upstream node never see upstream capability fields.
+ * Record nodes read their source's raw row through `normalizeFields`, at most
+ * once per keyword; models without a record node never read that source.
  */
 export function resolveChainFields(
   model: CompiledModel,
-  upstream: Readonly<Record<string, unknown>>,
+  providers: RecordSourceProviders,
 ): MetadataFields {
   const fields: MetadataFields = {};
   const declared = new Set<string>();
-  let upstreamFields: MetadataFields | undefined;
+  const recordFields = new Map<string, MetadataFields>();
   for (const node of model.plan) {
-    const source =
-      node.kind === "upstream"
-        ? (upstreamFields ??= normalizeFields(upstream))
-        : node.entry.fields;
+    let source: MetadataFields;
+    if (node.kind === "record") {
+      let cached = recordFields.get(node.keyword);
+      if (!cached) {
+        const row = Object.hasOwn(providers, node.keyword) ? providers[node.keyword](node.modelId) : undefined;
+        cached = row ? normalizeFields(row) : {};
+        recordFields.set(node.keyword, cached);
+      }
+      source = cached;
+    } else {
+      source = node.entry.fields;
+    }
     for (const [key, value] of Object.entries(source)) {
       if (value === undefined || value === null || declared.has(key)) continue;
       declared.add(key);
@@ -1532,16 +1603,16 @@ export function resolveChainFields(
 
 /**
  * The full per-model resolution callback for mapCatalog: the ordered plan
- * (external entries and `@self` positions) selects each field's first valid
- * value; overrides are applied to the Pi model afterwards (mapModel step),
- * not here.
+ * (external entries and record-source positions) selects each field's first
+ * valid value; overrides are applied to the final model afterwards, not here.
+ * `resolve` returns undefined for ids that were not compiled.
  */
-export function makeResolver(compiled: CompiledCatalog) {
+export function makeResolver(compiled: CompiledCatalog, providers: RecordSourceProviders) {
   const byId = new Map(compiled.models.map((model) => [model.publicId, model]));
   return {
-    resolve(publicId: string, upstream: Readonly<Record<string, unknown>>): Readonly<Record<string, unknown>> {
+    resolve(publicId: string): MetadataFields | undefined {
       const model = byId.get(publicId);
-      return model ? resolveChainFields(model, upstream) : normalizeFields(upstream);
+      return model ? resolveChainFields(model, providers) : undefined;
     },
     overridePatches(publicId: string): Record<string, unknown>[] {
       return byId.get(publicId)?.overridePatches ?? [];

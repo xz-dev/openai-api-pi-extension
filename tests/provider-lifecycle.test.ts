@@ -1043,6 +1043,7 @@ test("config error reports an error notification and keeps the old catalog", asy
 test("matchCategories: mutually exclusive, conservative, name-only is not a hit", async () => {
   const { matchCategories, mapCompiledCatalog } = await import("../index.ts");
   const { compileCatalog } = await import("../model-metadata.ts");
+  const { matchRules } = await import("../metadata-glob.ts");
   const { parseMetadataConfig } = await import("../metadata-config.ts");
   const t = {
     modelsDev: {
@@ -1062,7 +1063,8 @@ test("matchCategories: mutually exclusive, conservative, name-only is not a hit"
   - match: "name-m"
     chain: ["models.dev/acme/api_key/name-m"]
 `);
-  const compiled = compileCatalog(config, ["full-m", "partial-m", "none-m", "name-m", "off-m"], {
+  const ids = ["full-m", "partial-m", "none-m", "name-m", "off-m"];
+  const compiled = compileCatalog(config, ids, {
     ...t,
     modelsDev: {
       providers: {
@@ -1076,7 +1078,7 @@ test("matchCategories: mutually exclusive, conservative, name-only is not a hit"
       },
       models: {},
     },
-  });
+  }, matchRules(config, ids));
   // partial-m: models.dev hits but the modelparams entry stays unresolved.
   const categories = matchCategories(compiled.models);
   assert.deepEqual(categories, { complete: 1, partial: 1, unmatched: 2, disabled: 1 });

@@ -1,11 +1,10 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
-  compileCatalog,
+  compileCatalog as compileCatalogWithMatches,
   DEFAULT_CHAIN,
   externalFields,
   idCandidates,
-  matchModelPattern,
   mergePatch,
   MetadataConfigError,
   normalizeFields,
@@ -15,8 +14,15 @@ import {
   type SourceTables,
 } from "../model-metadata.ts";
 import { parseMetadataConfig } from "../metadata-config.ts";
+import { matchRules, modelGlobMatches } from "../metadata-glob.ts";
 
 const cfg = (overrides: Record<string, unknown> = {}) => ({ warnings: [], ...overrides });
+// Rule matching is host-side; tests compute it the way the host does.
+const compileCatalog = (config: Parameters<typeof compileCatalogWithMatches>[0], ids: readonly string[], t: SourceTables) =>
+  compileCatalogWithMatches(config, ids, t, matchRules(config, ids));
+const globMatches = modelGlobMatches;
+// `@self` provider over one fixed upstream row.
+const selfRow = (row: Record<string, unknown>) => ({ "@self": () => row });
 
 const tables = (overrides: Partial<SourceTables> = {}): SourceTables => ({
   modelsDev: { providers: {} },
@@ -188,11 +194,45 @@ test("parseMetadataConfig: overrides forbidden fields rejected", () => {
   }
 });
 
-test("matchModelPattern: * crosses '/', anchored, case-sensitive", () => {
-  assert.ok(matchModelPattern("*gpt-6-astra", "proxy/openai/gpt-6-astra"));
-  assert.ok(matchModelPattern("*gpt-6-astra", "gpt-6-astra"));
-  assert.ok(!matchModelPattern("*gpt-6-astra", "gpt-6-astra-preview"));
-  assert.ok(!matchModelPattern("*GPT", "openai/gpt"));
+test("model glob: single star stays inside one segment", () => {
+  assert.ok(globMatches("*gpt-6-astra", "gpt-6-astra"));
+  assert.ok(!globMatches("*gpt-6-astra", "openai/gpt-6-astra"));
+  assert.ok(!globMatches("*gpt-6-astra", "proxy/openai/gpt-6-astra"));
+  assert.ok(!globMatches("*gpt-6-astra", "gpt-6-astra-preview"));
+});
+
+test("model glob: suffix glob with ** covers bare and multi-level prefixes", () => {
+  for (const id of ["gpt-6-astra", "openai/gpt-6-astra", "proxy/openai/gpt-6-astra"]) {
+    assert.ok(globMatches("**/gpt-6-astra", id), id);
+  }
+  assert.ok(!globMatches("**/gpt-6-astra", "gpt-6-astra-preview"));
+});
+
+test("model glob: one-segment prefix vs ** prefix", () => {
+  assert.ok(!globMatches("proxy/*", "proxy/a/b"));
+  assert.ok(globMatches("proxy/**", "proxy/a/b"));
+  assert.ok(globMatches("proxy/*", "proxy/a"));
+});
+
+test("model glob: case-sensitive; leading ! and # are literal; dot, ?, classes, braces", () => {
+  assert.ok(!globMatches("p*", "Proxy"));
+  assert.ok(!globMatches("*GPT", "gpt"));
+  assert.ok(globMatches("!x", "!x"));
+  assert.ok(!globMatches("!x", "y"));
+  assert.ok(globMatches("#x", "#x"));
+  assert.ok(globMatches("**/.hidden", "x/.hidden"));
+  assert.ok(globMatches("*", ".dot"));
+  assert.ok(globMatches("gpt-?", "gpt-5"));
+  assert.ok(!globMatches("gpt-?", "gpt-55"));
+  assert.ok(globMatches("gpt-[45]", "gpt-4"));
+  assert.ok(globMatches("{a,b}/*", "b/m"));
+  assert.ok(!globMatches("{a,b}/*", "c/m"));
+});
+
+test("model glob: one-segment wildcard does not match bare ids", () => {
+  assert.ok(!globMatches("*/**", "bare"));
+  assert.ok(globMatches("*/**", "a/b"));
+  assert.ok(globMatches("*/**", "a/b/c"));
 });
 
 // --- @id candidates (task 3.2) ----------------------------------------------
@@ -462,7 +502,7 @@ test("compileCatalog: @default expands root chain in place", () => {
 test("compileCatalog: rule layering — later rules override per field, overrides merge", () => {
   const config = cfg({
     models: [
-      { match: "*", chain: ["models.dev/a/api_key"], overrides: { contextWindow: 200000, compat: { a: 1 } } },
+      { match: "**", chain: ["models.dev/a/api_key"], overrides: { contextWindow: 200000, compat: { a: 1 } } },
       { match: "proxy/*", chain: ["models.dev/b/api_key"], overrides: { compat: { b: 2 } } },
       { match: "proxy/claude", chain: ["@self"] },
     ],
@@ -470,9 +510,9 @@ test("compileCatalog: rule layering — later rules override per field, override
   const compiled = compileCatalog(config, ["proxy/claude", "other/claude"], tables());
   const proxy = compiled.models[0];
   const other = compiled.models[1];
-  // proxy/* chain (models.dev/b) wins over * (models.dev/a); the exact rule
+  // proxy/* chain (models.dev/b) wins over ** (models.dev/a); the exact rule
   // then replaces the whole chain with the upstream-only @self chain.
-  assert.deepEqual(proxy.plan, [{ kind: "upstream", modelId: "proxy/claude" }]);
+  assert.deepEqual(proxy.plan, [{ kind: "record", keyword: "@self", modelId: "proxy/claude" }]);
   assert.equal(proxy.externalChain, false, "upstream-only chain is not an external chain");
   assert.deepEqual(other.plan.map((n) => (n.kind === "external" ? n.entry.entry : n.kind)), []);
   assert.equal(other.externalChain, true, "models.dev/a is declared for other/claude");
@@ -485,7 +525,7 @@ test("compileCatalog: exact match pattern gets no extra priority (declaration or
   const config = cfg({
     models: [
       { match: "proxy/claude", chain: ["@self"] },
-      { match: "*", chain: ["models.dev/a/api_key"] },
+      { match: "**", chain: ["models.dev/a/api_key"] },
     ],
   });
   const compiled = compileCatalog(config, ["proxy/claude"], tables());
@@ -508,7 +548,7 @@ test("compileCatalog: @self compiles to a concrete upstream node per model, neve
   const compiled = compileCatalog(config, ["m1", "ns/m2"], t);
   for (const model of compiled.models) {
     // First node is THIS model's own upstream source; no keyword remains.
-    assert.deepEqual(model.plan[0], { kind: "upstream", modelId: model.publicId }, JSON.stringify(model.plan));
+    assert.deepEqual(model.plan[0], { kind: "record", keyword: "@self", modelId: model.publicId }, JSON.stringify(model.plan));
     assert.equal(model.plan[1]?.kind, "external");
   }
   const m1 = compiled.models[0];
@@ -517,7 +557,7 @@ test("compileCatalog: @self compiles to a concrete upstream node per model, neve
   assert.equal((m2.plan[1] as { entry: { entry: string } }).entry.entry, "models.dev/a/api_key/m2");
   assert.equal(m1.externalChain, true);
   const onlyUpstream = compileCatalog(cfg({ chain: ["@self"] }), ["m"], tables()).models[0];
-  assert.deepEqual(onlyUpstream.plan, [{ kind: "upstream", modelId: "m" }]);
+  assert.deepEqual(onlyUpstream.plan, [{ kind: "record", keyword: "@self", modelId: "m" }]);
   assert.equal(onlyUpstream.externalChain, false);
   assert.deepEqual(onlyUpstream.entries, []);
   assert.deepEqual(onlyUpstream.unresolved, []);
@@ -614,47 +654,47 @@ const extNode = (fields: Record<string, unknown>): CompiledModel["plan"][number]
     fields,
   },
 });
-const selfNode = { kind: "upstream" as const, modelId: "m" };
+const selfNode = { kind: "record" as const, keyword: "@self", modelId: "m" };
 
 test("resolveChainFields: external before @self overrides upstream, fills gaps", () => {
   const model = planModel([extNode({ context_window: 1000000 }), selfNode]);
-  const fields = resolveChainFields(model, { context_window: 500000, max_output_tokens: 64000 });
+  const fields = resolveChainFields(model, selfRow({ context_window: 500000, max_output_tokens: 64000 }));
   assert.equal(fields.context_window, 1000000);
   assert.equal(fields.max_output_tokens, 64000);
 });
 
 test("resolveChainFields: @self first keeps upstream, external fills gaps", () => {
   const model = planModel([selfNode, extNode({ context_window: 1000000, max_output_tokens: 128000 })]);
-  const fields = resolveChainFields(model, { context_window: 128000 });
+  const fields = resolveChainFields(model, selfRow({ context_window: 128000 }));
   assert.equal(fields.context_window, 128000);
   assert.equal(fields.max_output_tokens, 128000);
 });
 
 test("resolveChainFields: upstream alias cannot bypass an earlier @self", () => {
   const model = planModel([selfNode, extNode({ context_window: 1000000 })]);
-  const fields = resolveChainFields(model, { context_length: 128000 });
+  const fields = resolveChainFields(model, selfRow({ context_length: 128000 }));
   assert.equal(fields.context_window, 128000);
 });
 
 test("resolveChainFields: explicit empty upstream effort array is not missing", () => {
   const model = planModel([selfNode, extNode({ supported_reasoning_levels: ["low", "high"] })]);
-  const fields = resolveChainFields(model, { supported_reasoning_levels: [] });
+  const fields = resolveChainFields(model, selfRow({ supported_reasoning_levels: [] }));
   assert.deepEqual(fields.supported_reasoning_levels, []);
 });
 
 test("resolveChainFields: missing upstream fields fall through to later sources", () => {
   const model = planModel([selfNode, extNode({ context_window: 64000 })]);
-  const fields = resolveChainFields(model, {});
+  const fields = resolveChainFields(model, selfRow({}));
   assert.equal(fields.context_window, 64000);
 });
 
 test("resolveChainFields: no @self means upstream fields are never read", () => {
   const model = planModel([extNode({ context_window: 1000000 })]);
-  const fields = resolveChainFields(model, {
+  const fields = resolveChainFields(model, selfRow({
     context_window: 500000,
     max_output_tokens: 64000,
     capabilities: { effort_tiers: ["low", "high"] },
-  });
+  }));
   assert.equal(fields.context_window, 1000000);
   assert.equal(fields.max_output_tokens, undefined);
   assert.equal(fields.supported_reasoning_levels, undefined);
@@ -662,7 +702,7 @@ test("resolveChainFields: no @self means upstream fields are never read", () => 
 
 test("resolveChainFields: repeated @self nodes are idempotent (first valid wins)", () => {
   const model = planModel([selfNode, selfNode, extNode({ max_output_tokens: 10 })]);
-  const fields = resolveChainFields(model, { context_window: 32000 });
+  const fields = resolveChainFields(model, selfRow({ context_window: 32000 }));
   assert.equal(fields.context_window, 32000);
   assert.equal(fields.max_output_tokens, 10);
 });

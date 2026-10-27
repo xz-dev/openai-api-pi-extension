@@ -37,7 +37,8 @@
 
 `compileModelPattern(pattern)` 返回 `Minimatch` 实例，选项为 `{nonegate: true, nocomment: true, dot: true}`，其余用默认值：区分大小写，支持花括号与 extglob。`match` 与 `include_models` 都经过它。
 
-- 配置解析阶段编译一次，用于校验。由于 `Minimatch` 实例经结构化克隆会丢失原型，Worker 内按字符串重新编译一次，并在本次编译内缓存。
+- 配置解析阶段编译一次，用于校验。
+- 匹配只在宿主线程进行：`matchRules(config, publicIds)` 算出每个公开 ID 命中的规则序号，随 workerData 传入；`compileCatalog` 只读这些序号。实施中发现两点使"Worker 内重新编译"不可行：Worker 在 Bun 编译的 Pi 宿主中不能解析 `minimatch` 等裸包名；`makeRe()` 生成的正则与 `match()` 不等价（如 `*/**` 的正则会命中裸 ID），不能以正则源码跨线程传递。
 - 删除 `matchModelPattern`，不保留兼容开关。
 - 备选方案：自写 `*`/`**` 匹配器。放弃原因：标准语义细节多（字符类、花括号、转义），已有依赖可直接用。
 

@@ -82,12 +82,12 @@ chain:
   - "@self"
 
 models:
-  # Rules match on the full public model ID with `*` wildcards; every
-  # matching rule applies in declared order — later rules override fields
-  # and merge overrides.
-  - match: "*gpt-6-astra"   # matches gpt-6-astra, openai/gpt-6-astra, ...
+  # Rules match on the full public model ID with standard globs (see
+  # "Model ID globs"); every matching rule applies in declared order —
+  # later rules override fields and merge overrides.
+  - match: "**/gpt-6-astra" # matches gpt-6-astra, openai/gpt-6-astra, ...
     chain: ["models.dev/openai/api_key", "modelparams.dev/openai/api_key", "@self"]
-  - match: "*glm*"          # upstream values first, external fills the gaps
+  - match: "**/*glm*"       # upstream values first, external fills the gaps
     chain: ["@self", "@default"]
   - match: "model-a"        # matches only the exact ID model-a
     overrides: { contextWindow: 128000 }
@@ -104,11 +104,21 @@ verify inference limits. To prefer gateway values for a model family:
 
 ```yaml
 models:
-  - match: "gateway/*"
+  - match: "gateway/**"
     chain: ["@self", "@default"]
 ```
 
 Alternatively, set explicit final `contextWindow` and `maxTokens` overrides.
+
+**Record source keywords**: a whole chain entry `@<name>` is a record
+source registered by the host running the compiler. This extension
+registers exactly one, `@self` (the model's own upstream `/v1/models` row).
+Any other `@` entry such as `@cpa-upstream` or `@selfie` is a config error
+that names the entry path and lists the available keywords. `@creator`,
+`@id` and `@default` are built-in compile rules, not record sources. Other
+hosts that reuse the compiler (for example the AI-gateway models-enricher)
+register their own record sources; their configs are not portable to this
+extension unless they use only `@self`.
 
 **`@self`** may appear anywhere in a chain — including more than once
 (idempotent: the first valid value already occupies the field). A chain of
@@ -189,8 +199,43 @@ chain.
 **Rule layering**: every rule whose `match` glob hits the public ID
 contributes in declared order — later rules override `chain` entirely, and
 `overrides` merge RFC 7396-style (nested objects recurse, `null` deletes).
-`match: "*"` rules apply to all models; there is no extra priority for exact
+`match: "**"` rules apply to all models; there is no extra priority for exact
 names.
+
+### Model ID globs
+
+`models[].match` and `include_models` share one matcher with standard glob
+(minimatch) semantics on the complete public model ID:
+
+- `*` matches zero or more characters inside one `/`-separated segment and
+  never crosses `/`; `?` matches one character inside a segment.
+- `**` as a whole segment matches zero or more segments, so `**/x` matches
+  `x`, `a/x` and `a/b/x`.
+- Character classes `[...]` and brace expansion `{a,b}` are supported.
+- Segments starting with `.` are matched by wildcards.
+- A leading `!` or `#` is a literal character (no negation, no comment).
+- Matching is case-sensitive and covers the whole ID.
+
+### Selecting models with `include_models`
+
+`include_models` is an ordered list of globs; a leading `!` hides instead of
+keeps. For each upstream model the **last** matching entry decides; a model
+no entry matches is hidden. Omit the field to keep every model. An empty
+list, a non-string, an empty string or a lone `!` is a config error.
+
+```yaml
+include_models:
+  - "*/**"                 # keep only prefixed IDs: hides bare aliases like `claude`
+  - "!**/gpt-image-*"      # … but hide image models
+  - "codex/gpt-image-2"    # … except this one (last match wins)
+```
+
+Hidden models are removed before compilation: no external lookup, no
+upstream row read, no match statistics, and they are not published. If
+every model is hidden the published catalog is empty and a warning says
+how many models were hidden. `/provider-metadata` lists each hidden model
+with the deciding entry (for example `include_models[1] !**/gpt-image-*`) or
+`无规则命中` (no include rule matched).
 
 **Field selection**: for each capability field the chain order decides —
 `null` never erases a value, an explicit empty
@@ -228,6 +273,19 @@ The inference path never reads metadata. Offline restore and
 `allowNetwork: false` refreshes read no config and touch no data.
 
 ## Migrating legacy fields
+
+**Breaking change: standard glob matching.** `match` used to treat `*` as
+"any characters, including `/`". It now follows standard glob semantics, so
+rules that relied on `*` crossing `/` stop matching prefixed IDs. There is no
+compatibility switch; rewrite them:
+
+| Old rule | Intent | New rule |
+| --- | --- | --- |
+| `*gpt-6-astra` | the ID with any prefix, or bare | `**/gpt-6-astra` |
+| `*glm*` | any ID whose last segment contains `glm` | `**/*glm*` |
+| `proxy/*` | everything under `proxy/`, any depth | `proxy/**` (`proxy/*` now matches one level only) |
+| `*` | every model | `**` |
+| `claude-*` | bare IDs starting with `claude-` | `claude-*` (unchanged) |
 
 `fill_missing_only` is removed: every occurrence at root or rule level is a
 config error naming the exact path, even when the same config also contains
@@ -283,8 +341,9 @@ file under `os.tmpdir()`), and notifies you with
 filename. Open that path with any editor or pager. The file's first line
 also identifies this plugin. It lists the effective config (chains as
 written, including `@self`/`@default`), data versions, per-model matched
-rules, the fixed compiled plan — concrete external entries and
-`upstream <publicId>` nodes at their declared positions — supplied fields
+rules, models hidden by `include_models` with their deciding entry (only when
+`include_models` is set), the fixed compiled plan — concrete external
+entries and `upstream <publicId>` nodes at their declared positions — supplied fields
 and their per-field source (`[canonical]` = unified canonical table,
 unmarked = provider record), the full candidate list with match level and
 selection/skip reasons, `[unresolved]` markers, and final overrides — never

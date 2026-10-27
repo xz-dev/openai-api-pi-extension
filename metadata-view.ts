@@ -6,7 +6,7 @@
  * key — callers pass only compiled data and config, not credentials.
  */
 import { classifyModelMatch } from "./model-metadata.ts";
-import type { CompiledCatalog, CompiledModel, MetadataFields } from "./model-metadata.ts";
+import type { CompiledCatalog, CompiledModel, MetadataFields, ModelSelection } from "./model-metadata.ts";
 import { formatPluginOutput } from "./notification.ts";
 export { sanitizeTerminalText } from "./notification.ts";
 
@@ -44,11 +44,15 @@ const redactJson = (value: unknown) => JSON.stringify(redact(value));
 
 function formatEntryFields(model: CompiledModel, upstream?: Readonly<Record<string, MetadataFields>>): string[] {
   return model.plan.map((node) => {
-    if (node.kind === "upstream") {
-      // The upstream node shows the fields the model's own row CAN provide
-      // at this position — never claimed to be the final adopted values.
-      const keys = Object.keys(upstream?.[node.modelId] ?? {});
-      return `    upstream ${node.modelId} -> ${keys.join(", ") || "(no capability fields)"}`;
+    if (node.kind === "record") {
+      // `@self` is the model's own upstream row: show the fields it CAN
+      // provide at this position — never claimed to be the final values.
+      if (node.keyword === "@self") {
+        const keys = Object.keys(upstream?.[node.modelId] ?? {});
+        return `    upstream ${node.modelId} -> ${keys.join(", ") || "(no capability fields)"}`;
+      }
+      // Other host-registered sources are labeled by name; their rows are host data.
+      return `    record:${node.keyword.slice(1)} ${node.modelId} -> (record source fields)`;
     }
     const entry = node.entry;
     const fields = Object.entries(entry.fields).map(([key]) => {
@@ -77,9 +81,30 @@ function formatCandidates(model: CompiledModel): string[] {
   return lines;
 }
 
+function formatSelection(selection: ModelSelection): string[] {
+  const lines = ["== include_models =="];
+  lines.push(`kept ${selection.kept.length}  hidden ${selection.hidden.length}`);
+  if (selection.hidden.length > 0) {
+    lines.push("hidden (not compiled):");
+    for (const item of selection.hidden) {
+      const reason = item.ruleIndex === null
+        ? "无规则命中 (no include rule matched)"
+        : `include_models[${item.ruleIndex}] ${item.pattern}`;
+      lines.push(`  ${item.id}  ${reason}`);
+    }
+  }
+  lines.push("");
+  return lines;
+}
+
+/**
+ * `selection` is passed only when `include_models` is configured; hidden
+ * models are listed with the deciding entry and never shown as compiled.
+ */
 export function renderCompiledCatalog(
   compiled: CompiledCatalog,
   upstream?: Readonly<Record<string, MetadataFields>>,
+  selection?: ModelSelection,
 ): string {
   const lines: string[] = [];
   lines.push("== effective config ==");
@@ -101,6 +126,7 @@ export function renderCompiledCatalog(
   for (const item of compiled.degraded) lines.push(`degraded: ${item.site}: ${item.reason}`);
   if (compiled.warnings.length > 0) lines.push(`ignored fields: ${compiled.warnings.join(", ")}`);
   lines.push("");
+  if (selection) lines.push(...formatSelection(selection));
   // Hit-classification summary: complete / partial-source-missing /
   // unmatched over enabled chains, with disabled models listed separately.
   const counts = { complete: 0, partial: 0, unmatched: 0, disabled: 0 };

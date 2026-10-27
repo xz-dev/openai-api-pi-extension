@@ -1,37 +1,29 @@
 /**
- * Loads the local metadata packages inside a node:worker_threads Worker,
- * compiles the catalog there, and returns only the compiled result. The
- * worker imports the packages by explicit file path inside each package's
- * installed directory (bare subpath imports do not resolve the extension's
- * node_modules inside the Bun-compiled Pi worker), runs compileCatalog, and
- * is terminated so the ~6.9 MB snapshot never stays resident.
+ * Pi adapter over the host-neutral compile entry (metadata-core.ts): resolves
+ * the active local data packages under Pi's agent directory, then compiles in
+ * the plugin's Worker (metadata-compile-worker.mjs), which imports the
+ * packages by explicit file path (bare subpath imports do not resolve the
+ * extension's node_modules inside the Bun-compiled Pi worker). Only the
+ * compiled result returns; the ~6.9 MB snapshot never stays resident.
  *
- * Tests may inject `loadTables` to supply SourceTables directly (still inside
- * the real Worker when they pass a tables path — see fixtures) or to skip the
- * worker entirely by compiling in-process.
+ * Tests may inject `loadTables` to supply SourceTables directly (compiled
+ * in-process) or `tablesPath` to feed a fixture through the real Worker.
  */
-import { Worker } from "node:worker_threads";
 import { dirname, join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { selectDataSource } from "./metadata-packages.ts";
 import { fileURLToPath } from "node:url";
+import { neededSites, runCompileWorker, type CompileResult } from "./metadata-core.ts";
+import { matchRules } from "./metadata-glob.ts";
 import {
   compileCatalog,
-  DEFAULT_CHAIN,
-  matchModelPattern,
-  MetadataConfigError,
-  type CompiledCatalog,
   type MetadataConfig,
   type SourceTables,
 } from "./model-metadata.ts";
 
-const EXTENSION_DIR = dirname(fileURLToPath(import.meta.url));
+export { neededSites, type CompileResult } from "./metadata-core.ts";
 
-export type CompileResult = {
-  catalog: CompiledCatalog;
-  /** Sites/shapes whose package data could not be loaded; those steps degrade. */
-  degraded: { site: "models.dev" | "modelparams.dev"; reason: string; scope?: "providers" | "models" }[];
-};
+const EXTENSION_DIR = dirname(fileURLToPath(import.meta.url));
 
 /** Test seam: supply SourceTables without loading the real packages. */
 export type TablesLoader = (
@@ -52,47 +44,6 @@ export type CompileDeps = {
   modelsDevSnapshotOverride?: string;
 };
 
-/** Which sites the effective chains need; `null` = nothing needed. */
-export function neededSites(
-  config: MetadataConfig,
-  publicIds: readonly string[],
-): Set<"models.dev" | "modelparams.dev"> {
-  const sites = new Set<"models.dev" | "modelparams.dev">();
-  if (config.chain === undefined && (config.models === undefined || config.models.length === 0)) {
-    // Default chain applies to every model: both sites.
-    sites.add("models.dev");
-    sites.add("modelparams.dev");
-    return sites;
-  }
-  const effectiveChains = publicIds.map((id) => effectiveChainFor(config, id));
-  for (const chain of effectiveChains) {
-    for (const entry of chain) {
-      const site = entry.split("/", 1)[0];
-      if (site === "models.dev" || site === "modelparams.dev") {
-        sites.add(site);
-      }
-      // @creator resolution discovers canonical providers through the
-      // models.dev namespace map even when the query site is modelparams.dev.
-      if (entry.split("/")[1] === "@creator") sites.add("models.dev");
-    }
-  }
-  return sites;
-}
-
-/** Root chain if defined, else the shared default; then per-model rule layering. */
-function effectiveChainFor(config: MetadataConfig, publicId: string): string[] {
-  const root = config.chain ?? DEFAULT_CHAIN;
-  let chain: string[] | undefined;
-  for (const rule of config.models ?? []) {
-    if (!matchModelPattern(rule.match, publicId)) continue;
-    if (rule.chain !== undefined) chain = rule.chain;
-  }
-  const expanded = (chain ?? root).flatMap((entry) =>
-    entry === "@default" ? root : [entry],
-  );
-  return expanded;
-}
-
 /**
  * Compiles the catalog. With `loadTables` supplied (tests), tables come from
  * the loader; otherwise the real packages load inside a Worker and only the
@@ -105,17 +56,18 @@ export async function compileCatalogInWorker(
   signal?: AbortSignal,
 ): Promise<CompileResult> {
   signal?.throwIfAborted();
-  const sites = neededSites(config, publicIds);
+  const ruleMatches = matchRules(config, publicIds);
+  const sites = neededSites(config, publicIds, ruleMatches);
   if (deps?.loadTables) {
     const tables = await deps.loadTables(sites, signal);
-    const catalog = compileCatalog(config, publicIds, tables);
+    const catalog = compileCatalog(config, publicIds, tables, ruleMatches);
     return { catalog, degraded: tables.degraded ?? [] };
   }
   if (sites.size === 0) {
-    const catalog = compileCatalog(config, publicIds, { degraded: [] });
+    const catalog = compileCatalog(config, publicIds, { modelsDev: undefined, modelparams: undefined, degraded: [] }, ruleMatches);
     return { catalog, degraded: [] };
   }
-  const degraded: { site: "models.dev" | "modelparams.dev"; reason: string; scope?: "providers" | "models" }[] = [];
+  const degraded: CompileResult["degraded"] = [];
   // Capture both paths and versions once: a concurrent activation cannot
   // mix generations within this Worker.
   const useFixture = deps?.tablesPath !== undefined;
@@ -128,78 +80,20 @@ export async function compileCatalogInWorker(
   if (!useFixture && sites.has("modelparams.dev") && !modelparamsDir) {
     degraded.push({ site: "modelparams.dev", reason: "modelparams package not installed" });
   }
-  const workerFile = join(EXTENSION_DIR, "metadata-compile-worker.mjs");
-  const tablesPath = deps?.tablesPath;
-  const result = await new Promise<CompileResult>((resolve, reject) => {
-    let settled = false;
-    const finish = (fn: () => void) => {
-      if (settled) return;
-      settled = true;
-      signal?.removeEventListener("abort", onAbort);
-      fn();
-    };
-    const worker = new Worker(workerFile, {
-      // Fresh argv: a `node --test` parent passes --inspect-port which the
-      // worker cannot bind twice, and --test would put it in test-runner
-      // mode. Type stripping for the .ts import is on by default, so the
-      // worker needs no flags at all.
-      execArgv: [],
-      stderr: true,
-      stdout: true,
-      workerData: {
-        config,
-        publicIds,
-        neededSites: [...sites],
-        modelsDevSnapshotPath: modelsDevDir ? join(modelsDevDir, "dist", "snapshot.js") : undefined,
-        modelsDevSnapshotOverride: deps?.modelsDevSnapshotOverride,
-        modelparamsPath: modelparamsDir ? join(modelparamsDir, "dist", "index.js") : undefined,
-        modelsDevVersion: source?.modelsDev?.version,
-        modelparamsVersion: source?.modelparams?.version,
-        prescanDegraded: degraded,
-        tablesPath,
-        compileModulePath: join(EXTENSION_DIR, "model-metadata.ts"),
-      },
-    });
-    const stderrChunks: Buffer[] = [];
-    worker.stderr?.on("data", (chunk: Buffer) => stderrChunks.push(chunk));
-    worker.stdout?.on("data", (chunk: Buffer) => stderrChunks.push(chunk));
-    const stderrDetail = () => Buffer.concat(stderrChunks).toString().trim().slice(0, 500);
-    const onAbort = () => {
-      const reason = signal?.reason;
-      worker.terminate().finally(() => finish(() => reject(reason)));
-    };
-    signal?.addEventListener("abort", onAbort, { once: true });
-    worker.once("message", (message: {
-      ok?: boolean;
-      result?: CompileResult;
-      error?: { name?: string; path?: string; message?: string };
-    }) => {
-      finish(() => {
-        // Our own terminate is normal; no exit handler runs as a rejection.
-        worker.terminate().catch(() => undefined);
-        if (message.ok && message.result) {
-          resolve(message.result);
-        } else {
-          const e = message.error;
-          if (e?.name === "MetadataConfigError") {
-            reject(new MetadataConfigError(e.path ?? "openai-api-extension.yaml", e.message ?? "config error"));
-          } else {
-            reject(new Error(e?.message ?? "metadata compile worker failed"));
-          }
-        }
-      });
-    });
-    worker.once("error", (error) => finish(() => reject(error)));
-    worker.once("exit", (code) => {
-      finish(() => {
-        if (signal?.aborted) {
-          reject(signal.reason);
-        } else {
-          const detail = stderrDetail();
-          reject(new Error(`metadata compile worker exited with code ${code}${detail ? `: ${detail}` : ""}`));
-        }
-      });
-    });
+  const result = await runCompileWorker({
+    workerFile: join(EXTENSION_DIR, "metadata-compile-worker.mjs"),
+    config,
+    publicIds,
+    ruleMatches,
+    neededSites: sites,
+    tablesPath: deps?.tablesPath,
+    modelsDevSnapshotPath: modelsDevDir ? join(modelsDevDir, "dist", "snapshot.js") : undefined,
+    modelsDevSnapshotOverride: deps?.modelsDevSnapshotOverride,
+    modelparamsPath: modelparamsDir ? join(modelparamsDir, "dist", "index.js") : undefined,
+    modelsDevVersion: source?.modelsDev?.version,
+    modelparamsVersion: source?.modelparams?.version,
+    prescanDegraded: degraded,
+    signal,
   });
   if (source?.warning) result.catalog.sourceWarning = source.warning;
   return result;

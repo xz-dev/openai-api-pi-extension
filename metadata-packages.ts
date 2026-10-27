@@ -940,7 +940,6 @@ async function runValidationWorker(req: {
           : join(generationRoot, "node_modules", packageDirName(MODELPARAMS_PACKAGE), PACKAGE_ENTRY[MODELPARAMS_PACKAGE]),
         modelsDevVersion: targets[MODELS_DEV_PACKAGE],
         modelparamsVersion: targets[MODELPARAMS_PACKAGE],
-        compileModulePath: join(EXTENSION_DIR, "model-metadata.ts"),
       },
     });
     worker.stderr?.on("data", (c: Buffer) => tail(c, "err"));
