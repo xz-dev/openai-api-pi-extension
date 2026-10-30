@@ -169,7 +169,7 @@ function baselineModulePath(): string {
   const file = join(scratchDir, "model-metadata-baseline.ts");
   writeFileSync(
     file,
-    execFileSync("git", ["show", "HEAD:model-metadata.ts"], { encoding: "utf8" }),
+    execFileSync("git", ["show", "HEAD:src/model-metadata.ts"], { encoding: "utf8" }),
   );
   return file;
 }
