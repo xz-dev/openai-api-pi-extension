@@ -646,10 +646,10 @@ export function createOpenAIApiProvider(
     | undefined;
   const api = openAIResponsesApi();
   const replaySupported = "supportsBackgroundResponseReplay" in api && api.supportsBackgroundResponseReplay === true;
-  const replayOwnership = (options: CheckpointOptions): ResponseReplayOwnership => ({
-    enabled: replaySupported && options.transport === "sse", requested: false,
+  const replayOwnership = (transport: CheckpointOptions["transport"]): ResponseReplayOwnership => ({
+    enabled: replaySupported && transport === "sse", requested: false,
     reason: replaySupported ? "bridge_owns_transport" : "host_unsupported",
-    configuredTransport: options.transport ?? "auto",
+    configuredTransport: transport ?? "auto",
   });
   const bridgeOptions = (model: GatewayModel, context: Context, options: CheckpointOptions, ancestry: ResponseAncestryState) => {
     const raw = Object.hasOwn(options, "responseCheckpointExclude") ? options.responseCheckpointExclude : getRawCheckpointExclude();
@@ -752,7 +752,7 @@ export function createOpenAIApiProvider(
       // The bridge owns transport and ancestry, including explicit SSE without opening WS.
       const owned = bridgeOptions(model, context, options, ancestry);
       const bridge = createResponsesWebSocketBridge(model, owned);
-      const replay = replayOwnership(options);
+      const replay = replayOwnership(owned.transport);
       const sdkOptions = { ...options, responseReplay: replay.enabled, transport: "sse" as const, onTransport: undefined, fetch: bridge.fetch,
         onPayload: payloadHook(bridge, owned.checkpoints.enabled, options.onPayload, replay),
         onProviderStreamEvent: providerEventHook(bridge, options) };
@@ -768,7 +768,7 @@ export function createOpenAIApiProvider(
       const requestContext = normalizeContext?.(filteredContext) ?? filteredContext;
       const owned = bridgeOptions(model, context, options, ancestry);
       const bridge = createResponsesWebSocketBridge(model, owned);
-      const replay = replayOwnership(options);
+      const replay = replayOwnership(owned.transport);
       const sdkOptions = { ...options, responseReplay: replay.enabled, transport: "sse" as const, onTransport: undefined, fetch: bridge.fetch,
         onPayload: payloadHook(bridge, owned.checkpoints.enabled, options.onPayload, replay),
         onProviderStreamEvent: providerEventHook(bridge, options) };
