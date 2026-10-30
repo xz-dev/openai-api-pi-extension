@@ -1078,16 +1078,31 @@ export function createResponsesWebSocketBridge(
   };
 }
 
+export type ResponseReplayOwnership = {
+  enabled: boolean;
+  requested: boolean;
+  reason: "host_unsupported" | "bridge_owns_transport";
+  configuredTransport: NonNullable<SimpleStreamOptions["transport"]>;
+};
+
 export function wrapResponsesWebSocketStream(
   source: AssistantMessageEventStream,
   bridge: ResponsesWebSocketBridge,
+  replay?: ResponseReplayOwnership,
 ): AssistantMessageEventStream {
   const target = createAssistantMessageEventStream();
+  const finish = async (output: AssistantMessage) => {
+    await bridge.finish(output);
+    if (replay?.requested && !replay.enabled) {
+      appendAssistantMessageDiagnostic(output, { type: "provider_response_replay_passthrough", timestamp: Date.now(),
+        details: { reason: replay.reason, configuredTransport: replay.configuredTransport } });
+    }
+  };
   void (async () => {
     try {
       for await (const event of source) {
-        if (event.type === "done") await bridge.finish(event.message);
-        else if (event.type === "error") await bridge.finish(event.error);
+        if (event.type === "done") await finish(event.message);
+        else if (event.type === "error") await finish(event.error);
         target.push(event);
       }
     } catch (error) {
@@ -1109,7 +1124,7 @@ export function wrapResponsesWebSocketStream(
         errorMessage: error instanceof Error ? error.message : String(error),
         timestamp: Date.now(),
       } as AssistantMessage;
-      await bridge.finish(output);
+      await finish(output);
       target.push({ type: "error", reason: "error", error: output });
     }
   })();

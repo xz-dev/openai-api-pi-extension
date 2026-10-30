@@ -51,6 +51,7 @@ import {
   createResponsesWebSocketBridge,
   getActualResponsesTransport,
   redactAssistantStream,
+  type ResponseReplayOwnership,
   type ResponsesWebSocketBridge,
   wrapResponsesWebSocketStream,
 } from "./src/responses-websocket-fetch.ts";
@@ -644,6 +645,12 @@ export function createOpenAIApiProvider(
     | { baseUrl: string; apiKey: string; models: readonly GatewayModel[]; checkedAt: number }
     | undefined;
   const api = openAIResponsesApi();
+  const replaySupported = "supportsBackgroundResponseReplay" in api && api.supportsBackgroundResponseReplay === true;
+  const replayOwnership = (options: CheckpointOptions): ResponseReplayOwnership => ({
+    enabled: replaySupported && options.transport === "sse", requested: false,
+    reason: replaySupported ? "bridge_owns_transport" : "host_unsupported",
+    configuredTransport: options.transport ?? "auto",
+  });
   const bridgeOptions = (model: GatewayModel, context: Context, options: CheckpointOptions, ancestry: ResponseAncestryState) => {
     const raw = Object.hasOwn(options, "responseCheckpointExclude") ? options.responseCheckpointExclude : getRawCheckpointExclude();
     const mode = Object.hasOwn(options, "responseCheckpointMode") ? options.responseCheckpointMode : getRawCheckpointMode();
@@ -653,10 +660,12 @@ export function createOpenAIApiProvider(
       encodeOutput: (output: piAI.AssistantMessage) => encodeCheckpointOutput(api, model, context, output),
     } };
   };
-  const payloadHook = (bridge: ResponsesWebSocketBridge, enabled: boolean, original: CheckpointOptions["onPayload"]) =>
+  const payloadHook = (bridge: ResponsesWebSocketBridge, enabled: boolean, original: CheckpointOptions["onPayload"], replay: ResponseReplayOwnership) =>
     async (payload: unknown, model: GatewayModel, prepareRequest?: (payload: unknown) => Promise<Request>) => {
       if (enabled && payload && typeof payload === "object") (payload as { store?: boolean }).store = true;
       const next = await original?.(payload, model, prepareRequest);
+      const body = next === undefined ? payload : next;
+      replay.requested = isRecord(body) && body.background === true && body.stream === true;
       return bridge.prepare(next === undefined ? payload : next, prepareRequest);
     };
   const providerEventHook = (bridge: ResponsesWebSocketBridge, options: CheckpointOptions & {
@@ -743,11 +752,12 @@ export function createOpenAIApiProvider(
       // The bridge owns transport and ancestry, including explicit SSE without opening WS.
       const owned = bridgeOptions(model, context, options, ancestry);
       const bridge = createResponsesWebSocketBridge(model, owned);
-      const sdkOptions = { ...options, transport: "sse" as const, onTransport: undefined, fetch: bridge.fetch,
-        onPayload: payloadHook(bridge, owned.checkpoints.enabled, options.onPayload),
+      const replay = replayOwnership(options);
+      const sdkOptions = { ...options, responseReplay: replay.enabled, transport: "sse" as const, onTransport: undefined, fetch: bridge.fetch,
+        onPayload: payloadHook(bridge, owned.checkpoints.enabled, options.onPayload, replay),
         onProviderStreamEvent: providerEventHook(bridge, options) };
       return redactAssistantStream(
-        wrapResponsesWebSocketStream(api.stream(model, requestContext, sdkOptions), bridge),
+        wrapResponsesWebSocketStream(api.stream(model, requestContext, sdkOptions), bridge, replay),
         options.apiKey,
       );
     },
@@ -758,11 +768,12 @@ export function createOpenAIApiProvider(
       const requestContext = normalizeContext?.(filteredContext) ?? filteredContext;
       const owned = bridgeOptions(model, context, options, ancestry);
       const bridge = createResponsesWebSocketBridge(model, owned);
-      const sdkOptions = { ...options, transport: "sse" as const, onTransport: undefined, fetch: bridge.fetch,
-        onPayload: payloadHook(bridge, owned.checkpoints.enabled, options.onPayload),
+      const replay = replayOwnership(options);
+      const sdkOptions = { ...options, responseReplay: replay.enabled, transport: "sse" as const, onTransport: undefined, fetch: bridge.fetch,
+        onPayload: payloadHook(bridge, owned.checkpoints.enabled, options.onPayload, replay),
         onProviderStreamEvent: providerEventHook(bridge, options) };
       return redactAssistantStream(
-        wrapResponsesWebSocketStream(api.streamSimple(model, requestContext, sdkOptions), bridge),
+        wrapResponsesWebSocketStream(api.streamSimple(model, requestContext, sdkOptions), bridge, replay),
         options.apiKey,
       );
     },
