@@ -875,6 +875,10 @@ export default async function (pi: ExtensionAPI, dependencies: {
   // interactive mode discovers models through Pi's own background refresh.
   pi.registerCommand("provider-metadata", {
     description: "Export compiled metadata, or check/update its data packages",
+    getArgumentCompletions: (prefix) => {
+      const actions = ["check", "update"].filter((action) => action.startsWith(prefix.trimStart()));
+      return actions.length > 0 ? actions.map((action) => ({ value: action, label: action })) : null;
+    },
     handler: async (args, ctx) => {
       if (await packageCommands.handle(args, ctx)) return;
       const auth = await ctx.modelRegistry.getProviderAuth(PROVIDER);
