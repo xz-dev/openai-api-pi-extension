@@ -47,9 +47,9 @@ async function fixture(t: any, toolTurn = false, omitAnnotations = false) {
   for (const file of pkg.files) await cp(join(project, file), join(source, file), { recursive: true });
   await mkdir(join(source, "tests/fixtures"), { recursive: true });
   await cp(join(project, "tests/fixtures/checkpoint-cleanup-extension.ts"), join(source, "tests/fixtures/checkpoint-cleanup-extension.ts"));
-  const packages = ["balanced-match", "brace-expansion", "minimatch", "openai", "semver", "ws", "yaml"];
+  const packages = ["@isaacs/nonrecursive-glob-match", "balanced-match", "brace-expansion", "minimatch", "openai", "semver", "ws", "yaml"];
   for (const name of packages) await cp(join(project, "node_modules", name), join(source, "node_modules", name), { recursive: true });
-  assert.deepEqual((await readdir(join(source, "node_modules"))).sort(), packages.sort());
+  assert.deepEqual((await readdir(join(source, "node_modules"))).sort(), packages.map((name) => name.split("/")[0]).sort());
   const prohibited: string[] = [];
   const hook = registerHooks({ resolve(specifier, context, next) {
     if (context.parentURL?.startsWith(pathToFileURL(source).href) && specifier.startsWith("@earendil-works/pi-ai/api/")) {

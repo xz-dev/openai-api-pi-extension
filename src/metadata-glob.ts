@@ -21,7 +21,7 @@ export const MODEL_GLOB_OPTIONS = Object.freeze({ nonegate: true, nocomment: tru
 /** Compiles one glob; a pattern minimatch cannot compile is a config error at `path`. */
 export function compileModelPattern(glob: string, path: string): Minimatch {
   const matcher = new Minimatch(glob, MODEL_GLOB_OPTIONS);
-  if (matcher.makeRe() === false) throw new MetadataConfigError(path, `invalid glob ${JSON.stringify(glob)}`);
+  if (matcher.set.length === 0) throw new MetadataConfigError(path, `invalid glob ${JSON.stringify(glob)}`);
   return matcher;
 }
 
