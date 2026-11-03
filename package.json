@@ -30,7 +30,7 @@
   },
   "dependencies": {
     "@opencode-ai/models": "*",
-    "minimatch": "10.2.6",
+    "minimatch": "11.0.1",
     "modelparams": "*",
     "openai": "6.40.0",
     "semver": "^7.8.5",
