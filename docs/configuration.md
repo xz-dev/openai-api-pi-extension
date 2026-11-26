@@ -66,6 +66,31 @@ Model metadata config (source chains, rules, `overrides`) lives in
 `~/.pi/agent/openai-api-extension.yaml`; see
 [model metadata](model-metadata.md).
 
+## Function tool strictness
+
+Newly mapped Responses models declare `compat.supportsStrictMode: true`.
+This tells Pi the endpoint accepts the `strict` field; it does not force all
+functions into strict mode. In the same request, a regular function gets
+`strict: false` (its optional parameters stay optional), while a function that
+requires strict sampling and has a compatible schema gets `strict: true`.
+
+If a gateway rejects the `strict` field, add a matching rule to the `models`
+list in `~/.pi/agent/openai-api-extension.yaml`:
+
+```yaml
+models:
+  - match: "legacy-*"
+    overrides:
+      compat:
+        supportsStrictMode: false
+```
+
+Use the gateway's public model IDs for `match`. With this override Pi omits
+`strict` for regular functions instead of sending `strict: false`; a tool that
+requires strict sampling cannot use it on that model. After updating the
+extension or its rules, run `pi --refresh --list-models` to rebuild the
+catalog. Do not edit the generated catalog.
+
 ## Connection status
 
 Run:

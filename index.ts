@@ -258,6 +258,7 @@ export function mapModel(
     name: firstString(pick("name", "display_name")) ?? identity.id,
     provider: PROVIDER,
     api: "openai-responses",
+    compat: { supportsStrictMode: true },
     baseUrl,
     reasoning: map !== undefined,
     ...(map ? { thinkingLevelMap: map } : {}),

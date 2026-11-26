@@ -21,6 +21,10 @@ test("mapModel falls back to default context window when limits missing (omnirou
   assert.equal(model?.maxTokens, 128_000);
 });
 
+test("mapModel declares strict-mode support without a model-specific rule", () => {
+  assert.equal(mapModel({ id: "new-chat-model" })?.compat?.supportsStrictMode, true);
+});
+
 test("mapModel falls back to contextWindow when max tokens missing", () => {
   const model = mapModel({ slug: "glm-5.3", context_window: 1048576 });
   assert.equal(model?.contextWindow, 1048576);

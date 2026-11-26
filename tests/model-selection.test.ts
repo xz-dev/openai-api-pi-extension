@@ -235,6 +235,16 @@ test("enrichCatalog: hidden models never reach compilation and their rows are no
   assert.deepEqual(out.warnings, []);
 }, { timeout: 60_000 });
 
+test("enrichCatalog declares strict-mode support unless a matching rule opts out", async () => {
+  agentDir('chain: ["@self"]\nmodels:\n  - match: legacy-chat\n    overrides:\n      compat: {supportsStrictMode: false, supportsDeveloperRole: false}\n');
+  const { enrichCatalog } = await import("../index.ts");
+  const { models } = await enrichCatalog([{ id: "new-chat-model" }, { id: "legacy-chat" }], "http://127.0.0.1:1/v1");
+  assert.equal(models.find((model) => model.id === "new-chat-model")?.compat?.supportsStrictMode, true);
+  assert.deepEqual(models.find((model) => model.id === "legacy-chat")?.compat, {
+    supportsStrictMode: false, supportsDeveloperRole: false,
+  });
+});
+
 test("enrichCatalog: every model hidden publishes an empty catalog with a warning", async () => {
   agentDir('chain: ["@self"]\ninclude_models: ["nothing/**"]\n');
   const { enrichCatalog } = await import("../index.ts");
